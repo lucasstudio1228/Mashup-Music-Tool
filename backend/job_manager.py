@@ -1,0 +1,151 @@
+"""
+Job manager: 1 worker duy nhất (max_workers=1) + SSE progress qua asyncio.Queue.
+
+Luồng: submit() chạy fn trong thread → fn gọi progress_cb → _push_sse đẩy event
+vào asyncio.Queue (thread-safe qua run_coroutine_threadsafe) → SSE endpoint
+consume qua stream().
+"""
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+@dataclass
+class JobProgress:
+    mix_id: int
+    status: str = "pending"       # pending|running|completed|failed
+    step: int = 0                 # 1-6
+    step_name: str = ""
+    percent: float = 0.0
+    message: str = ""
+    error: Optional[str] = None
+    result: Optional[dict] = None
+
+
+class JobManager:
+    """Global singleton. Chỉ 1 job render tại 1 thời điểm."""
+
+    def __init__(self):
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._jobs: dict[int, JobProgress] = {}
+        self._queues: dict[int, asyncio.Queue] = {}
+        self._lock = threading.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Gọi 1 lần ở startup để worker thread biết loop nào để push event."""
+        self._loop = loop
+
+    # ---------- submit / run ----------
+    def submit(self, mix_id: int, fn, *args, on_success=None, on_failure=None,
+               **kwargs) -> None:
+        with self._lock:
+            self._jobs[mix_id] = JobProgress(mix_id=mix_id, status="pending")
+            self._queues.setdefault(mix_id, asyncio.Queue())
+        self._executor.submit(self._run, mix_id, fn, args, kwargs,
+                              on_success, on_failure)
+
+    def _run(self, mix_id, fn, args, kwargs, on_success, on_failure):
+        self._update(mix_id, status="running")
+        try:
+            result = fn(mix_id, self._progress_callback(mix_id), *args, **kwargs)
+            self._update(mix_id, status="completed", percent=100.0, result=result)
+            if on_success:
+                on_success(mix_id, result)
+        except Exception as exc:              # noqa: BLE001 - báo lỗi ra SSE + DB
+            self._update(mix_id, status="failed", error=str(exc))
+            if on_failure:
+                on_failure(mix_id, str(exc))
+            self._push_sse(mix_id, "error", {"message": str(exc)})
+        finally:
+            job = self.get_status(mix_id)
+            self._push_sse(mix_id, "done", {
+                "status": job.status if job else "unknown",
+            })
+
+    def _progress_callback(self, mix_id):
+        def callback(step: int, step_name: str, percent: float, message: str = ""):
+            self._update(mix_id, step=step, step_name=step_name,
+                         percent=percent, message=message)
+            self._push_sse(mix_id, "progress", {
+                "step": step, "step_name": step_name,
+                "percent": round(percent, 1), "message": message,
+            })
+        return callback
+
+    # ---------- state ----------
+    def _update(self, mix_id, **kwargs):
+        with self._lock:
+            job = self._jobs.get(mix_id)
+            if job:
+                for key, value in kwargs.items():
+                    setattr(job, key, value)
+
+    def get_status(self, mix_id: int) -> Optional[JobProgress]:
+        with self._lock:
+            return self._jobs.get(mix_id)
+
+    def is_busy(self) -> bool:
+        with self._lock:
+            return any(j.status in ("pending", "running")
+                       for j in self._jobs.values())
+
+    def active_count(self) -> int:
+        with self._lock:
+            return sum(1 for j in self._jobs.values()
+                       if j.status in ("pending", "running"))
+
+    # ---------- SSE plumbing ----------
+    def _get_queue(self, mix_id: int) -> asyncio.Queue:
+        with self._lock:
+            return self._queues.setdefault(mix_id, asyncio.Queue())
+
+    def _push_sse(self, mix_id, event_type, data):
+        """Thread-safe: worker thread đẩy event vào queue của event loop."""
+        queue = self._get_queue(mix_id)
+        event = {"type": event_type, "data": data}
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            asyncio.run_coroutine_threadsafe(queue.put(event), loop)
+        else:
+            # Fallback (test không có loop): put trực tiếp nếu đang trong loop.
+            try:
+                queue.put_nowait(event)
+            except Exception:
+                pass
+
+    async def stream(self, mix_id: int):
+        """Async generator cho SSE endpoint."""
+        # Replay nếu job đã kết thúc TRƯỚC KHI client connect.
+        with self._lock:
+            job = self._jobs.get(mix_id)
+        if job:
+            if job.status == "completed":
+                yield {"type": "progress", "data": {
+                    "step": 6, "step_name": "Completed",
+                    "percent": 100.0, "message": "",
+                }}
+                yield {"type": "done", "data": {"status": "completed"}}
+                return
+            elif job.status == "failed":
+                yield {"type": "error", "data": {
+                    "message": job.error or "Unknown error"}}
+                yield {"type": "done", "data": {"status": "failed"}}
+                return
+
+        # Job đang chạy hoặc pending — consume từ queue bình thường.
+        queue = self._get_queue(mix_id)
+        while True:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                yield event
+                if event["type"] == "done":
+                    break
+            except asyncio.TimeoutError:
+                yield {"type": "ping", "data": {}}     # keep-alive
+
+
+# Global singleton
+job_manager = JobManager()

@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+
+# App data & output (nguoi dung tu sinh - KHONG day len repo)
+data/
+outputs/
+stems/
+Projects/
+*.db
+*.sqlite
+*.sqlite3
+
+# File test / tam
+*_denoised_test.wav
+*_test.wav
+
+# Frontend deps (giu lai frontend/dist de khoi can Node khi chay)
+frontend/node_modules/
+
+# Build artifacts cua launcher .exe
+build/
+*.spec
+
+# OS
+.DS_Store
+Thumbs.db
+
+# TS build cache
+*.tsbuildinfo
