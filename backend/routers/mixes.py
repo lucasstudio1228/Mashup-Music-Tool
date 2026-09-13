@@ -20,6 +20,9 @@ router = APIRouter(tags=["mixes"])
 _OUTPUTS_ROOT = Path(__file__).parent.parent.parent / "outputs"
 DB_PATH = str(Path(__file__).parent.parent.parent / "data" / "app.db")
 MIN_TRACKS = 15
+# Chất lượng tối đa, không nén: luôn xuất 32-bit float.
+FORCED_BIT_DEPTH = 32
+MIN_SAMPLE_RATE = 44100
 DOWNLOAD_FILES = {
     "wav": ("mix.wav", "audio/wav"),
     "cue": ("mix.cue", "text/plain"),
@@ -64,6 +67,11 @@ def _on_success(mix_id: int, result: dict) -> None:
             mix.total_duration_seconds = result.get("total_duration_seconds")
             mix.track_count = result.get("track_count")
             mix.output_dir = result.get("output_dir")
+            # SR thực tế đã resolve trong worker (auto) — lưu lại cho chính xác.
+            if result.get("sample_rate"):
+                mix.sample_rate = result["sample_rate"]
+            if result.get("bit_depth"):
+                mix.bit_depth = result["bit_depth"]
             session.add(mix)
             session.commit()
 
@@ -102,12 +110,22 @@ def create_mix(project_id: int, data: MixCreate,
     if job_manager.is_busy():
         raise HTTPException(409, "Đang có 1 mix render. Vui lòng đợi hoàn tất.")
 
+    # ── Chốt chất lượng output ──
+    # Sample rate: 0/âm → auto = max native của library (sàn 44100), KHÔNG
+    # upsample giả. Nếu người dùng chỉ định thì tôn trọng nhưng không dưới sàn.
+    if not data.sample_rate or data.sample_rate <= 0:
+        sample_rate = max([t.sample_rate for t in tracks] + [MIN_SAMPLE_RATE])
+    else:
+        sample_rate = max(int(data.sample_rate), MIN_SAMPLE_RATE)
+    # Bit depth: luôn 32-bit float (không nén) để giữ headroom tối đa.
+    bit_depth = FORCED_BIT_DEPTH
+
     title = data.title or f"Mix {datetime.now():%Y-%m-%d %H:%M}"
     mix = Mix(
         project_id=project_id, title=title, status="pending",
         duration_minutes=data.duration_minutes,
         crossfade_seconds=data.crossfade_seconds,
-        sample_rate=data.sample_rate, bit_depth=data.bit_depth,
+        sample_rate=sample_rate, bit_depth=bit_depth,
     )
     session.add(mix)
     session.commit()
@@ -124,7 +142,7 @@ def create_mix(project_id: int, data: MixCreate,
     job_manager.submit(
         mix.id, core_bridge.run_mix_job,
         track_paths, str(output_dir), data.duration_minutes,
-        data.crossfade_seconds, data.sample_rate, data.bit_depth, DB_PATH,
+        data.crossfade_seconds, sample_rate, bit_depth, DB_PATH,
         on_success=_on_success, on_failure=_on_failure,
     )
     return to_mix_response(mix)

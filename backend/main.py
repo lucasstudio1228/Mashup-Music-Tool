@@ -15,7 +15,9 @@ from backend.job_manager import job_manager        # noqa: E402
 from backend.migrations import run_all as run_migrations  # noqa: E402
 from backend.routers import mixes, projects, settings, tracks  # noqa: E402
 from backend.routers.stems import router as stems_router        # noqa: E402
+from backend.routers.video import router as video_router        # noqa: E402
 from backend.stem_job_manager import stem_job_manager           # noqa: E402
+from backend.video.job_manager import video_job_manager         # noqa: E402
 
 app = FastAPI(title="MeditationMixer API")
 
@@ -38,7 +40,8 @@ async def startup():
     # Worker thread cần loop này để push SSE event.
     loop = asyncio.get_running_loop()
     job_manager.bind_loop(loop)
-    stem_job_manager.bind_loop(loop)   # ← mới
+    stem_job_manager.bind_loop(loop)
+    video_job_manager.bind_loop(loop)   # ← phần Video
 
 
 app.include_router(projects.router, prefix="/api")
@@ -46,6 +49,7 @@ app.include_router(tracks.router, prefix="/api")
 app.include_router(mixes.router, prefix="/api")
 app.include_router(settings.router)
 app.include_router(stems_router)   # đã có prefix="/api" nội bộ
+app.include_router(video_router)   # đã có prefix nội bộ
 
 
 @app.get("/api/health")
@@ -54,9 +58,6 @@ def health():
 
 
 # ─── Serve built frontend (production / distributable) ──────────────
-# Khi frontend/dist tồn tại (đã `npm run build`), backend phục vụ luôn
-# giao diện → chỉ cần 1 process, 1 port (8000), không cần Node runtime.
-# Các route /api/* ở trên được match TRƯỚC nên không bị catch-all che.
 from pathlib import Path                              # noqa: E402
 from fastapi.staticfiles import StaticFiles           # noqa: E402
 from fastapi.responses import FileResponse            # noqa: E402
@@ -73,7 +74,6 @@ if (_FRONTEND_DIST / "index.html").exists():
         return FileResponse(str(_FRONTEND_DIST / "index.html"))
 
     # SPA catch-all: file tĩnh thì trả file, còn lại trả index.html
-    # (để react-router xử lý deep-link như /projects/1 khi refresh).
     @app.get("/{full_path:path}")
     def _serve_spa(full_path: str):
         candidate = _FRONTEND_DIST / full_path

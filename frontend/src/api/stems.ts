@@ -2,18 +2,31 @@ import {
   useQuery, useMutation, useQueryClient
 } from "@tanstack/react-query";
 import { api, API_BASE } from "./client";
-import type { TrackStemInfo, StemVolumes, ProjectStemStatus } from "../types";
+import type {
+  TrackStemInfo, StemVolumes, StemDenoise, ProjectStemStatus
+} from "../types";
 
 /**
- * Backend dùng key `vol_*` (VolumeUpdate/BatchVolumeUpdate); frontend dùng
- * StemVolumes {other,bass,drums,vocals}. Map trước khi gửi.
+ * Backend dùng key `vol_*` / `den_*`; frontend dùng StemVolumes/StemDenoise
+ * {other,bass,drums,vocals}. Map trước khi gửi.
  */
-function toVolPayload(v: Partial<StemVolumes>): Record<string, number> {
+function toStemPayload(
+  v?: Partial<StemVolumes>,
+  d?: Partial<StemDenoise>,
+): Record<string, number> {
   const out: Record<string, number> = {};
-  if (v.other  !== undefined) out.vol_other  = v.other;
-  if (v.bass   !== undefined) out.vol_bass   = v.bass;
-  if (v.drums  !== undefined) out.vol_drums  = v.drums;
-  if (v.vocals !== undefined) out.vol_vocals = v.vocals;
+  if (v) {
+    if (v.other  !== undefined) out.vol_other  = v.other;
+    if (v.bass   !== undefined) out.vol_bass   = v.bass;
+    if (v.drums  !== undefined) out.vol_drums  = v.drums;
+    if (v.vocals !== undefined) out.vol_vocals = v.vocals;
+  }
+  if (d) {
+    if (d.other  !== undefined) out.den_other  = d.other;
+    if (d.bass   !== undefined) out.den_bass   = d.bass;
+    if (d.drums  !== undefined) out.den_drums  = d.drums;
+    if (d.vocals !== undefined) out.den_vocals = d.vocals;
+  }
   return out;
 }
 
@@ -64,7 +77,19 @@ export function useUpdateStemVolumes(trackId: number) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (volumes: Partial<StemVolumes>) =>
-      api.patch(`/api/tracks/${trackId}/stems/volumes`, toVolPayload(volumes)),
+      api.patch(`/api/tracks/${trackId}/stems/volumes`,
+                toStemPayload(volumes)),
+    onSuccess: () =>
+      qc.invalidateQueries({ queryKey: ["stems", trackId] }),
+  });
+}
+
+export function useUpdateStemDenoise(trackId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (denoise: Partial<StemDenoise>) =>
+      api.patch(`/api/tracks/${trackId}/stems/volumes`,
+                toStemPayload(undefined, denoise)),
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ["stems", trackId] }),
   });
@@ -73,9 +98,9 @@ export function useUpdateStemVolumes(trackId: number) {
 export function useApplyAllVolumes(projectId: number) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (volumes: StemVolumes) =>
+    mutationFn: (payload: { volumes: StemVolumes; denoise?: StemDenoise }) =>
       api.patch(`/api/projects/${projectId}/stems/volumes-all`,
-                toVolPayload(volumes)),
+                toStemPayload(payload.volumes, payload.denoise)),
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ["stems"] }),
   });

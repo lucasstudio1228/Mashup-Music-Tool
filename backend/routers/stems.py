@@ -20,12 +20,22 @@ class VolumeUpdate(BaseModel):
     vol_bass:   Optional[float] = Field(None, ge=0.0, le=2.0)
     vol_drums:  Optional[float] = Field(None, ge=0.0, le=2.0)
     vol_vocals: Optional[float] = Field(None, ge=0.0, le=2.0)
+    # Độ mạnh khử noise thủ công mỗi stem (0..1). None = không đổi.
+    den_other:  Optional[float] = Field(None, ge=0.0, le=1.0)
+    den_bass:   Optional[float] = Field(None, ge=0.0, le=1.0)
+    den_drums:  Optional[float] = Field(None, ge=0.0, le=1.0)
+    den_vocals: Optional[float] = Field(None, ge=0.0, le=1.0)
 
 class BatchVolumeUpdate(BaseModel):
     vol_other:  float = Field(ge=0.0, le=2.0)
     vol_bass:   float = Field(ge=0.0, le=2.0)
     vol_drums:  float = Field(ge=0.0, le=2.0)
     vol_vocals: float = Field(ge=0.0, le=2.0)
+    # Denoise là optional để tương thích client cũ; None = giữ nguyên.
+    den_other:  Optional[float] = Field(None, ge=0.0, le=1.0)
+    den_bass:   Optional[float] = Field(None, ge=0.0, le=1.0)
+    den_drums:  Optional[float] = Field(None, ge=0.0, le=1.0)
+    den_vocals: Optional[float] = Field(None, ge=0.0, le=1.0)
 
 # ── Helpers ────────────────────────────────────────────────────
 
@@ -36,7 +46,6 @@ def _get_or_create_stem_record(
         select(TrackStem).where(TrackStem.track_id == track_id)
     ).first()
     if not stem:
-        from datetime import datetime, timezone
         stem = TrackStem(track_id=track_id, project_id=project_id)
         db.add(stem)
         db.commit()
@@ -49,6 +58,8 @@ def _stem_to_response(stem: Optional[TrackStem]) -> dict:
             "status": "not_started",
             "volumes": {"other":1.0, "bass":1.0,
                         "drums":1.0, "vocals":1.0},
+            "denoise": {"other":0.0, "bass":0.0,
+                        "drums":0.0, "vocals":0.0},
             "waveform_data": None,
             "error_message": None,
         }
@@ -62,6 +73,12 @@ def _stem_to_response(stem: Optional[TrackStem]) -> dict:
             "drums":  stem.vol_drums,
             "vocals": stem.vol_vocals,
         },
+        "denoise": {
+            "other":  stem.den_other,
+            "bass":   stem.den_bass,
+            "drums":  stem.den_drums,
+            "vocals": stem.den_vocals,
+        },
         "waveform_data": (
             json.loads(stem.waveform_data) if stem.waveform_data else None
         ),
@@ -72,7 +89,7 @@ def _stem_to_response(stem: Optional[TrackStem]) -> dict:
 
 @router.get("/tracks/{track_id}/stems")
 def get_stem_info(track_id: int, db: Session = Depends(get_session)):
-    """Trả về trạng thái, volumes, waveform data."""
+    """Trả về trạng thái, volumes, denoise, waveform data."""
     stem = db.exec(
         select(TrackStem).where(TrackStem.track_id == track_id)
     ).first()
@@ -111,7 +128,6 @@ async def get_stem_audio(
         path=str(wav_path),
         media_type="audio/wav",
         filename=f"{track.filename}_{stem_name}.wav",
-        # Cache cho phép browser cache stems đã load
         headers={"Cache-Control": "private, max-age=3600"},
     )
 
@@ -178,8 +194,9 @@ def update_volumes(
     db: Session = Depends(get_session),
 ):
     """
-    Cập nhật volume sliders.
-    Validation (0.0–2.0) đã được Pydantic handle (ge/le).
+    Cập nhật volume sliders + độ mạnh khử noise (denoise) mỗi stem.
+    Validation (vol 0.0–2.0, den 0.0–1.0) đã được Pydantic handle.
+    Chỉ update field nào được gửi (khác None).
     """
     stem = db.exec(
         select(TrackStem).where(TrackStem.track_id == track_id)
@@ -192,6 +209,11 @@ def update_volumes(
     if body.vol_drums  is not None: stem.vol_drums  = body.vol_drums
     if body.vol_vocals is not None: stem.vol_vocals = body.vol_vocals
 
+    if body.den_other  is not None: stem.den_other  = body.den_other
+    if body.den_bass   is not None: stem.den_bass   = body.den_bass
+    if body.den_drums  is not None: stem.den_drums  = body.den_drums
+    if body.den_vocals is not None: stem.den_vocals = body.den_vocals
+
     db.add(stem)
     db.commit()
     return {
@@ -199,7 +221,11 @@ def update_volumes(
         "volumes": {
             "other":  stem.vol_other, "bass":  stem.vol_bass,
             "drums":  stem.vol_drums, "vocals": stem.vol_vocals,
-        }
+        },
+        "denoise": {
+            "other":  stem.den_other, "bass":  stem.den_bass,
+            "drums":  stem.den_drums, "vocals": stem.den_vocals,
+        },
     }
 
 @router.patch("/projects/{project_id}/stems/volumes-all")
@@ -209,7 +235,7 @@ def update_all_volumes(
     db: Session = Depends(get_session),
 ):
     """
-    Apply cùng volumes cho TẤT CẢ tracks trong project.
+    Apply cùng volumes (+ denoise nếu gửi) cho TẤT CẢ tracks trong project.
     Chỉ update tracks đã completed stems.
     """
     stems = db.exec(
@@ -228,6 +254,10 @@ def update_all_volumes(
         stem.vol_bass   = body.vol_bass
         stem.vol_drums  = body.vol_drums
         stem.vol_vocals = body.vol_vocals
+        if body.den_other  is not None: stem.den_other  = body.den_other
+        if body.den_bass   is not None: stem.den_bass   = body.den_bass
+        if body.den_drums  is not None: stem.den_drums  = body.den_drums
+        if body.den_vocals is not None: stem.den_vocals = body.den_vocals
         db.add(stem)
         updated += 1
 
@@ -240,6 +270,12 @@ def update_all_volumes(
             "bass":   body.vol_bass,
             "drums":  body.vol_drums,
             "vocals": body.vol_vocals,
+        },
+        "denoise": {
+            "other":  body.den_other,
+            "bass":   body.den_bass,
+            "drums":  body.den_drums,
+            "vocals": body.den_vocals,
         },
     }
 

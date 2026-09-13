@@ -12,11 +12,14 @@ import { StemPanel } from '../components/stems/StemPanel';
 import { StemSectionHeader } from '../components/stems/StemSectionHeader';
 import { ApplyAllPanel } from '../components/stems/ApplyAllPanel';
 import { StemPlayerBar } from '../components/stems/StemPlayerBar';
+import VideoPanel from '../components/video/VideoPanel';
 import { useStemPlayer } from '../hooks/useStemPlayer';
 import { useProject, useUpdateProject } from '../api/projects';
 import { useTracks, useDeleteTrack } from '../api/tracks';
 import { useMixes, useCreateMix, useDeleteMix } from '../api/mixes';
 import type { Mix, MixCreate } from '../types';
+
+type Tab = 'audio' | 'video';
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -41,6 +44,7 @@ export default function ProjectDetailPage() {
   const createMix = useCreateMix(projectId);
   const deleteMix = useDeleteMix(projectId);
 
+  const [tab, setTab] = useState<Tab>('audio');
   const [editing, setEditing] = useState(false);
   const [activeMixId, setActiveMixId] = useState<number | null>(null);
   const [mixToDelete, setMixToDelete] = useState<Mix | null>(null);
@@ -78,6 +82,13 @@ export default function ProjectDetailPage() {
     });
   }
 
+  const tabBtn = (t: Tab) =>
+    `px-4 py-2 text-sm font-medium rounded-lg transition-colors ${
+      tab === t
+        ? 'bg-accent text-white'
+        : 'bg-surface-2 text-gray-300 hover:bg-white/10'
+    }`;
+
   return (
     <AppShell
       title={project.name}
@@ -98,66 +109,80 @@ export default function ProjectDetailPage() {
         </>
       }
     >
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-        {/* Left column: Tracks */}
-        <div className="space-y-4">
-          <Section title={`Tracks (${trackList.length})`}>
-            <TrackList tracks={trackList} onDelete={(tid) => deleteTrack.mutate(tid)} />
-          </Section>
-          <Section title="Add Tracks">
-            <AddTracksPanel projectId={projectId} />
-          </Section>
-
-          {trackList.length > 0 && (
-            <Section title="Stem Separation">
-              <div className="space-y-2">
-                <StemSectionHeader projectId={projectId} />
-
-                <ApplyAllPanel projectId={projectId} />
-
-                <p className="text-xs text-gray-600">
-                  ⚡ RTX 3060 · ~1–2 phút/track (GPU, model đã cache) · model htdemucs_ft · -16 LUFS
-                </p>
-                <p className="text-xs text-gray-600">
-                  🔄 Chạy nền — không ảnh hưởng render mix
-                </p>
-
-                <div className="space-y-1 max-h-[500px] overflow-y-auto
-                                pr-1 custom-scrollbar">
-                  {trackList.map((track) => (
-                    <StemPanel
-                      key={track.id}
-                      trackId={track.id}
-                      trackName={track.filename}
-                      isActiveTrack={playerState.activeTrackId === track.id}
-                      isPlaying={playerState.isPlaying}
-                      onPlayTrack={handlePlayTrack}
-                      onSetVolume={playerControls.setVolume}
-                    />
-                  ))}
-                </div>
-              </div>
-            </Section>
-          )}
-        </div>
-
-        {/* Right column: Mix settings + history */}
-        <div className="space-y-4">
-          <Section title="Mix Settings">
-            <MixSettingsPanel
-              trackCount={trackList.length}
-              disabled={createMix.isPending}
-              onStart={startMix}
-            />
-            {startError && (
-              <p className="mt-2 text-xs text-red-400">{startError}</p>
-            )}
-          </Section>
-          <Section title={`Mix History (${mixList.length})`}>
-            <MixHistoryList mixes={mixList} onDelete={setMixToDelete} />
-          </Section>
-        </div>
+      {/* Tabs: Audio / Video */}
+      <div className="mb-5 flex gap-2">
+        <button className={tabBtn('audio')} onClick={() => setTab('audio')}>
+          🎵 Audio
+        </button>
+        <button className={tabBtn('video')} onClick={() => setTab('video')}>
+          🎬 Video
+        </button>
       </div>
+
+      {tab === 'audio' && (
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+          {/* Left column: Tracks */}
+          <div className="space-y-4">
+            <Section title={`Tracks (${trackList.length})`}>
+              <TrackList tracks={trackList} onDelete={(tid) => deleteTrack.mutate(tid)} />
+            </Section>
+            <Section title="Add Tracks">
+              <AddTracksPanel projectId={projectId} />
+            </Section>
+
+            {trackList.length > 0 && (
+              <Section title="Stem Separation">
+                <div className="space-y-2">
+                  <StemSectionHeader projectId={projectId} />
+
+                  <ApplyAllPanel projectId={projectId} />
+
+                  <p className="text-xs text-gray-600">
+                    ⚡ RTX 3060 · ~5–10 phút/track (chất lượng tối đa: shifts=5, overlap 0.5) · htdemucs_ft · -16 LUFS
+                  </p>
+                  <p className="text-xs text-gray-600">
+                    🔄 Chạy nền — không ảnh hưởng render mix
+                  </p>
+
+                  <div className="space-y-1 max-h-[500px] overflow-y-auto
+                                  pr-1 custom-scrollbar">
+                    {trackList.map((track) => (
+                      <StemPanel
+                        key={track.id}
+                        trackId={track.id}
+                        trackName={track.filename}
+                        isActiveTrack={playerState.activeTrackId === track.id}
+                        isPlaying={playerState.isPlaying}
+                        onPlayTrack={handlePlayTrack}
+                        onSetVolume={playerControls.setVolume}
+                      />
+                    ))}
+                  </div>
+                </div>
+              </Section>
+            )}
+          </div>
+
+          {/* Right column: Mix settings + history */}
+          <div className="space-y-4">
+            <Section title="Mix Settings">
+              <MixSettingsPanel
+                trackCount={trackList.length}
+                disabled={createMix.isPending}
+                onStart={startMix}
+              />
+              {startError && (
+                <p className="mt-2 text-xs text-red-400">{startError}</p>
+              )}
+            </Section>
+            <Section title={`Mix History (${mixList.length})`}>
+              <MixHistoryList mixes={mixList} onDelete={setMixToDelete} />
+            </Section>
+          </div>
+        </div>
+      )}
+
+      {tab === 'video' && <VideoPanel projectId={projectId} />}
 
       {editing && (
         <ProjectFormModal

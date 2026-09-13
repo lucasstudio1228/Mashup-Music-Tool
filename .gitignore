@@ -4,12 +4,16 @@ __pycache__/
 .env
 .venv/
 venv/
+.browser_profile/
+.runtime_packages/
+.runtime_packages311/
 
 # App data & output (nguoi dung tu sinh - KHONG day len repo)
 data/
 outputs/
 stems/
 Projects/
+media/
 *.db
 *.sqlite
 *.sqlite3

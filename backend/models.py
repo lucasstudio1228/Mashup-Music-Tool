@@ -62,6 +62,15 @@ class TrackStem(SQLModel, table=True):
     vol_drums:  float = Field(default=1.0)   # Trống
     vol_vocals: float = Field(default=1.0)   # Giọng hát
 
+    # Độ mạnh khử noise THỦ CÔNG mỗi stem — range 0.0 → 1.0
+    # 0.0 = chỉ khử tự động theo volume (mặc định, giữ hành vi cũ)
+    # >0  = ép khử mạnh hơn kể cả khi stem để nguyên
+    # Strength thực tế lúc mix = max(clip(1 - volume), den_*)
+    den_other:  float = Field(default=0.0)   # Âm nhạc
+    den_bass:   float = Field(default=0.0)   # Âm trầm
+    den_drums:  float = Field(default=0.0)   # Trống
+    den_vocals: float = Field(default=0.0)   # Giọng hát
+
     # Gain LUFS normalization đã apply (linear scalar)
     # Lưu để reference, không dùng lại
     lufs_gain_applied: Optional[float] = None
@@ -83,8 +92,10 @@ class Mix(SQLModel, table=True):
     # Settings snapshot
     duration_minutes: float = 60.0
     crossfade_seconds: float = 15.0
-    sample_rate: int = 96000
-    bit_depth: int = 24
+    # 0 = auto (max native, không upsample giả) — được resolve khi tạo mix.
+    sample_rate: int = 0
+    # 32-bit float (không nén) = chất lượng tối đa.
+    bit_depth: int = 32
     # Output
     output_dir: Optional[str] = None    # absolute path
     total_duration_seconds: Optional[float] = None

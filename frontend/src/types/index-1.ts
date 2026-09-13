@@ -139,14 +139,14 @@ export interface ProjectStemStatus {
 export interface VideoParamsInfo {
   image_count:    number;
   clip_seconds:   number;
-  rest_clips:     number;
+  rest_clips?:    number;
   total_clips:    number;
   t_window:       number;
   model:          string;
   aspect_ratio:   string;
-  flow_mode:      string;
-  blend_seconds:  number;
-  slow_speed:     number;
+  flow_mode?:     string;
+  blend_seconds?: number;
+  slow_speed?:    number;
 }
 
 export type VideoJobStatus = 'pending' | 'running' | 'completed' | 'failed';

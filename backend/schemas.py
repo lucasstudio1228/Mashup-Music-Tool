@@ -76,8 +76,10 @@ class ScanResult(BaseModel):
 class MixCreate(BaseModel):
     duration_minutes: float = 60.0
     crossfade_seconds: float = 15.0
-    sample_rate: int = 96000
-    bit_depth: int = 24
+    # sample_rate = 0 → auto (max native của library, không upsample giả).
+    sample_rate: int = 0
+    # bit_depth mặc định 32 (float, không nén) — chất lượng tối đa.
+    bit_depth: int = 32
     title: Optional[str] = None
 
 

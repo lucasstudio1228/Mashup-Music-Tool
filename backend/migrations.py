@@ -74,8 +74,37 @@ def migrate_create_stem_directories():
     stems_root.mkdir(exist_ok=True)
 
 
+def migrate_add_denoise_columns():
+    """
+    M003: Thêm cột den_other/den_bass/den_drums/den_vocals vào trackstem
+    (độ mạnh khử noise thủ công mỗi stem, 0.0 = auto theo volume như cũ).
+    """
+    if not DB_PATH.exists():
+        return
+
+    conn = _get_conn()
+    try:
+        if not _table_exists(conn, "trackstem"):
+            return  # Bảng chưa có → create_db_and_tables sẽ tạo đủ cột
+        cols = ["den_other", "den_bass", "den_drums", "den_vocals"]
+        missing = [c for c in cols if not _column_exists(conn, "trackstem", c)]
+        if not missing:
+            return  # Đã migrate rồi
+        print(f"  [Migration M003] Adding denoise columns: {missing}")
+        for col in missing:
+            conn.execute(
+                f"ALTER TABLE trackstem ADD COLUMN {col} FLOAT DEFAULT 0.0")
+        conn.commit()
+        print("  [Migration M003] Done.")
+    except Exception as e:
+        raise RuntimeError(f"Migration M003 failed: {e}") from e
+    finally:
+        conn.close()
+
+
 def run_all():
     """Gọi hàm này ở startup, trước create_db_and_tables()."""
-    migrate_remove_project_api_fields()   # M001 — đã có
-    migrate_create_stem_directories()      # M002 — mới
+    migrate_remove_project_api_fields()   # M001
+    migrate_create_stem_directories()      # M002
+    migrate_add_denoise_columns()          # M003 — mới
     # Thêm migration mới vào đây theo thứ tự

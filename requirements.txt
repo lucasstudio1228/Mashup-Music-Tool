@@ -18,3 +18,7 @@ sqlmodel>=0.0.18
 python-multipart>=0.0.9
 aiofiles>=23.0.0
 requests>=2.31.0
+# Phần Video: tự động hoá ChatGPT/Flow bằng trình duyệt.
+#   Sau khi pip install, chạy 1 lần:  playwright install chromium
+#   (hoặc dùng Chrome sẵn có — config.BrowserConfig.chrome_channel="chrome")
+playwright>=1.44.0

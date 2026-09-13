@@ -2,6 +2,15 @@
 stem_service.py
 Wrapper cho Demucs htdemucs_ft.
 Chạy trong ThreadPoolExecutor — không có asyncio context.
+
+Triết lý chất lượng ("cân bằng thông minh"):
+  - Tách stem ở CHẤT LƯỢNG TỐI ĐA (shifts cao + overlap 0.5) để bleed thấp nhất
+    ngay từ đầu.
+  - LƯU STEM GẦN NHƯ NGUYÊN BẢN (chỉ LUFS-normalize, KHÔNG nướng denoise cứng)
+    → để nguyên volume thì chất âm giữ tối đa.
+  - Khử noise/bleed được làm LÚC MIX, phụ thuộc mức volume: kéo stem càng thấp
+    thì gate + spectral-denoise + downward-expander càng mạnh → bleed biến mất
+    triệt để đúng lúc muốn bỏ stem đó (xem load_mixed_stems / _smart_clean).
 """
 import json, sqlite3, numpy as np, soundfile as sf
 from pathlib import Path
@@ -11,6 +20,15 @@ from typing import Callable, Optional
 STEMS_ROOT = Path(__file__).parent.parent / "stems"
 DB_PATH    = Path(__file__).parent.parent / "data" / "app.db"
 STEM_NAMES = ["other", "bass", "drums", "vocals"]
+
+# ─── Cấu hình chất lượng tách (max quality) ─────────────────────
+# shifts = test-time augmentation: chạy model nhiều lần với dịch pha rồi trung
+# bình → ít artifact & bleed hơn, nhưng chậm tuyến tính theo số shifts.
+# overlap cao → giảm seam artifact giữa các segment.
+# GPU chịu được shifts cao; CPU để thấp hơn cho đỡ quá lâu.
+SEP_SHIFTS_GPU = 5
+SEP_SHIFTS_CPU = 2
+SEP_OVERLAP    = 0.5
 
 # ─── DB helpers (sqlite3 thuần — không dùng SQLModel) ───────────
 
@@ -77,57 +95,102 @@ def _rms_thumbnail(audio: np.ndarray, n_points: int = 200) -> list[float]:
     mx = max(pts) or 1.0
     return [v / mx for v in pts]
 
-# ─── Spectral noise gate (giảm bleed sau Demucs) ────────────────
+# ─── Khử noise/bleed phụ thuộc volume (chạy lúc MIX) ─────────────
+#
+# strength ∈ [0, 1]: 0 = không đụng gì (stem để nguyên) → chất âm tối đa.
+#                    1 = stem bị kéo về ~0 → khử triệt để.
+# Được tính từ mức volume trong load_mixed_stems: strength = clip(1 - vol, 0, 1).
 
-# Cường độ khử noise theo từng stem. prop_decrease tối đa 0.7 —
-# cao hơn dễ làm méo nhạc chính. drums/vocals bleed nhiều nhất.
-_DENOISE_CONFIG = {
-    "other":  {"prop_decrease": 0.6, "n_fft": 2048},
-    "vocals": {"prop_decrease": 0.7, "n_fft": 2048},
-    "bass":   {"prop_decrease": 0.5, "n_fft": 2048},
-    "drums":  {"prop_decrease": 0.7, "n_fft": 2048},
-}
+# Dưới ngưỡng này coi như "để nguyên" → bỏ qua xử lý cho khỏi tốn CPU + giữ
+# nguyên chất âm.
+_CLEAN_EPS = 0.05
 
-def _denoise_stem(audio: np.ndarray, sr: int, stem_name: str) -> np.ndarray:
+# prop_decrease cho spectral gate, nội suy theo strength (nhẹ → rất mạnh).
+_SPECTRAL_MIN = 0.45
+_SPECTRAL_MAX = 0.95
+
+
+def _env_follow(x: np.ndarray, sr: int, tau: float = 0.030) -> np.ndarray:
+    """Bao biên (envelope) mượt bằng one-pole IIR — O(n), rất nhanh."""
+    try:
+        from scipy.signal import lfilter
+        a = float(np.exp(-1.0 / max(tau * sr, 1.0)))
+        return lfilter([1.0 - a], [1.0, -a], x).astype(np.float32)
+    except Exception:
+        # Fallback: không smooth (vẫn hoạt động, chỉ kém mượt hơn).
+        return x.astype(np.float32)
+
+
+def _downward_expander(audio: np.ndarray, sr: int, strength: float) -> np.ndarray:
     """
-    Spectral noise gate (stationary) để giảm bleed artifacts.
-
-    - Xử lý từng channel riêng (stereo), giữ float32 xuyên suốt.
-    - Fallback: nếu noisereduce lỗi/chậm → trả nguyên audio gốc,
-      log warning, KHÔNG block pipeline (constraint 3).
+    Downward expander: đè các đoạn năng lượng THẤP (chủ yếu là bleed/noise ở
+    khoảng lặng) xuống sâu, giữ nguyên các đoạn năng lượng cao (tín hiệu thật).
+    Ngưỡng và độ sâu tăng theo strength.
     """
+    if strength <= 0:
+        return audio
+    x = np.ascontiguousarray(audio, dtype=np.float32)
+    mono = x.mean(axis=1) if x.ndim == 2 else x
+
+    env  = _env_follow(np.abs(mono), sr, tau=0.030)
+    ref  = float(np.percentile(env, 99)) or 1.0
+
+    # Ngưỡng: -45 dB (nhẹ) → -25 dB (mạnh) so với đỉnh.
+    thr_db = -45.0 + strength * 20.0
+    thr    = ref * (10.0 ** (thr_db / 20.0))
+    # Sàn gain khi dưới ngưỡng: -20 dB (nhẹ) → -80 dB (gần như câm).
+    floor  = 10.0 ** ((-20.0 - strength * 60.0) / 20.0)
+
+    ratio = np.clip(env / (thr + 1e-9), 0.0, 1.0)     # gần ngưỡng → gần 1
+    gain  = np.where(env < thr, floor + (1.0 - floor) * ratio, 1.0).astype(np.float32)
+    gain  = _env_follow(gain, sr, tau=0.050)          # làm mượt để tránh zipper
+
+    return (x * gain[:, None]).astype(np.float32) if x.ndim == 2 \
+        else (x * gain).astype(np.float32)
+
+
+def _spectral_clean(audio: np.ndarray, sr: int, strength: float,
+                    stem_name: str) -> np.ndarray:
+    """Spectral noise gate (noisereduce) — khử bleed/hiss băng rộng."""
+    if strength <= 0:
+        return audio
     try:
         import noisereduce as nr
-    except Exception as e:
-        print(f"  ⚠️  noisereduce không khả dụng ({e}) — bỏ qua denoise {stem_name}")
+    except Exception:
         return audio
 
-    cfg = _DENOISE_CONFIG.get(stem_name, {"prop_decrease": 0.6, "n_fft": 2048})
-
+    prop = _SPECTRAL_MIN + (_SPECTRAL_MAX - _SPECTRAL_MIN) * float(strength)
     try:
-        result     = np.zeros_like(audio, dtype=np.float32)
-        n_channels = audio.shape[1] if audio.ndim == 2 else 1
-
-        for ch in range(n_channels):
-            channel = audio[:, ch] if audio.ndim == 2 else audio
-            cleaned = nr.reduce_noise(
-                y=channel.astype(np.float32),
-                sr=sr,
-                stationary=True,
-                prop_decrease=cfg["prop_decrease"],
-                n_fft=cfg["n_fft"],
-                n_jobs=1,          # tránh multiprocessing conflict trong thread
-            ).astype(np.float32)
-
-            if audio.ndim == 2:
-                result[:, ch] = cleaned
-            else:
-                result = cleaned
-
-        return result
+        x = np.ascontiguousarray(audio, dtype=np.float32)
+        if x.ndim == 1:
+            return nr.reduce_noise(y=x, sr=sr, stationary=True,
+                                   prop_decrease=prop, n_fft=2048,
+                                   n_jobs=1).astype(np.float32)
+        out = np.zeros_like(x, dtype=np.float32)
+        for ch in range(x.shape[1]):
+            out[:, ch] = nr.reduce_noise(
+                y=x[:, ch], sr=sr, stationary=True,
+                prop_decrease=prop, n_fft=2048, n_jobs=1).astype(np.float32)
+        return out
     except Exception as e:
-        print(f"  ⚠️  denoise {stem_name} lỗi ({type(e).__name__}: {e}) — dùng stem gốc")
+        print(f"  ⚠️  spectral_clean {stem_name} lỗi ({type(e).__name__}: {e}) "
+              f"— dùng stem gốc")
         return audio
+
+
+def _smart_clean(audio: np.ndarray, sr: int, strength: float,
+                 stem_name: str) -> np.ndarray:
+    """
+    Kết hợp "mọi cách" để khử triệt để khi stem bị giảm:
+      1. Spectral gate  → bỏ hiss/bleed băng rộng.
+      2. Downward expander → bỏ bleed còn sót ở khoảng lặng.
+    strength càng cao xử lý càng mạnh; strength≈0 thì trả nguyên audio.
+    """
+    if strength < _CLEAN_EPS:
+        return audio
+    cleaned = _spectral_clean(audio, sr, strength, stem_name)
+    cleaned = _downward_expander(cleaned, sr, strength)
+    return cleaned
 
 # ─── CUDA check ─────────────────────────────────────────────────
 
@@ -154,21 +217,22 @@ def separate_track(
     progress_cb: Optional[Callable[[str], None]] = None,
 ) -> None:
     """
-    Chạy Demucs htdemucs_ft cho 1 track.
+    Chạy Demucs htdemucs_ft cho 1 track ở CHẤT LƯỢNG TỐI ĐA.
     Gọi từ StemJobManager trong ThreadPoolExecutor.
 
     Pipeline:
       1. Load track gốc → đo LUFS
-      2. Demucs separation → 4 stem tensors (float32)
+      2. Demucs separation (shifts cao, overlap 0.5) → 4 stem tensors
       3. Convert tensors → numpy arrays
       4. Apply LUFS normalization (cùng gain cho tất cả stems)
-      5. Lưu mỗi stem thành WAV float32
+      5. Lưu mỗi stem thành WAV float32 (KHÔNG nén, gần như nguyên bản)
       6. Tính waveform thumbnails
       7. Lưu kết quả vào DB
+
+    Lưu ý: KHÔNG denoise ở đây — giữ stem nguyên chất; việc khử noise/bleed
+    được làm lúc mix theo mức volume (load_mixed_stems).
     """
     import demucs.api
-    import torchaudio
-    import torch
     from backend.loudness_service import (
         normalize_stems_to_target, TARGET_LUFS
     )
@@ -186,21 +250,21 @@ def separate_track(
         if original.ndim == 1:
             original = np.column_stack([original, original])
 
-        # ── Bước 2: Khởi tạo Demucs ──
+        # ── Bước 2: Khởi tạo Demucs (max quality) ──
         if progress_cb: progress_cb("Đang load model htdemucs_ft...")
         device = _get_device()
+        shifts = SEP_SHIFTS_GPU if device == "cuda" else SEP_SHIFTS_CPU
         separator = demucs.api.Separator(
             model="htdemucs_ft",
             device=device,
-            # Dùng shifts=1 để chất lượng tốt hơn (ít artifact hơn)
-            # shifts=0 nhanh hơn nhưng có thể nghe tiếng "metallic"
-            shifts=1,
-            overlap=0.25,     # overlap giữa các chunk — tránh seam artifact
+            shifts=shifts,        # test-time augmentation → ít artifact/bleed
+            overlap=SEP_OVERLAP,  # 0.5 → giảm seam artifact
         )
 
         # ── Bước 3: Separation ──
         if progress_cb: progress_cb(
-            f"Đang tách stems {'(GPU)' if device=='cuda' else '(CPU)'}...")
+            f"Đang tách stems chất lượng cao "
+            f"{'(GPU)' if device=='cuda' else '(CPU)'} shifts={shifts}...")
         origin_tensor, separated = separator.separate_audio_file(audio_path)
 
         # ── Bước 4: Convert tensor → numpy float32 ──
@@ -209,27 +273,13 @@ def separate_track(
         for name, tensor in separated.items():
             if name not in STEM_NAMES:
                 continue
-            # Chuyển về (samples, channels) — chuẩn soundfile
-            arr = tensor.cpu().numpy().T.astype(np.float32)
-            # Đảm bảo stereo
+            arr = tensor.cpu().numpy().T.astype(np.float32)   # → (samples, ch)
             if arr.ndim == 1:
                 arr = np.column_stack([arr, arr])
             stem_arrays[name] = arr
 
-        # ── Bước 4.5: Denoise stems (spectral gate — giảm bleed) ──
-        # Chạy TRƯỚC LUFS normalize, trên sr gốc của stem (= separator.samplerate).
-        if progress_cb: progress_cb("Đang khử noise...")
-        stem_sr = separator.samplerate
-        for name in STEM_NAMES:
-            if name in stem_arrays:
-                stem_arrays[name] = _denoise_stem(
-                    stem_arrays[name], stem_sr, name
-                )
-
         # ── Bước 5: LUFS Normalization ──
         if progress_cb: progress_cb("Đang normalize LUFS...")
-
-        # Resample original về sr của separator nếu cần (thường là 44100)
         target_sr = separator.samplerate
         if orig_sr != target_sr:
             import librosa
@@ -247,27 +297,23 @@ def separate_track(
         )
 
         # ── Existence guard: tránh orphan files nếu project/track bị xóa
-        #    trong khi job đang chạy (demucs mất ~40 phút) ──
+        #    trong khi job đang chạy ──
         if not _stem_record_still_exists(stem_id):
-            # Project/track đã bị xóa trong khi job đang chạy
-            # Dọn sạch out_dir nếu đã tạo, không write gì cả
             import shutil
             if out_dir.exists():
                 shutil.rmtree(out_dir, ignore_errors=True)
-            return   # Không raise, không set status — row đã không còn
+            return
 
-        # Lazy mkdir: chỉ tạo directory khi record còn tồn tại (sau guard)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # ── Bước 6: Lưu WAV float32 (KHÔNG nén) ──
+        # ── Bước 6: Lưu WAV float32 (KHÔNG nén, giữ nguyên chất) ──
         if progress_cb: progress_cb("Đang lưu stem files...")
         for name in STEM_NAMES:
-            arr      = normalized_stems.get(name)
+            arr = normalized_stems.get(name)
             if arr is None:
                 continue
             wav_path = out_dir / f"{name}.wav"
             sf.write(str(wav_path), arr, target_sr, subtype="FLOAT")
-            # FLOAT = 32-bit float PCM — không mất chất lượng
 
         # ── Bước 7: Waveform thumbnails ──
         if progress_cb: progress_cb("Đang tính waveform...")
@@ -297,15 +343,26 @@ def load_mixed_stems(
     vol_drums:  float,
     vol_vocals: float,
     target_sr:  int,
+    den_other:  float = 0.0,
+    den_bass:   float = 0.0,
+    den_drums:  float = 0.0,
+    den_vocals: float = 0.0,
 ) -> Optional[np.ndarray]:
     """
-    Load 4 stem WAV files, apply volume, mix thành 1 stereo array.
-    Return None nếu bất kỳ stem nào thiếu.
+    Load 4 stem WAV, khử noise/bleed THÔNG MINH theo volume, apply volume,
+    mix thành 1 stereo array.  Return None nếu bất kỳ stem nào thiếu.
 
     Volume range 0.0–2.0:
       0.0 = mute hoàn toàn
-      1.0 = giữ nguyên (sau LUFS normalize)
+      1.0 = giữ nguyên (sau LUFS normalize) — KHÔNG khử gì, chất âm tối đa
       2.0 = boost gấp đôi
+
+    Cơ chế "cân bằng thông minh":
+      strength = clip(1 - volume, 0, 1)
+      - volume ≥ ~0.95 → strength ≈ 0 → stem giữ nguyên bản.
+      - volume càng thấp → strength càng cao → spectral gate + downward
+        expander càng mạnh → bleed/noise của stem đó bị khử triệt để trước
+        khi bị kéo nhỏ, nên không còn "bóng ma" bleed trong bản mix.
 
     Sau khi mix: soft limiter để tránh méo tiếng.
     """
@@ -318,8 +375,14 @@ def load_mixed_stems(
         "drums":  vol_drums,
         "vocals": vol_vocals,
     }
+    # Độ mạnh khử noise thủ công mỗi stem (0..1) — làm sàn cho strength.
+    manual_denoise = {
+        "other":  den_other,
+        "bass":   den_bass,
+        "drums":  den_drums,
+        "vocals": den_vocals,
+    }
 
-    # Kiểm tra tất cả 4 stems tồn tại
     for name in STEM_NAMES:
         if not (stem_dir / f"{name}.wav").exists():
             return None
@@ -329,23 +392,38 @@ def load_mixed_stems(
     for name in STEM_NAMES:
         arr, sr = sf.read(str(stem_dir / f"{name}.wav"), dtype="float32")
 
-        # Resample về target_sr nếu khác
-        if sr != target_sr:
-            arr = librosa.resample(
-                arr.T, orig_sr=sr, target_sr=target_sr,
-                res_type="kaiser_best"
-            ).T
-
-        # Đảm bảo stereo
+        # Đảm bảo stereo TRƯỚC khi xử lý.
         if arr.ndim == 1:
             arr = np.column_stack([arr, arr])
         elif arr.shape[1] == 1:
             arr = np.column_stack([arr[:, 0], arr[:, 0]])
 
-        # Apply volume
-        arr = arr * volumes[name]
+        vol = volumes[name]
+        if vol is None:
+            vol = 1.0
 
-        # Accumulate
+        # Khử noise/bleed — làm ở sr GỐC của stem (chính xác hơn), trước resample.
+        # strength = max(tự động theo volume, thủ công do người dùng đặt).
+        auto_strength   = float(np.clip(1.0 - vol, 0.0, 1.0))
+        manual_strength = float(np.clip(manual_denoise.get(name, 0.0) or 0.0,
+                                        0.0, 1.0))
+        strength = max(auto_strength, manual_strength)
+        if strength >= _CLEAN_EPS:
+            arr = _smart_clean(arr, sr, strength, name)
+
+        # Resample về target_sr nếu khác.
+        if sr != target_sr:
+            arr = librosa.resample(
+                arr.T, orig_sr=sr, target_sr=target_sr,
+                res_type="kaiser_best"
+            ).T
+            if arr.ndim == 1:
+                arr = np.column_stack([arr, arr])
+
+        # Apply volume.
+        arr = arr * vol
+
+        # Accumulate.
         if mixed is None:
             mixed = arr
         else:
@@ -355,7 +433,7 @@ def load_mixed_stems(
     if mixed is None:
         return None
 
-    # Soft limiter sau khi mix (KHÔNG hard-clip)
+    # Soft limiter sau khi mix (KHÔNG hard-clip).
     peak = np.max(np.abs(mixed))
     if peak > 0.99:
         mixed = mixed * (0.99 / peak)

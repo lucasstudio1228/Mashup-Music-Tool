@@ -7,14 +7,23 @@ interface Props {
   onStart: (settings: MixCreate) => void;
 }
 
-const SAMPLE_RATES = [48000, 88200, 96000, 176400, 192000];
+// 0 = Auto (lấy sample rate gốc cao nhất của library, không upsample giả).
+const SAMPLE_RATES = [0, 48000, 88200, 96000, 176400, 192000];
+const SR_LABEL: Record<number, string> = {
+  0: 'Auto (gốc cao nhất)',
+  48000: '48000 Hz',
+  88200: '88200 Hz',
+  96000: '96000 Hz',
+  176400: '176400 Hz',
+  192000: '192000 Hz',
+};
 const MIN_TRACKS = 15;
 
 export default function MixSettingsPanel({ trackCount, disabled, onStart }: Props) {
   const [duration, setDuration] = useState(60);
   const [crossfade, setCrossfade] = useState(15);
-  const [sampleRate, setSampleRate] = useState(96000);
-  const [bitDepth, setBitDepth] = useState<24 | 32>(24);
+  const [sampleRate, setSampleRate] = useState(0);        // mặc định Auto
+  const [bitDepth, setBitDepth] = useState<24 | 32>(32);  // mặc định 32-bit float
 
   const enoughTracks = trackCount >= MIN_TRACKS;
 
@@ -47,13 +56,13 @@ export default function MixSettingsPanel({ trackCount, disabled, onStart }: Prop
 
       <Row label="Sample Rate">
         <select
-          className={inputCls + ' w-32'}
+          className={inputCls + ' w-40'}
           value={sampleRate}
           onChange={(e) => setSampleRate(Number(e.target.value))}
         >
           {SAMPLE_RATES.map((sr) => (
             <option key={sr} value={sr}>
-              {sr} Hz
+              {SR_LABEL[sr]}
             </option>
           ))}
         </select>
@@ -73,6 +82,11 @@ export default function MixSettingsPanel({ trackCount, disabled, onStart }: Prop
           ))}
         </div>
       </Row>
+
+      <p className="text-xs text-gray-600">
+        🎧 Chất lượng tối đa: xuất WAV 32-bit float (không nén). Auto giữ đúng
+        sample rate gốc cao nhất, không upsample giả.
+      </p>
 
       {!enoughTracks && (
         <div className="rounded-lg bg-yellow-500/10 px-3 py-2 text-xs text-yellow-300">

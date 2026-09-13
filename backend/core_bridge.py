@@ -22,6 +22,10 @@ from metadata_writer import write_metadata  # noqa: E402
 from playlist_generator import generate_playlist  # noqa: E402
 from track_namer import generate_names  # noqa: E402
 
+# Sàn sample rate: không upsample giả xuống dưới mức này, cũng không ép lên cao
+# hơn nguồn. 44100 = sr gốc của stem Demucs.
+MIN_SAMPLE_RATE = 44100
+
 
 def scan_folder(folder_path: str, recursive: bool = False) -> tuple[list[Track], list[str]]:
     """
@@ -73,6 +77,14 @@ def _load_ignore_minimum(paths: list[str]) -> list[Track]:
         audio_loader.MIN_TRACKS = original
 
 
+def resolve_target_sample_rate(track_sample_rates: list[int]) -> int:
+    """
+    Auto sample rate = max native trong library (sàn 44100), KHÔNG upsample giả.
+    Dùng khi người dùng chọn 'Auto (gốc cao nhất)'.
+    """
+    return max(list(track_sample_rates) + [MIN_SAMPLE_RATE])
+
+
 def get_api_config_from_db(db_path: str) -> APIConfig:
     """
     Đọc AppSettings từ SQLite trực tiếp (không qua FastAPI session)
@@ -114,6 +126,7 @@ def _load_track_audio_with_stems(
     """
     Load audio cho 1 track:
       Path A (stems ready): mix 4 stems với volume settings → đã LUFS normalized
+                            + đã khử noise/bleed thông minh theo volume
       Path B (fallback):    load file gốc → apply LUFS normalization
 
     Không bao giờ raise → luôn trả về audio array hợp lệ.
@@ -129,7 +142,9 @@ def _load_track_audio_with_stems(
             SELECT t.id, t.project_id,
                    ts.status,
                    ts.vol_other, ts.vol_bass,
-                   ts.vol_drums, ts.vol_vocals
+                   ts.vol_drums, ts.vol_vocals,
+                   ts.den_other, ts.den_bass,
+                   ts.den_drums, ts.den_vocals
             FROM track t
             LEFT JOIN trackstem ts ON ts.track_id = t.id
             WHERE t.filepath = ?
@@ -138,17 +153,20 @@ def _load_track_audio_with_stems(
         conn.close()
 
     if row and row[2] == "completed":
-        track_id, project_id, _, vo, vb, vd, vv = row
+        (track_id, project_id, _, vo, vb, vd, vv,
+         do, db_, dd, dv) = row
         from backend.stem_service import load_mixed_stems
         mixed = load_mixed_stems(
             project_id=project_id,
             track_id=track_id,
             vol_other=vo,  vol_bass=vb,
             vol_drums=vd,  vol_vocals=vv,
+            den_other=do,  den_bass=db_,
+            den_drums=dd,  den_vocals=dv,
             target_sr=target_sr,
         )
         if mixed is not None:
-            # Stems đã được LUFS normalized trong stem_service
+            # Stems đã được LUFS normalized + smart-clean trong stem_service
             return mixed
         # Nếu load_mixed_stems trả None (file bị xóa) → fallback
 
@@ -195,6 +213,9 @@ def run_mix_job(
     """
     Chạy full mix pipeline trong ThreadPoolExecutor worker.
     Return metadata dict để router cập nhật Mix record.
+
+    sample_rate <= 0 → auto: max native của library (sàn 44100), không upsample giả.
+    bit_depth mặc định 32 (float, không nén) để giữ headroom tối đa.
     """
     api_config = get_api_config_from_db(db_path)
     os.makedirs(output_dir, exist_ok=True)
@@ -202,6 +223,10 @@ def run_mix_job(
     # Step 1/6 – Load & validate tracks
     progress_cb(1, "Loading tracks", 5.0)
     tracks = load_library(track_paths)
+
+    # Auto sample rate nếu chưa chỉ định (hoặc <= 0).
+    if not sample_rate or sample_rate <= 0:
+        sample_rate = resolve_target_sample_rate([t.sample_rate for t in tracks])
 
     # Step 2/6 – Generate playlist
     progress_cb(2, "Generating playlist", 15.0)
@@ -216,6 +241,8 @@ def run_mix_job(
     progress_cb(4, "Loading stems & mixing", 28.0)
     preloaded: dict[str, np.ndarray] = {}
     for i, track in enumerate(playlist):
+        if track.path in preloaded:
+            continue     # track lặp lại (T+3) — đã load, khỏi xử lý lại
         pct = 28.0 + (i / max(len(playlist), 1)) * 30.0
         stem_status = _get_track_stem_status(track.path, db_path)
         msg = (f"[{i+1}/{len(playlist)}] "
@@ -268,4 +295,6 @@ def run_mix_job(
         "total_duration_seconds": info.duration,
         "track_count": len(playlist),
         "output_dir": output_dir,
+        "sample_rate": sample_rate,
+        "bit_depth": bit_depth,
     }

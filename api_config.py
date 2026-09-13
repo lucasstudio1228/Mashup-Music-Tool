@@ -18,8 +18,16 @@ class APIConfig:
         return bool(self.api_key)
 
     def to_client_kwargs(self) -> dict:
-        """Return kwargs để pass vào anthropic.Anthropic()."""
-        kwargs = {"base_url": self.base_url}
+        """Return kwargs để pass vào anthropic.Anthropic().
+
+        SDK anthropic tự nối '/v1/messages' vào base_url; nếu người dùng lỡ lưu
+        base_url có sẵn '/v1' thì sẽ thành '/v1/v1/messages' (404). Cắt bỏ đuôi
+        '/v1' để chống lỗi cấu hình phổ biến này.
+        """
+        base = (self.base_url or DEFAULT_BASE_URL).rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        kwargs = {"base_url": base}
         if self.api_key:
             kwargs["api_key"] = self.api_key
         return kwargs
