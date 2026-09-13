@@ -38,11 +38,11 @@ Tạo project → tải nhạc lên → bấm tách stem → chỉnh âm lượn
 
 ## 🔑 Tùy chọn: API key cho tính năng AI
 
-Một số tính năng gợi ý bằng AI cần **Anthropic API key**.
+Một số tính năng gợi ý bằng AI cần **OpenAI API key**.
 Mở file `.env` (được tạo tự động sau khi cài) và điền:
 
 ```
-ANTHROPIC_API_KEY=sk-ant-...
+OPENAI_API_KEY=sk-...
 ```
 
 Không dùng tính năng AI thì có thể bỏ qua bước này.

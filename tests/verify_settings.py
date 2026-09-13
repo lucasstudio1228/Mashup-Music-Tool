@@ -64,8 +64,8 @@ def run():
 
     # Reset về clean state
     requests.patch(f"{BASE}/api/settings", json={"clear_api_key": True,
-                   "api_base_url": "https://api.anthropic.com",
-                   "api_model": "claude-haiku-4-5-20251001"})
+                   "api_base_url": "https://api.openai.com/v1",
+                   "api_model": "gpt-4o-mini"})
 
     print("\n=== SETTINGS VERIFY ===")
     all_pass = True

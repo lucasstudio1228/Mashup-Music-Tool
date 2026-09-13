@@ -51,17 +51,17 @@ def run():
 
     # Test 5: APIConfig reads env variables
     import os
-    os.environ["ANTHROPIC_API_KEY"] = "test-key-123"
-    os.environ["ANTHROPIC_BASE_URL"] = "https://custom.endpoint.com"
-    os.environ["ANTHROPIC_MODEL"] = "claude-sonnet-4-6"
+    os.environ["OPENAI_API_KEY"] = "test-key-123"
+    os.environ["OPENAI_BASE_URL"] = "https://custom.endpoint.com"
+    os.environ["OPENAI_MODEL"] = "gpt-4o-mini"
     from api_config import APIConfig
     cfg = APIConfig()
     ok = (cfg.api_key == "test-key-123" and
           cfg.base_url == "https://custom.endpoint.com" and
-          cfg.model == "claude-sonnet-4-6" and
+          cfg.model == "gpt-4o-mini" and
           cfg.is_configured() is True)
     results.append(("APIConfig reads env vars", ok))
-    del os.environ["ANTHROPIC_API_KEY"]
+    del os.environ["OPENAI_API_KEY"]
     cfg2 = APIConfig()
     results.append(("APIConfig.is_configured() False when no key", not cfg2.is_configured()))
 

@@ -59,7 +59,7 @@ if not exist ".env" (
     if exist ".env.example" (
         copy ".env.example" ".env" >nul
         echo.
-        echo [!] Da tao file .env tu mau. Mo .env va dien ANTHROPIC_API_KEY neu can dung AI.
+        echo [!] Da tao file .env tu mau. Mo .env va dien OPENAI_API_KEY neu can dung AI.
     )
 )
 

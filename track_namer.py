@@ -1,11 +1,13 @@
-"""Đặt tên track: gọi Claude API, tự động fallback rule-based khi lỗi/không có key."""
+"""Đặt tên track: gọi OpenAI API, tự động fallback rule-based khi lỗi/không có key."""
 import json
 import random
 
-import anthropic
+from openai import OpenAI
 
 import console  # noqa: F401 - bật UTF-8 output khi import
 from api_config import APIConfig
+
+_FALLBACK_MODEL = "gpt-4o-mini"
 
 ADJECTIVES = ["Silent", "Deep", "Soft", "Still", "Gentle", "Clear", "Warm",
               "Flowing", "Sacred", "Ancient", "Golden", "Misty", "Serene",
@@ -36,15 +38,18 @@ def generate_names(count: int, config: APIConfig) -> list[str]:
 
 
 def generate_names_with_source(count: int, config: APIConfig) -> tuple[list[str], str]:
-    """Như generate_names nhưng kèm nguồn ('Claude API' | 'rule-based') để hiển thị."""
+    """Như generate_names nhưng kèm nguồn ('OpenAI API' | 'rule-based') để hiển thị."""
     if count <= 0:
         return [], "rule-based"
 
     if config.is_configured():
         try:
-            client = anthropic.Anthropic(**config.to_client_kwargs())
-            response = client.messages.create(
-                model=config.model,
+            client = OpenAI(**config.to_client_kwargs())
+            model = config.model
+            if not model or model.lower().startswith("claude"):
+                model = _FALLBACK_MODEL
+            response = client.chat.completions.create(
+                model=model,
                 max_tokens=max(1000, count * 25),
                 messages=[{
                     "role": "user",
@@ -60,7 +65,7 @@ def generate_names_with_source(count: int, config: APIConfig) -> tuple[list[str]
                     )
                 }]
             )
-            text = response.content[0].text.strip()
+            text = (response.choices[0].message.content or "").strip()
             # Strip markdown code fences nếu có
             text = text.replace("```json", "").replace("```", "").strip()
             names = json.loads(text)
@@ -69,7 +74,7 @@ def generate_names_with_source(count: int, config: APIConfig) -> tuple[list[str]
                     len(names) >= count and
                     len(set(names)) >= count):
                 # preserve order, dedupe
-                return list(dict.fromkeys(names))[:count], "Claude API"
+                return list(dict.fromkeys(names))[:count], "OpenAI API"
             print(f"  ⚠️  API trả về {len(names) if isinstance(names, list) else '?'} "
                   f"tên không hợp lệ, dùng fallback rule-based")
         except Exception as e:                       # noqa: BLE001 - naming không được chặn render

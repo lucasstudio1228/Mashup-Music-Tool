@@ -56,9 +56,9 @@ def _usable_tracks(tracks, crossfade_sec, ui):
               help='0 = auto (max của inputs, sàn 48000)')
 @click.option('--bit-depth', default='24', type=click.Choice(['24', '32']),
               help='24 = PCM_24, 32 = float')
-@click.option('--api-key', default=None, envvar='ANTHROPIC_API_KEY')
-@click.option('--api-base-url', default=None, envvar='ANTHROPIC_BASE_URL')
-@click.option('--api-model', default=None, envvar='ANTHROPIC_MODEL')
+@click.option('--api-key', default=None, envvar='OPENAI_API_KEY')
+@click.option('--api-base-url', default=None, envvar='OPENAI_BASE_URL')
+@click.option('--api-model', default=None, envvar='OPENAI_MODEL')
 def main(input_path, duration, output, crossfade, sample_rate, bit_depth,
          api_key, api_base_url, api_model):
     ui = Console()

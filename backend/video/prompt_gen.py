@@ -1,6 +1,6 @@
 """
-video/prompt_gen.py — Dùng Claude (Anthropic) để biến IDEA của người dùng
-thành bộ prompt ảnh liên kết cho một "phim hoạt hình ngắn" chill/relaxing.
+video/prompt_gen.py — Dùng OpenAI GPT để biến IDEA của người dùng thành bộ
+prompt ảnh liên kết cho một "phim hoạt hình ngắn" chill/relaxing.
 
 Đầu ra: dict {"0": <thumbnail có chữ>, "1": <scene>, ... "N-1": <scene>}.
 - Ảnh 0  : thumbnail 16:9 CÓ tiêu đề (title) + vài từ khoá healing.
@@ -26,6 +26,9 @@ _SYSTEM = (
     "và viết prompt tạo ẢNH cho từng shot. Bạn CHỈ trả về JSON hợp lệ, không "
     "kèm giải thích, không markdown."
 )
+
+# Model dự phòng khi cấu hình lỡ để tên model của Claude cũ.
+_FALLBACK_MODEL = "gpt-4o-mini"
 
 
 def _build_user_prompt(idea: str, title: str, keywords: str,
@@ -120,36 +123,40 @@ def generate_prompts(
         _log("Không có ý tưởng — dùng prompt mặc định.")
         return None
     if not api_config or not getattr(api_config, "api_key", None):
-        _log("Chưa cấu hình ANTHROPIC_API_KEY — dùng prompt mặc định.")
+        _log("Chưa cấu hình OPENAI_API_KEY — dùng prompt mặc định.")
         return None
 
     try:
-        import anthropic
+        from openai import OpenAI
     except Exception as e:  # pragma: no cover
-        _log(f"Không import được anthropic ({e}) — dùng prompt mặc định.")
+        _log(f"Không import được openai ({e}) — dùng prompt mặc định.")
         return None
 
+    # Nếu model còn để tên Claude cũ thì đổi sang GPT mặc định.
+    model = api_config.model
+    if not model or model.lower().startswith("claude"):
+        model = _FALLBACK_MODEL
+
     try:
-        client = anthropic.Anthropic(**api_config.to_client_kwargs())
+        client = OpenAI(**api_config.to_client_kwargs())
         user_msg = _build_user_prompt(idea, title, keywords, image_count,
                                       aspect_ratio, style)
-        resp = client.messages.create(
-            model=api_config.model,
+        resp = client.chat.completions.create(
+            model=model,
             max_tokens=8000,
-            system=_SYSTEM,
-            messages=[{"role": "user", "content": user_msg}],
+            messages=[
+                {"role": "system", "content": _SYSTEM},
+                {"role": "user", "content": user_msg},
+            ],
         )
-        text = "".join(
-            block.text for block in resp.content
-            if getattr(block, "type", None) == "text"
-        )
+        text = resp.choices[0].message.content or ""
     except Exception as e:
-        _log(f"Gọi Claude thất bại ({type(e).__name__}: {e}) — dùng prompt mặc định.")
+        _log(f"Gọi OpenAI thất bại ({type(e).__name__}: {e}) — dùng prompt mặc định.")
         return None
 
     data = _extract_json(text)
     if not isinstance(data, dict):
-        _log("Claude trả về không phải JSON hợp lệ — dùng prompt mặc định.")
+        _log("OpenAI trả về không phải JSON hợp lệ — dùng prompt mặc định.")
         return None
 
     prompts = data.get("prompts")
@@ -166,5 +173,5 @@ def generate_prompts(
             return None
         out[str(i)] = val.strip()
 
-    _log(f"Đã sinh {image_count} prompt từ ý tưởng bằng Claude ({api_config.model}).")
+    _log(f"Đã sinh {image_count} prompt từ ý tưởng bằng OpenAI ({model}).")
     return out

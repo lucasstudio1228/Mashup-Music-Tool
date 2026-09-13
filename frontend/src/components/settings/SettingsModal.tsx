@@ -71,8 +71,8 @@ export function SettingsModal({ open, onClose }: Props) {
                 }}
                 placeholder={
                   settings?.has_api_key
-                    ? 'sk-ant-•••••••• (set — enter new to replace)'
-                    : 'sk-ant-api03-...'
+                    ? 'sk-•••••••• (set — enter new to replace)'
+                    : 'sk-...'
                 }
                 className="w-full bg-[#0f1117] border border-white/10 rounded-lg
                            px-3 py-2 text-sm text-white placeholder:text-gray-600
@@ -143,7 +143,7 @@ export function SettingsModal({ open, onClose }: Props) {
             {/* Info */}
             <p className="text-xs text-gray-500 border-t border-white/5 pt-4">
               ℹ️ Settings apply to all projects. Leave API key empty to use the
-              <code className="text-gray-400 mx-1">ANTHROPIC_API_KEY</code>
+              <code className="text-gray-400 mx-1">OPENAI_API_KEY</code>
               environment variable as fallback.
             </p>
           </div>

@@ -9,8 +9,8 @@ class AppSettings(SQLModel, table=True):
     """Singleton — luôn chỉ có 1 row với id=1."""
     id: int = Field(default=1, primary_key=True)
     api_key: Optional[str] = None           # stored, never returned to client
-    api_base_url: str = "https://api.anthropic.com"
-    api_model: str = "claude-haiku-4-5-20251001"
+    api_base_url: str = "https://api.openai.com/v1"
+    api_model: str = "gpt-4o-mini"
     updated_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc))
 

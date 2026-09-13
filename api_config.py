@@ -1,33 +1,45 @@
-"""Cấu hình endpoint Anthropic API tập trung một chỗ."""
+"""Cấu hình endpoint OpenAI API (GPT) tập trung một chỗ.
+
+Trước đây dùng Anthropic (Claude); nay chuyển sang OpenAI GPT. Vẫn đọc được env
+var cũ (ANTHROPIC_*) để tương thích ngược, ưu tiên OPENAI_*.
+"""
 import os
 from dataclasses import dataclass, field
 
-DEFAULT_BASE_URL = "https://api.anthropic.com"
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_MODEL = "gpt-4o-mini"
+
+
+def _env(*names: str) -> str | None:
+    """Trả về env var đầu tiên có giá trị trong danh sách tên."""
+    for n in names:
+        v = os.getenv(n)
+        if v:
+            return v
+    return None
 
 
 @dataclass
 class APIConfig:
-    api_key: str | None = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY"))
-    base_url: str = field(default_factory=lambda: os.getenv("ANTHROPIC_BASE_URL",
-                                                            DEFAULT_BASE_URL))
-    model: str = field(default_factory=lambda: os.getenv("ANTHROPIC_MODEL",
-                                                         DEFAULT_MODEL))
+    api_key: str | None = field(
+        default_factory=lambda: _env("OPENAI_API_KEY", "ANTHROPIC_API_KEY"))
+    base_url: str = field(
+        default_factory=lambda: _env("OPENAI_BASE_URL", "ANTHROPIC_BASE_URL")
+        or DEFAULT_BASE_URL)
+    model: str = field(
+        default_factory=lambda: _env("OPENAI_MODEL", "ANTHROPIC_MODEL")
+        or DEFAULT_MODEL)
 
     def is_configured(self) -> bool:
         return bool(self.api_key)
 
     def to_client_kwargs(self) -> dict:
-        """Return kwargs để pass vào anthropic.Anthropic().
+        """Return kwargs để pass vào openai.OpenAI().
 
-        SDK anthropic tự nối '/v1/messages' vào base_url; nếu người dùng lỡ lưu
-        base_url có sẵn '/v1' thì sẽ thành '/v1/v1/messages' (404). Cắt bỏ đuôi
-        '/v1' để chống lỗi cấu hình phổ biến này.
+        SDK OpenAI nối '/chat/completions' vào base_url, nên base_url PHẢI có
+        sẵn '/v1' (vd 'https://api.openai.com/v1' hoặc proxy '.../v1').
         """
-        base = (self.base_url or DEFAULT_BASE_URL).rstrip("/")
-        if base.endswith("/v1"):
-            base = base[:-3]
-        kwargs = {"base_url": base}
+        kwargs = {"base_url": (self.base_url or DEFAULT_BASE_URL)}
         if self.api_key:
             kwargs["api_key"] = self.api_key
         return kwargs
