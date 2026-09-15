@@ -1,7 +1,13 @@
 import axios from 'axios';
 import type { MixProgressEvent } from '../types';
 
-export const API_BASE = 'http://localhost:8000';
+// Production: SPA được backend phục vụ cùng origin → dùng URL tương đối ('')
+// để gọi API cùng host, tránh CORS dù mở bằng localhost, 127.0.0.1 hay IP LAN.
+// Dev (Vite :5173): trỏ thẳng backend :8000 (CORS đã cho phép :5173).
+// Có thể override bằng biến môi trường VITE_API_BASE khi build.
+export const API_BASE =
+  (import.meta.env.VITE_API_BASE as string | undefined) ??
+  (import.meta.env.DEV ? 'http://localhost:8000' : '');
 
 export const api = axios.create({
   baseURL: API_BASE,

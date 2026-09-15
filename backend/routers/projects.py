@@ -30,6 +30,8 @@ def to_response(session: Session, project: Project) -> ProjectResponse:
         id=project.id, name=project.name, description=project.description,
         created_at=project.created_at,
         track_count=track_count, mix_count=mix_count,
+        video_idea=project.video_idea, auto_video=project.auto_video,
+        video_style=project.video_style,
     )
 
 
@@ -78,6 +80,9 @@ def update_project(project_id: int, data: ProjectUpdate,
                    session: Session = Depends(get_session)):
     project = get_project_or_404(session, project_id)
     for key, value in data.model_dump(exclude_unset=True).items():
+        if key == "video_style":
+            from backend.video import config as video_config
+            value = video_config.normalize_style(value)
         setattr(project, key, value)
     session.add(project)
     session.commit()

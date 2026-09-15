@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
-import { useSettings, useUpdateSettings } from '../../api/settings';
-import type { AppSettingsUpdate } from '../../types';
+import { useSettings, useUpdateSettings, useTestApi } from '../../api/settings';
+import type { AppSettingsUpdate, ApiTestResult } from '../../types';
 
 interface Props {
   open: boolean;
@@ -10,11 +10,13 @@ interface Props {
 export function SettingsModal({ open, onClose }: Props) {
   const { data: settings, isLoading } = useSettings();
   const updateMutation = useUpdateSettings();
+  const testMutation = useTestApi();
 
   const [apiKey, setApiKey] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
   const [model, setModel] = useState('');
   const [dirty, setDirty] = useState(false);
+  const [testResult, setTestResult] = useState<ApiTestResult | null>(null);
 
   // Sync state khi settings load
   useEffect(() => {
@@ -23,10 +25,34 @@ export function SettingsModal({ open, onClose }: Props) {
       setModel(settings.api_model);
       setApiKey(''); // Không hiện key thật — placeholder sẽ cho biết trạng thái
       setDirty(false);
+      setTestResult(null);
     }
   }, [settings, open]);
 
   if (!open) return null;
+
+  async function handleTest() {
+    setTestResult(null);
+    try {
+      // Gửi giá trị đang gõ (trống → server dùng cấu hình đã lưu).
+      const result = await testMutation.mutateAsync({
+        api_key: apiKey.trim() || undefined,
+        api_base_url: baseUrl.trim() || undefined,
+        api_model: model.trim() || undefined,
+      });
+      setTestResult(result);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setTestResult({
+        ok: false,
+        model: model || '',
+        base_url: baseUrl || '',
+        error_type: 'RequestFailed',
+        error: `Không gọi được backend: ${msg}`,
+        retryable: true,
+      });
+    }
+  }
 
   async function handleSave() {
     const payload: AppSettingsUpdate = {};
@@ -146,25 +172,77 @@ export function SettingsModal({ open, onClose }: Props) {
               <code className="text-gray-400 mx-1">OPENAI_API_KEY</code>
               environment variable as fallback.
             </p>
+
+            {/* Kết quả Test API */}
+            {testResult && (
+              <div
+                className={`rounded-lg px-3 py-2.5 text-sm border ${
+                  testResult.ok
+                    ? 'bg-green-500/10 border-green-500/30 text-green-300'
+                    : 'bg-red-500/10 border-red-500/30 text-red-300'
+                }`}
+              >
+                {testResult.ok ? (
+                  <div>
+                    <div className="font-medium">
+                      ✅ API hoạt động
+                      {typeof testResult.latency_ms === 'number' && (
+                        <span className="text-green-400/70 font-normal">
+                          {' '}
+                          ({testResult.latency_ms} ms)
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-xs text-green-400/70 mt-1">
+                      Model: <code>{testResult.model}</code>
+                      {testResult.reply ? ` · trả lời: "${testResult.reply}"` : ''}
+                    </div>
+                  </div>
+                ) : (
+                  <div>
+                    <div className="font-medium">❌ Gọi API thất bại</div>
+                    <div className="text-xs text-red-300/90 mt-1">
+                      {testResult.error}
+                    </div>
+                    {testResult.retryable && (
+                      <div className="text-xs text-yellow-400/80 mt-1">
+                        ⏳ Lỗi tạm thời — có thể chờ ~120s rồi bấm Test lại.
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
 
         {/* Footer */}
-        <div className="flex justify-end gap-3 mt-6">
+        <div className="flex items-center justify-between gap-3 mt-6">
           <button
-            onClick={onClose}
-            className="px-4 py-2 text-sm text-gray-400 hover:text-white"
+            onClick={handleTest}
+            disabled={testMutation.isPending}
+            className="px-4 py-2 text-sm border border-white/15 hover:border-white/30
+                       hover:bg-white/5 disabled:opacity-40 rounded-lg
+                       text-gray-200 font-medium"
           >
-            Cancel
+            {testMutation.isPending ? '⏳ Testing…' : '🔌 Test API'}
           </button>
-          <button
-            onClick={handleSave}
-            disabled={updateMutation.isPending || !dirty}
-            className="px-4 py-2 text-sm bg-violet-600 hover:bg-violet-500
-                       disabled:opacity-40 rounded-lg text-white font-medium"
-          >
-            {updateMutation.isPending ? 'Saving...' : 'Save Settings'}
-          </button>
+          <div className="flex gap-3">
+            <button
+              onClick={onClose}
+              className="px-4 py-2 text-sm text-gray-400 hover:text-white"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleSave}
+              disabled={updateMutation.isPending || !dirty}
+              className="px-4 py-2 text-sm bg-violet-600 hover:bg-violet-500
+                         disabled:opacity-40 rounded-lg text-white font-medium"
+            >
+              {updateMutation.isPending ? 'Saving...' : 'Save Settings'}
+            </button>
+          </div>
         </div>
       </div>
     </div>

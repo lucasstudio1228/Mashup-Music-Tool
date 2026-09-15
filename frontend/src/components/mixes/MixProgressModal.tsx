@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { createProgressStream, downloadUrl } from '../../api/client';
+import { useCancelMix } from '../../api/mixes';
 import type { MixProgressEvent } from '../../types';
 
 interface Props {
@@ -20,6 +21,7 @@ const STEPS = [
 
 export default function MixProgressModal({ mixId, projectId, onClose }: Props) {
   const qc = useQueryClient();
+  const cancelMix = useCancelMix(projectId);
   const [progress, setProgress] = useState<MixProgressEvent>({
     step: 0,
     step_name: 'Starting…',
@@ -27,6 +29,7 @@ export default function MixProgressModal({ mixId, projectId, onClose }: Props) {
   });
   const [done, setDone] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
   const [log, setLog] = useState<string[]>([]);
   const logRef = useRef<HTMLDivElement>(null);
 
@@ -56,7 +59,16 @@ export default function MixProgressModal({ mixId, projectId, onClose }: Props) {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
   }, [log]);
 
+  const cancelled = progress.step_name === 'cancelled';
   const failed = Boolean(error) || progress.step_name === 'failed';
+
+  const handleCancel = () => {
+    if (!confirm('Huỷ render nhạc? Phần đã tạo sẽ được giữ lại.')) return;
+    setCancelling(true);
+    cancelMix.mutate(mixId, {
+      onError: () => setCancelling(false),
+    });
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70">
@@ -88,7 +100,13 @@ export default function MixProgressModal({ mixId, projectId, onClose }: Props) {
         {/* Main */}
         <div className="flex-1">
           <h3 className="mb-4 text-lg font-semibold text-white">
-            {done ? '✅ Mix Complete' : error ? '❌ Failed' : 'Rendering Mix…'}
+            {cancelled
+              ? '⛔ Đã huỷ'
+              : done
+                ? '✅ Mix Complete'
+                : error
+                  ? '❌ Failed'
+                  : 'Rendering Mix…'}
           </h3>
 
           <div className="mb-1 flex justify-between text-xs text-gray-400">
@@ -112,22 +130,48 @@ export default function MixProgressModal({ mixId, projectId, onClose }: Props) {
             {error && <div className="text-red-400">{error}</div>}
           </div>
 
-          <div className="flex justify-end gap-3">
-            {done && (
-              <a
-                href={downloadUrl(mixId, 'wav')}
-                className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-accent-hover"
-              >
-                ⬇ Download WAV
-              </a>
-            )}
-            <button
-              onClick={onClose}
-              disabled={!done && !failed}
-              className="rounded-lg bg-surface-2 px-4 py-2 text-sm text-gray-200 hover:bg-white/10 disabled:opacity-40"
-            >
-              {done || failed ? 'Close' : 'Rendering…'}
-            </button>
+          <div className="flex items-center justify-between gap-3">
+            {/* Trái: khi ĐANG chạy → nút ẩn xuống thanh dưới để làm việc khác */}
+            <div>
+              {!done && !failed && !cancelled && (
+                <button
+                  onClick={onClose}
+                  className="rounded-lg bg-surface-2 px-4 py-2 text-sm font-medium text-gray-200 hover:bg-white/10"
+                  title="Tiếp tục chạy nền, theo dõi ở thanh dưới màn hình"
+                >
+                  🔽 Ẩn xuống thanh dưới
+                </button>
+              )}
+            </div>
+
+            {/* Phải: huỷ (khi chạy) hoặc tải + đóng (khi xong) */}
+            <div className="flex gap-3">
+              {!done && !failed && !cancelled && (
+                <button
+                  onClick={handleCancel}
+                  disabled={cancelling}
+                  className="rounded-lg border border-red-500/40 bg-red-950/30 px-4 py-2 text-sm font-medium text-red-300 hover:bg-red-950/60 disabled:opacity-50"
+                >
+                  {cancelling ? 'Đang huỷ…' : '✕ Huỷ'}
+                </button>
+              )}
+              {done && !cancelled && (
+                <a
+                  href={downloadUrl(mixId, 'wav')}
+                  className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-accent-hover"
+                >
+                  ⬇ Download WAV
+                </a>
+              )}
+              {(done || failed || cancelled) && (
+                <button
+                  onClick={onClose}
+                  className="rounded-lg bg-surface-2 px-4 py-2 text-sm text-gray-200 hover:bg-white/10"
+                >
+                  Close
+                </button>
+              )}
+            </div>
           </div>
         </div>
       </div>

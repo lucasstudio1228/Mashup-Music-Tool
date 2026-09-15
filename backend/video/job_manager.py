@@ -9,12 +9,18 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
 
+from backend.keep_awake import keep_awake
+
+
+class JobCancelled(Exception):
+    """Ném từ progress callback khi user bấm Cancel → dừng job hợp tác."""
+
 
 @dataclass
 class VideoJob:
     project_id: int
     kind: str                      # images | clips | assemble | full
-    status: str = "pending"        # pending|running|completed|failed
+    status: str = "pending"        # pending|running|completed|failed|cancelled
     percent: float = 0.0
     message: str = ""
     error: Optional[str] = None
@@ -27,6 +33,7 @@ class VideoJobManager:
             max_workers=1, thread_name_prefix="video_worker")
         self._jobs: dict[int, VideoJob] = {}
         self._queues: dict[int, asyncio.Queue] = {}
+        self._cancels: dict[int, threading.Event] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._lock = threading.Lock()
 
@@ -45,16 +52,36 @@ class VideoJobManager:
         with self._lock:
             self._jobs[project_id] = VideoJob(project_id=project_id, kind=kind)
             self._queues.setdefault(project_id, asyncio.Queue())
+            self._cancels[project_id] = threading.Event()
         self._executor.submit(self._run, project_id, fn, args, kwargs)
+
+    def cancel(self, project_id: int) -> bool:
+        """Yêu cầu huỷ hợp tác: đặt cờ → progress callback kế tiếp ném
+        JobCancelled → dừng ở ranh giới bước/ảnh/clip gần nhất."""
+        with self._lock:
+            job = self._jobs.get(project_id)
+            ev = self._cancels.get(project_id)
+            if not job or not ev or job.status not in ("pending", "running"):
+                return False
+            ev.set()
+            return True
 
     def _run(self, project_id, fn, args, kwargs):
         self._update(project_id, status="running")
         try:
-            result = fn(project_id, self._progress(project_id), *args, **kwargs)
+            with keep_awake():
+                result = fn(project_id, self._progress(project_id),
+                            *args, **kwargs)
             self._update(project_id, status="completed", percent=100.0,
                          result=result if isinstance(result, dict) else None)
             self._push(project_id, {"type": "done", "status": "completed",
                                     "result": result if isinstance(result, dict) else None})
+        except JobCancelled:
+            self._update(project_id, status="cancelled", message="Đã huỷ")
+            self._push(project_id, {"type": "progress",
+                                    "message": "Đã huỷ theo yêu cầu",
+                                    "percent": 0.0})
+            self._push(project_id, {"type": "done", "status": "cancelled"})
         except Exception as exc:                          # noqa: BLE001
             import traceback
             msg = str(exc).strip()
@@ -66,7 +93,11 @@ class VideoJobManager:
             self._push(project_id, {"type": "done", "status": "failed"})
 
     def _progress(self, project_id):
+        ev = self._cancels.get(project_id)
+
         def cb(message: str, percent: float):
+            if ev is not None and ev.is_set():
+                raise JobCancelled()
             self._update(project_id, message=message, percent=percent)
             self._push(project_id, {"type": "progress",
                                     "message": message,
@@ -93,12 +124,15 @@ class VideoJobManager:
     async def stream(self, project_id: int):
         with self._lock:
             job = self._jobs.get(project_id)
-        if job and job.status in ("completed", "failed"):
+        if job and job.status in ("completed", "failed", "cancelled"):
             if job.status == "completed":
                 yield {"type": "progress", "message": job.message,
                        "percent": 100.0}
                 yield {"type": "done", "status": "completed",
                        "result": job.result}
+            elif job.status == "cancelled":
+                yield {"type": "progress", "message": "Đã huỷ", "percent": 0.0}
+                yield {"type": "done", "status": "cancelled"}
             else:
                 yield {"type": "error", "message": job.error or "Unknown"}
                 yield {"type": "done", "status": "failed"}

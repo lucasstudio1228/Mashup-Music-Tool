@@ -58,7 +58,33 @@ def _get_mix_or_404(session: Session, mix_id: int) -> Mix:
 
 
 # ---------- Job callbacks (chạy trong worker thread → session riêng) ----------
+def _maybe_trigger_auto_video(project_id: int, project_name: str,
+                              idea: str, audio_path: str,
+                              style_key: str | None = None) -> None:
+    """
+    Sau khi mix Audio xong: nếu project bật auto_video thì tự động submit job
+    dựng video (ảnh → clip → ghép → MP4 vào media/<project>/final/). Import cục
+    bộ để tránh vòng import và để lỗi ở nhánh video không làm hỏng việc lưu mix.
+    """
+    try:
+        from backend.video.job_manager import video_job_manager
+        from backend.video import service as video_service
+
+        if video_job_manager.is_busy():
+            # Đang có tác vụ video chạy — bỏ qua auto để không chen ngang.
+            return
+        topic = (project_name or "meditation").strip()
+        video_job_manager.submit(
+            project_id, "full", video_service.run_full_video,
+            topic, audio_path, None, project_name, (idea or None), style_key,
+        )
+    except Exception:
+        # Auto-video là tính năng phụ — không được làm sập callback mix.
+        pass
+
+
 def _on_success(mix_id: int, result: dict) -> None:
+    auto_ctx: dict | None = None
     with Session(engine) as session:
         mix = session.get(Mix, mix_id)
         if mix:
@@ -75,6 +101,27 @@ def _on_success(mix_id: int, result: dict) -> None:
             session.add(mix)
             session.commit()
 
+            # Chuẩn bị context để auto-dựng video (đọc trong session còn mở).
+            project = session.get(Project, mix.project_id)
+            out_dir = mix.output_dir
+            if project and project.auto_video and out_dir:
+                wav = Path(out_dir) / "mix.wav"
+                if wav.exists():
+                    auto_ctx = {
+                        "project_id": project.id,
+                        "project_name": project.name,
+                        "idea": project.video_idea or "",
+                        "audio_path": str(wav),
+                        "style_key": project.video_style,
+                    }
+
+    # Submit NGOÀI session (job chạy trong worker thread khác của video manager).
+    if auto_ctx:
+        _maybe_trigger_auto_video(
+            auto_ctx["project_id"], auto_ctx["project_name"],
+            auto_ctx["idea"], auto_ctx["audio_path"], auto_ctx["style_key"],
+        )
+
 
 def _on_failure(mix_id: int, error: str) -> None:
     with Session(engine) as session:
@@ -82,6 +129,17 @@ def _on_failure(mix_id: int, error: str) -> None:
         if mix:
             mix.status = "failed"
             mix.error_message = error
+            mix.completed_at = datetime.now(timezone.utc)
+            session.add(mix)
+            session.commit()
+
+
+def _on_cancel(mix_id: int) -> None:
+    with Session(engine) as session:
+        mix = session.get(Mix, mix_id)
+        if mix:
+            mix.status = "cancelled"
+            mix.error_message = "Đã huỷ theo yêu cầu"
             mix.completed_at = datetime.now(timezone.utc)
             session.add(mix)
             session.commit()
@@ -143,7 +201,7 @@ def create_mix(project_id: int, data: MixCreate,
         mix.id, core_bridge.run_mix_job,
         track_paths, str(output_dir), data.duration_minutes,
         data.crossfade_seconds, sample_rate, bit_depth, DB_PATH,
-        on_success=_on_success, on_failure=_on_failure,
+        on_success=_on_success, on_failure=_on_failure, on_cancel=_on_cancel,
     )
     return to_mix_response(mix)
 
@@ -165,6 +223,16 @@ def delete_mix(mix_id: int, session: Session = Depends(get_session)):
     session.delete(mix)
     session.commit()
     return {"ok": True}
+
+
+@router.post("/mixes/{mix_id}/cancel")
+def cancel_mix(mix_id: int, session: Session = Depends(get_session)):
+    """Huỷ mix đang render (hợp tác — dừng ở bước kế tiếp)."""
+    _get_mix_or_404(session, mix_id)
+    ok = job_manager.cancel(mix_id)
+    if not ok:
+        raise HTTPException(409, "Mix này không đang render để huỷ.")
+    return {"status": "cancelling", "mix_id": mix_id}
 
 
 @router.get("/mixes/{mix_id}/progress")

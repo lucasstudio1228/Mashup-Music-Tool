@@ -17,16 +17,25 @@ MEDIA_ROOT  = _ROOT / "media"                              # media/<project_name
 PROFILE_DIR = _ROOT / ".browser_profile"                  # Chrome profile (giữ login)
 OVERRIDES   = _ROOT / "data" / "video_overrides.json"     # override selector (tùy chọn)
 
-STEM_IMAGE  = "images"    # media/<project>/images/0.png..19.png
+STEM_IMAGE  = "images"    # media/<project>/images/0.png..40.png
 STEM_CLIP   = "clips"     # media/<pid>/clips/clip_00.mp4..
 STEM_FINAL  = "final"     # media/<pid>/final/final.mp4
+STEM_UPLOAD = "uploads"   # media/<pid>/uploads/<file> — nhạc nền upload cho video
+
+# Đuôi file audio chấp nhận cho nhạc nền video (ffmpeg đọc trực tiếp được).
+AUDIO_EXTS = (".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wma")
 
 
 def project_folder_name(project_name: str | None, project_id: int) -> str:
-    """Tên thư mục an toàn trên Windows, ưu tiên đúng tên project trong tool."""
+    """
+    Tên thư mục media: tên project + id để VỪA dễ đọc VỪA ỔN ĐỊNH.
+    Kèm '#<id>' để đổi tên project KHÔNG trỏ nhầm sang folder cũ, và 2 project
+    trùng tên KHÔNG dùng chung folder (trước đây gây lỗi render lấy ảnh của
+    project khác / bản cũ).
+    """
     name = (project_name or "").strip()
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
-    return name or f"project_{project_id}"
+    return f"{name} (#{project_id})" if name else f"project_{project_id}"
 
 def project_dir(project_id: int, project_name: str | None = None) -> Path:
     return MEDIA_ROOT / project_folder_name(project_name, project_id)
@@ -40,27 +49,30 @@ def clips_dir(project_id: int, project_name: str | None = None) -> Path:
 def final_dir(project_id: int, project_name: str | None = None) -> Path:
     return project_dir(project_id, project_name) / STEM_FINAL
 
+def uploads_dir(project_id: int, project_name: str | None = None) -> Path:
+    return project_dir(project_id, project_name) / STEM_UPLOAD
+
 
 # ── Tham số sinh ảnh / video ────────────────────────────────────
 @dataclass
 class VideoParams:
     # Ảnh: 0 = thumbnail, 1..(image_count-1) = cảnh nền
-    image_count:     int   = 20             # 0..19; mỗi ảnh tạo đúng 1 clip
+    image_count:     int   = 41             # 0..40; mỗi ảnh tạo đúng 1 clip
     aspect_ratio:    str   = "16:9"
     image_style:     str   = "hoạt hình (animation/cartoon), màu sắc dịu, điện ảnh"
 
     # Video (Flow / Veo) — CHẾ ĐỘ "THÀNH PHẦN" (ingredients): mỗi clip tạo từ
     # 1 ảnh nguyên liệu (image-to-video), KHÔNG dùng khung đầu/cuối nữa.
-    flow_model:      str   = "Veo 3.1 - Fast"
+    flow_model:      str   = "Omni 1.1 Flash"
     flow_mode:       str   = "Ingredients"   # Flow có thể hiện tiếng Anh/Việt
     clip_seconds:    int   = 8
     outputs_per_run: int   = 1               # x1 video
     # Giữ field này để tương thích API/UI cũ; pipeline 1:1 dùng image_count.
-    rest_clips:      int   = 19              # ảnh 1..19, mỗi ảnh đúng 1 clip
-    min_total_clips: int   = 20
+    rest_clips:      int   = 40              # ảnh 1..40, mỗi ảnh đúng 1 clip
+    min_total_clips: int   = 41
 
     # Ghép/mix: blend (crossfade) + làm chậm
-    t_window:        int   = 5              # T+5: không lặp trong 5 clip kế
+    t_window:        int   = 10             # T+10: không lặp trong 10 clip kế
     blend_seconds:   float = 1.0            # thời lượng crossfade blend giữa 2 clip
     slow_speed:      float = 0.7            # tốc độ phát (0.7 = chậm lại, mượt)
 
@@ -125,6 +137,84 @@ def generate_ingredient_plan(image_count: int, rest_clips: int,
             plan.append(im)
             last = im
     return plan
+
+
+# ── 2 PHONG CÁCH: 2D & 3D ───────────────────────────────────────
+# Vấn đề: khi prompt mô tả nhân vật quá "thực" (chất liệu vải, màu da, mã màu
+# hex) và từ khoá phong cách nằm cuối/quá yếu, Gemini render ra ẢNH THẬT
+# (photorealistic). Nên ta ÉP một câu lệnh phong cách mạnh vào ĐẦU mọi prompt
+# (nơi model coi trọng nhất) + một câu PHỦ ĐỊNH ở cuối cấm ảnh thật.
+# Người dùng chọn 2D hoặc 3D theo từng project → quyết định prefix/negative,
+# lời hướng dẫn cho AI viết prompt, và gợi ý phong cách cho clip (Flow/Veo).
+# Đổi khi thay đổi định nghĩa phong cách. Cache prompts.json có style_version
+# KHÁC giá trị này (hoặc khác style_key) sẽ bị coi là cũ → sinh lại prompt.
+STYLE_VERSION = "styles-v4"
+DEFAULT_STYLE = "2d"
+
+STYLES: dict[str, dict[str, str]] = {
+    "2d": {
+        "label": "2D (tranh vẽ / anime / cartoon)",
+        # Chèn vào ĐẦU mọi prompt ảnh.
+        "prefix": (
+            "TRANH HOẠT HÌNH 2D (2D animation / cartoon / anime-style "
+            "illustration), vẽ tay nét mềm, tô màu phẳng kiểu cel-shading, màu "
+            "pastel dịu, ánh sáng điện ảnh. ĐÂY LÀ TRANH HOẠT HÌNH 2D, KHÔNG "
+            "PHẢI ẢNH CHỤP THẬT. "
+        ),
+        # Chèn vào CUỐI mọi prompt ảnh.
+        "negative": (
+            " || Phong cách BẮT BUỘC: hoạt hình 2D vẽ tay / cartoon / anime "
+            "(flat cel-shading). TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh chụp "
+            "thật (photo/photograph/realistic photo), KHÔNG người/da/vải/tóc "
+            "chân thực như đời thật, KHÔNG 3D render thực, KHÔNG hyperrealism. "
+            "Nếu phân vân, luôn nghiêng về nét vẽ tay 2D phẳng."
+        ),
+        # Đưa vào lời nhắc AI viết prompt (prompt_gen).
+        "brief": (
+            "tranh hoạt hình 2D vẽ tay / cartoon / anime-style illustration, "
+            "tô màu phẳng cel-shading, nét viền mềm, màu pastel dịu"
+        ),
+        # Gợi ý phong cách gắn vào prompt chuyển động của clip (Flow/Veo).
+        "motion": "2D hand-drawn animated cartoon look",
+    },
+    "3d": {
+        "label": "3D (Pixar / Disney CGI)",
+        "prefix": (
+            "PHIM HOẠT HÌNH 3D (3D animated movie / Pixar-Disney style / "
+            "stylized 3D CGI render), nhân vật & cảnh vật tạo khối 3D mềm mại "
+            "đáng yêu, đổ bóng dịu, màu pastel ấm, ánh sáng điện ảnh. ĐÂY LÀ "
+            "ẢNH HOẠT HÌNH 3D, KHÔNG PHẢI ẢNH CHỤP THẬT. "
+        ),
+        "negative": (
+            " || Phong cách BẮT BUỘC: hoạt hình 3D kiểu Pixar/Disney (stylized "
+            "3D CGI). TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh chụp thật (photo"
+            "/photograph/realistic photo), KHÔNG người/da/vải/tóc chân thực như "
+            "đời thật, KHÔNG hyperrealism, KHÔNG tranh vẽ 2D phẳng. Nếu phân "
+            "vân, luôn nghiêng về khối 3D cách điệu kiểu phim hoạt hình."
+        ),
+        "brief": (
+            "phim hoạt hình 3D kiểu Pixar/Disney (stylized 3D CGI), khối 3D mềm "
+            "mại đáng yêu, đổ bóng dịu, subsurface scattering nhẹ, màu pastel ấm"
+        ),
+        "motion": "stylized 3D Pixar-style animated film look",
+    },
+}
+
+
+def normalize_style(style: str | None) -> str:
+    """Chuẩn hoá key phong cách về '2d'/'3d'; giá trị lạ → DEFAULT_STYLE."""
+    s = (style or "").strip().lower()
+    return s if s in STYLES else DEFAULT_STYLE
+
+
+def style_info(style: str | None) -> dict[str, str]:
+    return STYLES[normalize_style(style)]
+
+
+def wrap_style(prompt: str, style: str | None = None) -> str:
+    """Bọc prompt bằng prefix phong cách (2D/3D) + phủ định cấm ảnh thật."""
+    s = style_info(style)
+    return f"{s['prefix']}{prompt}{s['negative']}"
 
 
 # ── Prompt sinh ảnh (chỉnh theo ý muốn) ─────────────────────────
@@ -192,12 +282,33 @@ THUMBNAIL_KEYWORDS = [
 
 # Prompt mô tả chuyển động cho Flow (áp cho mọi clip; có thể để rỗng).
 FLOW_MOTION_PROMPT = (
-    "chill animated film, slow tempo, ultra-slow smooth camera movement, "
-    "subtle breathing, cloth, steam, leaves, water and light movement only; "
-    "preserve the exact same character face, hairstyle, sage hoodie, beige "
-    "headphones, calico cat, cabin layout, scenery, color palette and original "
-    "composition; no scene cut, no sudden motion, no dialogue, no lip movement, "
-    "no new character, no morphing, keep all typography unchanged"
+    "chill meditative animated film, very slow tempo, exactly one ultra-slow "
+    "smooth camera move; gentle natural in-place micro-motion of the character, "
+    "soft ambient motion of leaves, drifting mist, water ripples and light only; "
+    "preserve the exact same character identity, face, hairstyle, outfit, props, "
+    "scenery, color palette and original composition; seamless slow loop, "
+    "no scene cut, no sudden motion, no dialogue, no lip sync, no new character"
+)
+
+# Phủ định CỨNG gắn vào CUỐI mọi prompt chuyển động gửi Veo/Flow. Chặn các lỗi
+# "ảo giác" Veo hay tạo ra: khói/hơi/lửa bốc ra từ miệng hay nhạc cụ, đầu xoay
+# ngược, méo mó mặt/tay/ngón, thừa chi, biến hình, nhân bản, cắt cảnh, chữ...
+# Áp dụng cho MỌI clip (cả motion AI lẫn motion mặc định).
+MOTION_NEGATIVE = (
+    " || NGHIÊM CẤM (negative — tránh tuyệt đối): KHÔNG khói, hơi nước, hơi thở "
+    "thành khói, lửa, tàn lửa hay sương khói bốc ra từ miệng, mũi, sáo hoặc bất "
+    "kỳ nhạc cụ/vật thể nào; KHÔNG đầu hay cổ xoay ngược, xoay 180°, giật ngược "
+    "bất thường; KHÔNG méo mó/biến dạng khuôn mặt, mắt, răng, tay, ngón tay; "
+    "KHÔNG thừa hay thiếu ngón/chi; KHÔNG mọc thêm người, chi hay vật; KHÔNG "
+    "biến hình (morph), KHÔNG nhân bản/tách đôi nhân vật; KHÔNG đổi trang phục "
+    "hay đạo cụ giữa chừng; KHÔNG cắt cảnh, KHÔNG nháy hình, KHÔNG chuyển động "
+    "giật cục hay đột ngột; KHÔNG mấp máy môi như đang nói; KHÔNG chữ, logo, "
+    "watermark. negative prompt: no smoke, no steam, no vapor, no breath vapor, "
+    "no fog from mouth, no smoke from flute or instrument, no fire, no head "
+    "spinning, no reversed head, no 180-degree head turn, no face distortion, "
+    "no warped or melting hands, no extra fingers, no extra limbs, no morphing, "
+    "no duplicated character, no scene cut, no flicker, no text. Keep anatomy "
+    "correct, physically plausible, and the character identity fully consistent."
 )
 
 
@@ -227,10 +338,11 @@ FLOW_URL    = "https://flow.google.com/"
 GEMINI_IMAGE_MODEL = "3.1 Pro"
 
 # Độ phân giải khi TẢI clip từ Flow (menu Tải xuống có menu con):
-#   "720p" = kích thước gốc; "1080p" = tăng độ phân giải (upscale, miễn phí);
-#   "4K" = upscale nhưng tốn 50 tín dụng/clip. Veo 3.1 Fast render gốc 720p,
-#   1080p là bản upscale khi tải. Override qua "flow_download_resolution".
-FLOW_DOWNLOAD_RESOLUTION = "1080p"
+#   "720p" = kích thước gốc (tải NGAY, KHÔNG upscale); "1080p"/"4K" = upscale
+#   (chờ "Upscaling your video", 4K tốn tín dụng). Omni 1.1 Flash render gốc
+#   720p và chỉ có 360p/720p → dùng "720p" để tải trực tiếp, tránh upscale.
+#   Override qua "flow_download_resolution" trong video_overrides.json.
+FLOW_DOWNLOAD_RESOLUTION = "720p"
 
 
 # ── SELECTOR (best-effort — SỬA Ở ĐÂY khi automation lỗi) ────────
@@ -376,19 +488,12 @@ FLOW_SELECTORS: dict[str, list[str]] = {
     "aspect_option_169": [
         "[role='radio']:has-text('16:9')",
     ],
-    # Dropdown model + option Veo 3.1 - Fast
+    # Dropdown model. Option model + radio thời lượng được dựng ĐỘNG trong
+    # flow_driver._configure_settings từ config.PARAMS.flow_model /
+    # clip_seconds (EN+VN), nên không hardcode ở đây nữa.
     "model_selector": [
         "button[aria-label='Select model family']",
         "button[aria-label='Chọn nhóm mô hình']",
-    ],
-    "model_option_veo31_fast": [
-        "[role='menuitem']:has-text('Veo 3.1 - Fast')",
-    ],
-    # Thời lượng 8 giây, số lượng x1
-    "duration_8s": [
-        "[role='radio']:text-is('8s')",
-        "[role='radio']:has-text('8s')",
-        "[role='radio']:has-text('8 giây')",
     ],
     "outputs_x1": [
         "[role='radio']:text-is('x1')",

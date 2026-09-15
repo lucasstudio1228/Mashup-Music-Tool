@@ -11,11 +11,17 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
 
+from backend.keep_awake import keep_awake
+
+
+class JobCancelled(Exception):
+    """Ném ra từ progress callback khi user bấm Cancel → dừng job hợp tác."""
+
 
 @dataclass
 class JobProgress:
     mix_id: int
-    status: str = "pending"       # pending|running|completed|failed
+    status: str = "pending"       # pending|running|completed|failed|cancelled
     step: int = 0                 # 1-6
     step_name: str = ""
     percent: float = 0.0
@@ -31,6 +37,7 @@ class JobManager:
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._jobs: dict[int, JobProgress] = {}
         self._queues: dict[int, asyncio.Queue] = {}
+        self._cancels: dict[int, threading.Event] = {}
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -40,20 +47,42 @@ class JobManager:
 
     # ---------- submit / run ----------
     def submit(self, mix_id: int, fn, *args, on_success=None, on_failure=None,
-               **kwargs) -> None:
+               on_cancel=None, **kwargs) -> None:
         with self._lock:
             self._jobs[mix_id] = JobProgress(mix_id=mix_id, status="pending")
             self._queues.setdefault(mix_id, asyncio.Queue())
+            self._cancels[mix_id] = threading.Event()
         self._executor.submit(self._run, mix_id, fn, args, kwargs,
-                              on_success, on_failure)
+                              on_success, on_failure, on_cancel)
 
-    def _run(self, mix_id, fn, args, kwargs, on_success, on_failure):
+    def cancel(self, mix_id: int) -> bool:
+        """Yêu cầu huỷ hợp tác: đặt cờ → progress callback kế tiếp ném
+        JobCancelled → job dừng. Trả True nếu job đang chạy/chờ để huỷ."""
+        with self._lock:
+            job = self._jobs.get(mix_id)
+            ev = self._cancels.get(mix_id)
+            if not job or not ev or job.status not in ("pending", "running"):
+                return False
+            ev.set()
+            return True
+
+    def _run(self, mix_id, fn, args, kwargs, on_success, on_failure, on_cancel):
         self._update(mix_id, status="running")
         try:
-            result = fn(mix_id, self._progress_callback(mix_id), *args, **kwargs)
+            with keep_awake():
+                result = fn(mix_id, self._progress_callback(mix_id),
+                            *args, **kwargs)
             self._update(mix_id, status="completed", percent=100.0, result=result)
             if on_success:
                 on_success(mix_id, result)
+        except JobCancelled:
+            self._update(mix_id, status="cancelled", message="Đã huỷ")
+            if on_cancel:
+                on_cancel(mix_id)
+            self._push_sse(mix_id, "progress", {
+                "step": 0, "step_name": "cancelled",
+                "percent": 0.0, "message": "Đã huỷ theo yêu cầu",
+            })
         except Exception as exc:              # noqa: BLE001 - báo lỗi ra SSE + DB
             self._update(mix_id, status="failed", error=str(exc))
             if on_failure:
@@ -66,7 +95,11 @@ class JobManager:
             })
 
     def _progress_callback(self, mix_id):
+        ev = self._cancels.get(mix_id)
+
         def callback(step: int, step_name: str, percent: float, message: str = ""):
+            if ev is not None and ev.is_set():
+                raise JobCancelled()
             self._update(mix_id, step=step, step_name=step_name,
                          percent=percent, message=message)
             self._push_sse(mix_id, "progress", {
@@ -133,6 +166,12 @@ class JobManager:
                 yield {"type": "error", "data": {
                     "message": job.error or "Unknown error"}}
                 yield {"type": "done", "data": {"status": "failed"}}
+                return
+            elif job.status == "cancelled":
+                yield {"type": "progress", "data": {
+                    "step": 0, "step_name": "cancelled",
+                    "percent": 0.0, "message": "Đã huỷ"}}
+                yield {"type": "done", "data": {"status": "cancelled"}}
                 return
 
         # Job đang chạy hoặc pending — consume từ queue bình thường.

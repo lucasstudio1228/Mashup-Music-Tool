@@ -1,6 +1,11 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from './client';
-import type { AppSettings, AppSettingsUpdate } from '../types';
+import type {
+  AppSettings,
+  AppSettingsUpdate,
+  ApiTestRequest,
+  ApiTestResult,
+} from '../types';
 
 export function useSettings() {
   return useQuery<AppSettings>({
@@ -22,6 +27,18 @@ export function useUpdateSettings() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['settings'] });
+    },
+  });
+}
+
+export function useTestApi() {
+  return useMutation({
+    mutationFn: async (data: ApiTestRequest) => {
+      // Timeout dài phía client vì proxy có thể chậm (server tự giới hạn 60s).
+      const res = await api.post('/api/settings/test', data, {
+        timeout: 75_000,
+      });
+      return res.data as ApiTestResult;
     },
   });
 }

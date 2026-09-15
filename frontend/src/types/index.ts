@@ -5,6 +5,9 @@ export interface Project {
   created_at: string;
   track_count?: number;
   mix_count?: number;
+  video_idea?: string;
+  auto_video?: boolean;
+  video_style?: string;
 }
 
 export interface AppSettings {
@@ -18,6 +21,23 @@ export interface AppSettingsUpdate {
   clear_api_key?: boolean;
   api_base_url?: string;
   api_model?: string;
+}
+
+export interface ApiTestRequest {
+  api_key?: string;
+  api_base_url?: string;
+  api_model?: string;
+}
+
+export interface ApiTestResult {
+  ok: boolean;
+  model: string;
+  base_url: string;
+  latency_ms?: number | null;
+  reply?: string | null;
+  error_type?: string | null;
+  error?: string | null;
+  retryable: boolean;
 }
 
 export interface Track {
@@ -34,7 +54,7 @@ export interface Track {
   added_at: string;
 }
 
-export type MixStatus = 'pending' | 'running' | 'completed' | 'failed';
+export type MixStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
 
 export interface Mix {
   id: number;
@@ -78,6 +98,9 @@ export interface ProjectCreate {
 export interface ProjectUpdate {
   name?: string;
   description?: string;
+  video_idea?: string;
+  auto_video?: boolean;
+  video_style?: string;
 }
 
 export interface MixCreate {
@@ -166,6 +189,7 @@ export interface VideoStatus {
   clip_count:     number;
   final_exists:   boolean;
   final_path?:    string | null;
+  thumbnail_path?: string | null;
   audio_path?:    string | null;
   audio_duration?: number | null;
   job?:           VideoJobInfo | null;

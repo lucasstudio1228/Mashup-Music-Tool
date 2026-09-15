@@ -34,6 +34,11 @@ class RunAllBody(BaseModel):
     audio_path: Optional[str] = None
     seed: Optional[int] = None
 
+class RebuildBody(BaseModel):
+    audio_path: Optional[str] = None
+    seed: Optional[int] = None
+    mode: str = "restart"          # clip mode: "restart" (tạo lại clip) | "resume"
+
 
 def _project_or_404(db: Session, project_id: int) -> Project:
     p = db.get(Project, project_id)
@@ -75,7 +80,7 @@ def gen_images(project_id: int, body: RunImagesBody,
     mode = "resume" if body.mode == "resume" else "restart"
     idea = (body.idea or "").strip() or None
     video_job_manager.submit(project_id, "images", service.step_images,
-                             topic, mode, project.name, idea)
+                             topic, mode, project.name, idea, project.video_style)
     return {"status": "submitted", "kind": "images", "topic": topic,
             "mode": mode, "has_idea": bool(idea)}
 
@@ -87,7 +92,7 @@ def gen_clips(project_id: int, body: RunClipsBody = RunClipsBody(),
     _guard_busy()
     mode = "resume" if body.mode == "resume" else "restart"
     video_job_manager.submit(project_id, "clips", service.step_clips,
-                             mode, project.name)
+                             mode, project.name, project.video_style)
     return {"status": "submitted", "kind": "clips", "mode": mode}
 
 
@@ -109,9 +114,38 @@ def run_all(project_id: int, body: RunAllBody,
     topic = (body.topic or project.name or "meditation").strip()
     idea = (body.idea or "").strip() or None
     video_job_manager.submit(project_id, "full", service.run_full_video,
-                             topic, body.audio_path, body.seed, project.name, idea)
+                             topic, body.audio_path, body.seed, project.name,
+                             idea, project.video_style)
     return {"status": "submitted", "kind": "full", "topic": topic,
             "has_idea": bool(idea)}
+
+
+@router.post("/rebuild")
+def rebuild(project_id: int, body: RebuildBody = RebuildBody(),
+            db: Session = Depends(get_session)):
+    """Tạo lại VIDEO từ ảnh ĐÃ CÓ (không tạo lại ảnh): clip → ghép."""
+    project = _project_or_404(db, project_id)
+    _guard_busy()
+    media = service.list_media(project_id, project.name)
+    if media["image_count"] < config.PARAMS.image_count:
+        raise HTTPException(
+            400, f"Chưa đủ {config.PARAMS.image_count} ảnh để tạo lại video "
+                 f"(hiện có {media['image_count']}). Hãy tạo ảnh trước.")
+    mode = "resume" if body.mode == "resume" else "restart"
+    video_job_manager.submit(project_id, "rebuild", service.run_video_from_images,
+                             body.audio_path, body.seed, project.name,
+                             project.video_style, mode)
+    return {"status": "submitted", "kind": "rebuild", "mode": mode}
+
+
+@router.post("/cancel")
+def cancel(project_id: int, db: Session = Depends(get_session)):
+    """Huỷ tác vụ video đang chạy (hợp tác — dừng ở ranh giới ảnh/clip kế)."""
+    _project_or_404(db, project_id)
+    ok = video_job_manager.cancel(project_id)
+    if not ok:
+        raise HTTPException(409, "Không có tác vụ video nào đang chạy để huỷ.")
+    return {"status": "cancelling", "project_id": project_id}
 
 
 @router.get("/progress")
@@ -135,3 +169,16 @@ def download(project_id: int, db: Session = Depends(get_session)):
                    for c in (project.name or "video")).strip()
     return FileResponse(str(final), media_type="video/mp4",
                         filename=f"{safe or 'video'}_final.mp4")
+
+
+@router.get("/thumbnail")
+def thumbnail(project_id: int, db: Session = Depends(get_session)):
+    project = _project_or_404(db, project_id)
+    thumb = config.final_dir(project_id, project.name) / "thumbnail.png"
+    if not thumb.exists():
+        raise HTTPException(404, "Chưa có thumbnail. Hãy ghép video (assemble) "
+                                 "để tạo thumbnail kèm chữ.")
+    safe = "".join(c if c.isalnum() or c in " -_" else "_"
+                   for c in (project.name or "video")).strip()
+    return FileResponse(str(thumb), media_type="image/png",
+                        filename=f"{safe or 'video'}_thumbnail.png")

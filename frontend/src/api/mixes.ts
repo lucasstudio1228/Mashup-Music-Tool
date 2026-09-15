@@ -31,6 +31,17 @@ export function useCreateMix(projectId: number) {
   });
 }
 
+export function useCancelMix(projectId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (mixId: number) =>
+      (await api.post(`/api/mixes/${mixId}/cancel`)).data,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['mixes', projectId] });
+    },
+  });
+}
+
 export function useDeleteMix(projectId: number) {
   const qc = useQueryClient();
   return useMutation({

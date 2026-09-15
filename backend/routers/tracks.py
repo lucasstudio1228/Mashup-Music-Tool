@@ -1,7 +1,9 @@
-"""Quản lý track của 1 project: scan folder, add file, xóa."""
+"""Quản lý track của 1 project: scan folder, add file, upload, xóa."""
+import re
+import shutil
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlmodel import Session, select
 
 from backend import core_bridge
@@ -10,8 +12,16 @@ from backend.models import Track
 from backend.routers.projects import get_project_or_404
 from backend.schemas import (AddFileRequest, ScanRequest, ScanResult,
                              TrackResponse)
+from backend.video import config as video_config
 
 router = APIRouter(prefix="/projects", tags=["tracks"])
+
+
+def _safe_filename(name: str) -> str:
+    """Bỏ ký tự nguy hiểm khỏi tên file upload (chống path traversal)."""
+    base = Path(name or "").name                       # bỏ mọi thành phần thư mục
+    base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", base).strip(" .")
+    return base or "upload"
 
 
 def _delete_track_stems(session: Session, track: Track) -> None:
@@ -109,6 +119,54 @@ def add_file(project_id: int, data: AddFileRequest,
     core_track = core_bridge.probe_file(str(path))
     if core_track is None:
         raise HTTPException(400, f"Không đọc được file audio: {path.name}")
+
+    track = _persist(session, project_id, core_track)
+    session.commit()
+    session.refresh(track)
+    return track
+
+
+@router.post("/{project_id}/tracks/upload", response_model=TrackResponse)
+def upload_track(project_id: int,
+                 file: UploadFile = File(...),
+                 session: Session = Depends(get_session)):
+    """Upload 1 file audio TỪ MÁY người dùng → lưu vào media/<project>/uploads/,
+    đăng ký thành track VÀ dùng luôn làm nhạc nền video (find_latest_audio quét
+    thư mục uploads). Cho phép 'upload track dài rồi tạo video' không cần mix."""
+    project = get_project_or_404(session, project_id)
+
+    fname = _safe_filename(file.filename or "upload")
+    ext = Path(fname).suffix.lower()
+    if ext not in video_config.AUDIO_EXTS:
+        raise HTTPException(
+            400, f"Định dạng '{ext or '?'}' không hỗ trợ. Chấp nhận: "
+                 f"{', '.join(video_config.AUDIO_EXTS)}")
+
+    up_dir = video_config.uploads_dir(project_id, project.name)
+    up_dir.mkdir(parents=True, exist_ok=True)
+    dest = up_dir / fname
+    # Tránh ghi đè file trùng tên: thêm hậu tố _1, _2, ...
+    if dest.exists():
+        stem, suffix = Path(fname).stem, Path(fname).suffix
+        i = 1
+        while (up_dir / f"{stem}_{i}{suffix}").exists():
+            i += 1
+        dest = up_dir / f"{stem}_{i}{suffix}"
+
+    try:
+        with dest.open("wb") as out:
+            shutil.copyfileobj(file.file, out)
+    finally:
+        file.file.close()
+
+    resolved = str(dest.resolve())
+    if resolved in _existing_paths(session, project_id):
+        raise HTTPException(409, "File đã có trong project")
+
+    core_track = core_bridge.probe_file(str(dest))
+    if core_track is None:
+        dest.unlink(missing_ok=True)                   # dọn file rác nếu không đọc được
+        raise HTTPException(400, f"Không đọc được file audio: {fname}")
 
     track = _persist(session, project_id, core_track)
     session.commit()

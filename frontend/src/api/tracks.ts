@@ -43,6 +43,27 @@ export function useAddFile(projectId: number) {
   });
 }
 
+export function useUploadTrack(projectId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (file: File) => {
+      const form = new FormData();
+      form.append('file', file);
+      const res = await api.post<Track>(
+        `/api/projects/${projectId}/tracks/upload`,
+        form,
+        {
+          // File dài có thể to → tắt timeout mặc định của axios cho request này.
+          timeout: 0,
+          headers: { 'Content-Type': 'multipart/form-data' },
+        },
+      );
+      return res.data;
+    },
+    onSuccess: () => invalidate(qc, projectId),
+  });
+}
+
 export function useDeleteTrack(projectId: number) {
   const qc = useQueryClient();
   return useMutation({

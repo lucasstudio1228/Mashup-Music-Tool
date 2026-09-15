@@ -13,6 +13,7 @@ import { StemSectionHeader } from '../components/stems/StemSectionHeader';
 import { ApplyAllPanel } from '../components/stems/ApplyAllPanel';
 import { StemPlayerBar } from '../components/stems/StemPlayerBar';
 import VideoPanel from '../components/video/VideoPanel';
+import WorkflowStatusBar from '../components/shared/WorkflowStatusBar';
 import { useStemPlayer } from '../hooks/useStemPlayer';
 import { useProject, useUpdateProject } from '../api/projects';
 import { useTracks, useDeleteTrack } from '../api/tracks';
@@ -127,7 +128,10 @@ export default function ProjectDetailPage() {
               <TrackList tracks={trackList} onDelete={(tid) => deleteTrack.mutate(tid)} />
             </Section>
             <Section title="Add Tracks">
-              <AddTracksPanel projectId={projectId} />
+              <AddTracksPanel
+                projectId={projectId}
+                onGoToVideo={() => setTab('video')}
+              />
             </Section>
 
             {trackList.length > 0 && (
@@ -216,6 +220,8 @@ export default function ProjectDetailPage() {
         }}
         onCancel={() => setMixToDelete(null)}
       />
+
+      <WorkflowStatusBar projectId={projectId} onReopenMix={setActiveMixId} />
 
       {playerState.activeTrackId !== null && (
         <StemPlayerBar

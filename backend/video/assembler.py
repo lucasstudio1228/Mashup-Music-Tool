@@ -27,6 +27,99 @@ def probe_duration(path: str) -> float:
     return float(json.loads(r.stdout)["format"]["duration"])
 
 
+def _probe_resolution(path: str) -> tuple[int, int]:
+    """(width, height) của stream video đầu tiên bằng ffprobe."""
+    r = _run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height", "-of", "json", path,
+    ])
+    if r.returncode != 0:
+        raise RuntimeError(f"ffprobe lỗi: {r.stderr.strip()[:200]}")
+    st = json.loads(r.stdout)["streams"][0]
+    return int(st["width"]), int(st["height"])
+
+
+def overlay_title_on_clip(clip_path: str, title: str, subtitle: str,
+                          out_path: str, log=None) -> bool:
+    """Chồng tiêu đề (giống thumbnail) lên TOÀN BỘ clip intro → `out_path`.
+
+    Cần thiết vì clip_00 do Veo tạo LẠI cảnh từ ảnh 0 nên chữ nướng sẵn trong
+    ảnh 0 KHÔNG còn ở video. Vẽ chữ bằng font thật (Pillow) ra PNG trong suốt
+    rồi ffmpeg overlay → intro video có tiêu đề đúng chính tả, khớp thumbnail.
+    Trả True nếu tạo được clip có tiêu đề; False (không phá pipeline) nếu lỗi —
+    caller nên fallback dùng clip gốc."""
+    def _log(m: str):
+        if log:
+            try:
+                log(m)
+            except Exception:
+                pass
+
+    title = (title or "").strip()
+    if not title:
+        return False
+    try:
+        from . import thumbnail
+    except Exception as e:
+        _log(f"intro-title: không import được thumbnail ({e})")
+        return False
+    try:
+        w, h = _probe_resolution(clip_path)
+    except Exception as e:
+        _log(f"intro-title: không đọc được kích thước clip ({e})")
+        return False
+
+    png = Path(out_path).with_suffix(".title.png")
+    if not thumbnail.render_title_overlay_png(
+            w, h, title, subtitle or "", png, log=log):
+        return False
+
+    # Cần độ dài clip để co lịch animation cho vừa clip ngắn. Lỗi probe → 8s.
+    try:
+        clip_dur = probe_duration(clip_path)
+    except Exception:
+        clip_dur = 8.0
+
+    # Animation tiêu đề: fade-IN + trượt LÊN nhẹ → GIỮ ngắn → fade-OUT SỚM.
+    # Tiêu đề phải BIẾN MẤT hẳn TRƯỚC khi intro crossfade sang cảnh kế (không
+    # để chữ dính sang cảnh mới), nên fade-out đặt ở KHOẢNG ĐẦU clip chứ KHÔNG
+    # ở cuối clip. Với clip intro thô ~8s: hiện ~0.8s + giữ ~2s + tắt ~1s →
+    # chữ tắt hẳn quanh giây 3.8, còn xa điểm chuyển cảnh (~giây 7.3).
+    # QUAN TRỌNG: PNG tĩnh chỉ có 1 frame ở t=0 nên fade sẽ kẹt alpha=0 mãi →
+    # phải `-loop 1` để ảnh thành stream có timestamp chạy; overlay `shortest=1`
+    # để dừng theo clip (nếu chỉ `-shortest` output sẽ encode vô hạn).
+    d = 0.8                                   # thời lượng fade-in (giây)
+    hold = 2.0                                # giữ hiển thị (giây)
+    d_out = 1.0                               # thời lượng fade-out (giây)
+    # Clip quá ngắn → co toàn bộ lịch lại, chừa 0.3s để chữ tắt hẳn trước cuối.
+    total_show = d + hold + d_out
+    if total_show > clip_dur - 0.3:
+        k = max(0.2, (clip_dur - 0.3) / total_show)
+        d *= k; hold *= k; d_out *= k
+    slide = max(12, int(h * 0.045))           # quãng trượt lên (px)
+    out_st = d + hold                         # fade-out bắt đầu ngay sau lúc giữ
+    y_expr = f"if(lt(t\\,{d})\\,{slide}*(1-t/{d})\\,0)"
+    r = _run([
+        "ffmpeg", "-y", "-i", clip_path, "-loop", "1", "-i", str(png),
+        "-filter_complex",
+        f"[1:v]scale={w}:{h},format=rgba,"
+        f"fade=t=in:st=0:d={d}:alpha=1,"
+        f"fade=t=out:st={out_st:.3f}:d={d_out}:alpha=1[t];"
+        f"[0:v][t]overlay=x=0:y={y_expr}:shortest=1:format=auto",
+        "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out_path),
+    ])
+    try:
+        png.unlink(missing_ok=True)
+    except Exception:
+        pass
+    if r.returncode != 0:
+        _log(f"intro-title: ffmpeg overlay lỗi: {r.stderr.strip()[-300:]}")
+        return False
+    _log(f"intro-title: đã chồng tiêu đề '{title}' lên clip intro")
+    return True
+
+
 def _write_concat_list(sequence: list[str], list_path: Path) -> None:
     """File cho ffmpeg concat demuxer. Escape dấu ' trong path."""
     lines = []

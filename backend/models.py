@@ -23,6 +23,15 @@ class Project(SQLModel, table=True):
         default_factory=lambda: datetime.now(timezone.utc))
     # api_key, api_base_url, api_model ĐÃ XÓA — dùng AppSettings toàn cục
 
+    # Video: ý tưởng lưu sẵn để AI viết prompt (dùng cho cả tạo tay lẫn auto).
+    video_idea: str = ""
+    # Tự động dựng video ngay sau khi render mix Audio xong. Project MỚI mặc
+    # định BẬT (model default True); project CŨ giữ TẮT (migration set 0).
+    auto_video: bool = True
+    # Phong cách ảnh/video: "2d" (tranh vẽ/anime/cartoon) hoặc "3d" (Pixar CGI).
+    # Mặc định 2D cho cả project mới lẫn cũ (migration set '2d').
+    video_style: str = "2d"
+
 
 class Track(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)

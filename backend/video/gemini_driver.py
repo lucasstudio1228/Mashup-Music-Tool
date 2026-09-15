@@ -2,7 +2,7 @@
 video/gemini_driver.py — Tự động hoá Gemini web (gemini.google.com) để tạo ảnh.
 
 Chọn model 3.1 Pro (2 bước: '3.1 Pro' rồi 'Tư duy mở rộng'), sinh 20 ảnh:
-  0 = thumbnail CÓ CHỮ biến thiên theo project; 1..14 = các shot liên kết,
+  0 = ảnh nền thumbnail (KHÔNG chữ); 1..14 = các shot liên kết,
   đồng bộ nhân vật, bối cảnh và diễn tiến ánh sáng.
 Lưu vào media/<project>/images/{i}.png.
 
@@ -84,7 +84,8 @@ def _thumbnail_keywords() -> str:
 
 
 def _prompt_for(index: int, topic: str, params: config.VideoParams,
-                prompts_override: Optional[dict] = None) -> str:
+                prompts_override: Optional[dict] = None,
+                style: Optional[str] = None) -> str:
     # Ưu tiên prompt do AI sinh từ ý tưởng người dùng (prompts_override),
     # rồi tới overrides file, cuối cùng là DEFAULT_PROMPTS.
     prompts = (prompts_override
@@ -94,12 +95,27 @@ def _prompt_for(index: int, topic: str, params: config.VideoParams,
     fmt = {"topic": topic, "keywords": _thumbnail_keywords()}
     if tmpl:
         try:
-            return tmpl.format(**fmt)
+            body = tmpl.format(**fmt)
         except Exception:
-            return tmpl.replace("{topic}", topic)
-    return (f"Tạo ảnh nền cảnh thiên nhiên/thành phố/mây trời số {index}, "
-            f"phong cách {params.image_style}, chủ đề '{topic}', "
-            f"tỉ lệ {params.aspect_ratio}, không chữ.")
+            body = tmpl.replace("{topic}", topic)
+    else:
+        body = (f"Cảnh thiên nhiên/thành phố/mây trời số {index}, "
+                f"chủ đề '{topic}', tỉ lệ {params.aspect_ratio}, không chữ.")
+    # ÉP phong cách hoạt hình (2D/3D) vào ĐẦU + phủ định cấm ảnh thật ở CUỐI,
+    # áp dụng cho MỌI prompt (AI-sinh, overrides file, DEFAULT_PROMPTS, fallback).
+    wrapped = config.wrap_style(body, style)
+    if index == 0:
+        # Thumbnail: model sinh ảnh KHÔNG đánh vần được → cấm tuyệt đối vẽ chữ,
+        # tiêu đề sẽ được overlay bằng font thật sau (thumbnail.render_title).
+        # Đặt CUỐI cùng để ưu tiên cao nhất; yêu cầu chừa khoảng trống bên trái.
+        wrapped += (
+            " || QUAN TRỌNG NHẤT (ưu tiên tuyệt đối): ẢNH PHẢI HOÀN TOÀN KHÔNG "
+            "CÓ CHỮ. TUYỆT ĐỐI KHÔNG vẽ bất kỳ chữ/tiêu đề/tên/typography/"
+            "caption/watermark/logo/số nào trong ảnh — không một ký tự nào. Bố "
+            "cục thumbnail hút mắt, nhân vật lệch sang PHẢI, CHỪA khoảng trống "
+            "thoáng (negative space) ở NỬA TRÁI để chèn tiêu đề sau."
+        )
+    return wrapped
 
 
 def _select_model(page, sels) -> None:
@@ -252,11 +268,15 @@ def generate_images(
     resume: bool = False,
     project_name: str | None = None,
     prompts_override: Optional[dict] = None,
+    style: Optional[str] = None,
 ) -> list[str]:
     """
     Trả về danh sách đường dẫn ảnh đã tạo (0..n) qua Gemini web.
     resume=True: BỎ QUA ảnh đã có (chỉ tạo ảnh còn thiếu). Nếu đã đủ → không
     mở trình duyệt.
+    Ảnh 0 giữ SẠCH (không chữ): tiêu đề được overlay ở bước ghép video
+    (service.step_assemble) lên clip intro + thumbnail.png bằng font thật, tránh
+    chữ nướng sẵn bị Veo tạo lại thành bóng ma / chồng chéo.
     """
     params = params or config.PARAMS
     sels = config.get_selectors("gemini")
@@ -268,6 +288,19 @@ def generate_images(
             progress_cb(msg, pct)
 
     n = params.image_count
+    # RESTART: XOÁ hết ảnh cũ trước khi tạo, để KHÔNG bao giờ trộn ảnh mới với
+    # ảnh cũ/của lần render trước. Nếu run mới bị dở dang thì bước clip sẽ báo
+    # "thiếu ảnh" rõ ràng thay vì âm thầm dùng ảnh cũ để ghép.
+    if not resume:
+        removed = 0
+        for old in out_dir.glob("*.png"):
+            try:
+                old.unlink()
+                removed += 1
+            except OSError:
+                pass
+        if removed:
+            _p(f"Xoá {removed} ảnh cũ (restart)", 1.0)
     todo = [i for i in range(n) if not (resume and _has_image(out_dir, i))]
     if resume and not todo:
         _p("Đã đủ ảnh — bỏ qua (resume)", 100.0)
@@ -297,7 +330,7 @@ def generate_images(
         for k, i in enumerate(todo):
             pct = 6.0 + (k / max(len(todo), 1)) * 90.0
             _p(f"[{k+1}/{len(todo)}] Gửi prompt ảnh {i}...", pct)
-            prompt = _prompt_for(i, topic, params, prompts_override)
+            prompt = _prompt_for(i, topic, params, prompts_override, style)
 
             if not fill_first(page, sels["prompt_box"], prompt):
                 raise RuntimeError("Không tìm thấy ô nhập prompt Gemini "
@@ -324,6 +357,7 @@ def generate_images(
             seen.add(src)
             saved.append(str(dest))
             _p(f"[{i+1}/{n}] Đã lưu ảnh {i}", pct + 6.0)
+            # Ảnh 0 giữ SẠCH — tiêu đề overlay ở bước ghép (service.step_assemble).
 
     _p("Xong tạo ảnh", 100.0)
     # Trả về TẤT CẢ ảnh hiện có (gồm ảnh cũ khi resume + ảnh mới tạo).

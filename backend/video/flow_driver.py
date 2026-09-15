@@ -17,6 +17,7 @@ Mọi selector nằm trong config.get_selectors('flow').
 """
 from __future__ import annotations
 import json
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -133,13 +134,27 @@ def _click(page, selectors, timeout_ms=6000) -> bool:
 
 
 def _configure_settings(page, sels) -> None:
-    """Mở bảng cài đặt và set: THÀNH PHẦN, 16:9, Veo 3.1 Fast, 8s, x1."""
+    """Mở bảng cài đặt và set động theo config.PARAMS: THÀNH PHẦN, 16:9,
+    model (vd Omni 1.1 Flash), thời lượng (vd 10s), x1. Chịu được UI EN/VN."""
+    model_name = getattr(config.PARAMS, "flow_model", "Omni 1.1 Flash")
+    clip_sec = int(getattr(config.PARAMS, "clip_seconds", 10))
+    # Selector động cho option model + radio thời lượng (EN + VN).
+    model_option_sels = [
+        f"[role='menuitem']:has-text('{model_name}')",
+        f"[role='option']:has-text('{model_name}')",
+    ]
+    duration_sels = [
+        f"[role='radio']:text-is('{clip_sec}s')",
+        f"[role='radio']:has-text('{clip_sec}s')",
+        f"[role='radio']:has-text('{clip_sec} giây')",
+    ]
+
     if not _click(page, sels["settings_trigger"], 8000):
         _dump_buttons(page, "settings-trigger")
         raise RuntimeError("Không mở được Settings của Flow.")
     page.wait_for_timeout(600)
-    def ensure_radio(key: str, label: str, summary_token: str = "") -> None:
-        loc = query_first(page, sels[key], 2500)
+    def ensure_radio(sel_list, label: str, summary_token: str = "") -> None:
+        loc = query_first(page, sel_list, 2500)
         if loc is not None:
             try:
                 if loc.get_attribute("aria-checked") == "true":
@@ -163,11 +178,11 @@ def _configure_settings(page, sels) -> None:
                     return
             except Exception:
                 pass
-        _dump_buttons(page, f"setting-{key}")
+        _dump_buttons(page, f"setting-{label}")
         raise RuntimeError(f"Không chọn được {label}.")
 
-    ensure_radio("mode_ingredients", "mode Ingredients/Thành phần")
-    ensure_radio("aspect_option_169", "tỉ lệ 16:9")
+    ensure_radio(sels["mode_ingredients"], "mode Ingredients/Thành phần")
+    ensure_radio(sels["aspect_option_169"], "tỉ lệ 16:9")
 
     model = query_first(page, sels["model_selector"], 5000)
     if model is None:
@@ -176,17 +191,18 @@ def _configure_settings(page, sels) -> None:
         current_model = model.inner_text()
     except Exception:
         current_model = ""
-    if "Veo 3.1 - Fast" not in current_model:
+    if model_name not in current_model:
         model.click()
         page.wait_for_timeout(500)
-        if not _click(page, sels["model_option_veo31_fast"], 6000):
-            raise RuntimeError("Không chọn được Veo 3.1 - Fast.")
+        if not _click(page, model_option_sels, 6000):
+            _dump_buttons(page, "model-option")
+            raise RuntimeError(f"Không chọn được model {model_name}.")
         page.wait_for_timeout(500)
     else:
-        _log("    model Veo 3.1 - Fast: đã chọn sẵn")
+        _log(f"    model {model_name}: đã chọn sẵn")
 
-    ensure_radio("duration_8s", "thời lượng 8s", "8s")
-    ensure_radio("outputs_x1", "số lượng x1", "x1")
+    ensure_radio(duration_sels, f"thời lượng {clip_sec}s", f"{clip_sec}s")
+    ensure_radio(sels["outputs_x1"], "số lượng x1", "x1")
     # Đóng bảng cài đặt
     try:
         page.keyboard.press("Escape")
@@ -218,6 +234,60 @@ def _clear_ingredients(page, sels) -> None:
             break
 
 
+def _match_index(text: str, index: int) -> bool:
+    """True nếu text option ứng ĐÚNG {index}.png. Chặn nhầm: tìm '0' không được
+    khớp '10.png'/'20.png' (số phải không có chữ số đứng ngay trước)."""
+    return re.search(rf"(?<!\d){index}\.png", text or "") is not None
+
+
+def _find_ready_option(page, index: int):
+    """Tìm option ảnh '{index}.png' ĐÃ upload xong trong picker (bỏ trạng thái
+    'Uploading'/'Đang tải'). Trả (locator|None, text_gần_nhất)."""
+    last = ""
+    try:
+        opts = page.locator("[role='option']").filter(has_text=f"{index}.png")
+        n = opts.count()
+    except Exception:
+        return None, last
+    for k in range(n):
+        o = opts.nth(k)
+        try:
+            txt = (o.inner_text() or "").strip()
+        except Exception:
+            continue
+        if not _match_index(txt, index):
+            continue          # ví dụ đang tìm 0 nhưng đây là 10.png
+        if re.search(r"uploading|đang tải", txt, re.IGNORECASE):
+            last = txt         # đúng ảnh nhưng còn đang upload → chờ tiếp
+            continue
+        return o, txt
+    return None, last
+
+
+def _wait_ready_option(page, index: int, timeout_ms: int = 90000):
+    """Chờ tới khi ảnh '{index}.png' upload xong & hiện trong picker. Kéo danh
+    sách để nạp thêm option nếu Flow lazy-render. Trả locator hoặc None."""
+    deadline = time.time() + timeout_ms / 1000.0
+    last = ""
+    while time.time() < deadline:
+        loc, txt = _find_ready_option(page, index)
+        if loc is not None:
+            return loc
+        last = txt or last
+        try:                               # nạp thêm option (lazy-render)
+            opts = page.locator("[role='option']")
+            c = opts.count()
+            if c:
+                opts.nth(c - 1).scroll_into_view_if_needed(timeout=1000)
+        except Exception:
+            pass
+        page.wait_for_timeout(1000)
+    if last:
+        _log(f"    ảnh {index}.png hết {timeout_ms//1000}s vẫn ở trạng thái "
+             f"'{last}'")
+    return None
+
+
 def _add_ingredient(page, sels, index: int) -> None:
     """
     Mode Thành phần: bấm '+' thêm thành phần → chọn ảnh '{index}.png' →
@@ -230,20 +300,22 @@ def _add_ingredient(page, sels, index: int) -> None:
     page.wait_for_timeout(1000)
 
     name = f"{index}.png"
-    clicked = False
-    for sel in (f"[role='option']:has-text('{name}')",
-                f"button:has-text('{name}')"):
-        try:
-            loc = page.locator(sel).first
-            if loc.count() > 0:
-                loc.click()
-                clicked = True
-                break
-        except Exception:
-            continue
-    if not clicked:
+    # Chờ đúng ảnh upload xong: sau khi upload 20 ảnh, picker cần thời gian
+    # index hóa; ảnh còn 'Uploading' hoặc chưa hiện sẽ khiến chọn thất bại.
+    opt = _wait_ready_option(page, index, timeout_ms=90000)
+    if opt is None:
         _dump_frame_dialog(page, f"ingredient-{index}")
-        raise RuntimeError(f"Không chọn được ảnh {name} khi thêm thành phần.")
+        raise RuntimeError(
+            f"Không chọn được ảnh {name} khi thêm thành phần "
+            f"(ảnh chưa upload xong / chưa hiện trong picker sau 90s).")
+    try:
+        opt.click()
+    except Exception:
+        try:
+            opt.scroll_into_view_if_needed(timeout=1500)
+        except Exception:
+            pass
+        opt.click()
     page.wait_for_timeout(500)
     # Tùy phiên bản Flow, chọn option có thể tự thêm và đóng picker; phiên bản
     # khác vẫn hiện nút Add to prompt/Thêm vào câu lệnh.
@@ -319,16 +391,14 @@ def _select_frame(page, sels, which: str, index: int) -> None:
 
     name = f"{index}.png"
     clicked = False
-    for sel in (f"[role='option']:has-text('{name}')",
-                f"button:has-text('{name}')"):
+    # Khớp ĐÚNG index (0 không nhầm 10.png) & chờ ảnh sẵn sàng.
+    opt = _wait_ready_option(page, index, timeout_ms=45000)
+    if opt is not None:
         try:
-            loc = page.locator(sel).first
-            if loc.count() > 0:
-                loc.click()
-                clicked = True
-                break
+            opt.click()
+            clicked = True
         except Exception:
-            continue
+            clicked = False
     if not clicked:
         # Dự phòng: tìm rồi chọn kết quả đầu tiên
         fill_first(page, sels["frame_search"], str(index), timeout_ms=4000)
@@ -377,6 +447,34 @@ def _clip_play_count(page) -> int:
         return 0
 
 
+# Số lần bấm Retry tối đa khi Veo báo lỗi tạo clip (thất bại/tạm chặn).
+_CLIP_MAX_RETRIES = 3
+# Số lần tạo LẠI TOÀN BỘ 1 clip (làm mới nguyên liệu + bấm tạo lại) khi Veo
+# không ra clip động. BẮT BUỘC mỗi clip là video động thật từ ĐÚNG ảnh của nó —
+# tuyệt đối KHÔNG thay bằng ảnh tĩnh hay clip của ảnh khác. Hết số lần này mà vẫn
+# lỗi → coi là LỖI, dừng (không ghép video sai); resume sẽ tạo lại đúng clip đó.
+_CLIP_FULL_ATTEMPTS = 3
+
+
+def _find_retry_button(page):
+    """Trả về locator nút 'Retry/Thử lại' khi Veo tạo clip THẤT BẠI (tile hiện
+    trạng thái lỗi: refresh/Retry + Reuse prompt + Delete). None nếu không có."""
+    for sel in (
+        "button[aria-label='Retry']",
+        "button[aria-label='Thử lại']",
+        "button[aria-label='Try again']",
+        "button:has-text('Retry')",
+        "button:has-text('Thử lại')",
+    ):
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0 and loc.first.is_visible():
+                return loc.first
+        except Exception:
+            continue
+    return None
+
+
 def _wait_and_download_clip(page, sels, dest: Path, wait_sec: int,
                             prev_count: int) -> bool:
     """
@@ -395,9 +493,14 @@ def _wait_and_download_clip(page, sels, dest: Path, wait_sec: int,
 
     # Chỉ chấp nhận khi số clip xong > prev_count ỔN ĐỊNH (2 lần liên tiếp,
     # cách nhau ~4s) → tránh mọi nhấp nháy tạm thời.
+    # ⚠️ Khi Veo tạo THẤT BẠI (lỗi/tạm chặn) → tile hiện nút 'Retry' và số clip
+    #    xong KHÔNG bao giờ tăng. Trước đây ta chờ đủ wait_sec (900s) vô ích rồi
+    #    huỷ cả pipeline. Giờ: phát hiện nút Retry SỚM → bấm Retry, gia hạn thời
+    #    gian, thử lại tối đa _CLIP_MAX_RETRIES lần.
     found = False
     streak = 0
     last_log = 0.0
+    retries = 0
     while time.time() < deadline:
         cnt = _clip_play_count(page)
         if cnt > prev_count:
@@ -409,13 +512,33 @@ def _wait_and_download_clip(page, sels, dest: Path, wait_sec: int,
                 break
         else:
             streak = 0
+            # Veo báo lỗi? → bấm Retry để tạo lại thay vì chờ hết giờ.
+            if retries < _CLIP_MAX_RETRIES:
+                retry_btn = _find_retry_button(page)
+                if retry_btn is not None:
+                    retries += 1
+                    _log(f"    ⚠ Veo báo LỖI tạo clip (hiện nút Retry) — bấm "
+                         f"Retry tạo lại (lần {retries}/{_CLIP_MAX_RETRIES})")
+                    try:
+                        retry_btn.click()
+                    except Exception as e:
+                        _log(f"    (không bấm được Retry: {e})")
+                        _dump_buttons(page, "retry-fail")
+                        break
+                    # Bỏ qua ~12s nhấp nháy đầu của lần render lại + gia hạn giờ.
+                    page.wait_for_timeout(12000)
+                    deadline = time.time() + wait_sec
+                    t0 = time.time()
+                    last_log = 0.0
+                    continue
         if time.time() - last_log > 30:
             last_log = time.time()
             _log(f"    ... đang render ({time.time()-t0:.0f}s, clip xong={cnt})")
         page.wait_for_timeout(4000)
     if not found:
         _log(f"    ✗ HẾT {wait_sec}s chưa thấy clip xong (clip xong hiện = "
-             f"{_clip_play_count(page)}). Có thể Veo còn render hoặc bị chặn.")
+             f"{_clip_play_count(page)}, đã Retry {retries} lần). "
+             f"Có thể Veo còn render hoặc bị chặn.")
         _dump_buttons(page, "wait-timeout")
         return False
     page.wait_for_timeout(1500)   # để tile ổn định
@@ -561,12 +684,27 @@ def _clip_done(out_dir, idx: int) -> bool:
         return False
 
 
+def _load_motions(img_dir) -> dict[str, str]:
+    """Đọc prompt chuyển động AI theo từng ảnh từ images/prompts.json (do
+    prompt_gen sinh). Trả {} nếu không có/không hợp lệ (→ dùng mặc định)."""
+    try:
+        raw = json.loads((img_dir / "prompts.json").read_text(encoding="utf-8"))
+        motions = raw.get("motions")
+        if isinstance(motions, dict):
+            return {str(k): v.strip() for k, v in motions.items()
+                    if isinstance(v, str) and v.strip()}
+    except Exception:
+        pass
+    return {}
+
+
 def generate_clips(
     project_id: int,
     params: Optional[config.VideoParams] = None,
     progress_cb: Optional[Callable[[str, float], None]] = None,
     resume: bool = False,
     project_name: str | None = None,
+    style: str | None = None,
 ) -> list[str]:
     """
     Tạo clip (chế độ THÀNH PHẦN). Trả về danh sách path clip.
@@ -614,6 +752,33 @@ def generate_clips(
         plan = config.generate_ingredient_plan(
             params.image_count, params.image_count - 1)
 
+    # Clip DỰ PHÒNG tĩnh (Veo lỗi) được ĐÁNH DẤU để resume TẠO LẠI bằng Veo —
+    # nếu không, file .mp4 tĩnh trông y hệt clip thật nên resume sẽ bỏ qua và ảnh
+    # tĩnh "dính" mãi trong video. Đọc lại tập fallback đã lưu ở lần chạy trước.
+    fallback_idx: set[int] = set()
+    if resume and plan_file.exists():
+        try:
+            raw = json.loads(plan_file.read_text(encoding="utf-8"))
+            fb = raw.get("fallback") if isinstance(raw, dict) else None
+            if isinstance(fb, list):
+                fallback_idx = {int(x) for x in fb}
+        except Exception:
+            fallback_idx = set()
+
+    def _is_done(k: int) -> bool:
+        """RESUME coi clip k là XONG khi có file hợp lệ VÀ không phải clip tĩnh
+        dự phòng (clip tĩnh cần Veo tạo lại thành video thật)."""
+        return _clip_done(out_dir, k) and k not in fallback_idx
+
+    def _save_plan() -> None:
+        try:
+            plan_file.write_text(json.dumps(
+                {"plan": plan, "clips": plan_map,
+                 "fallback": sorted(fallback_idx)}, ensure_ascii=False),
+                encoding="utf-8")
+        except Exception:
+            pass
+
     if not resume:
         # RESTART: xoá clip cũ + kế hoạch + log
         for old in out_dir.glob("clip_*.mp4"):
@@ -638,43 +803,61 @@ def generate_clips(
     # Lưu kế hoạch đầy đủ ngay để resume lần sau dùng lại đúng plan.
     plan_map: dict[str, int] = {f"clip_{k:02d}.mp4": im
                                 for k, im in enumerate(plan)
-                                if _clip_done(out_dir, k)}
-    try:
-        plan_file.write_text(json.dumps(
-            {"plan": plan, "clips": plan_map}, ensure_ascii=False),
-            encoding="utf-8")
-    except Exception:
-        pass
+                                if _is_done(k)}
+    _save_plan()
 
     # Resume mà đã đủ clip → khỏi mở trình duyệt.
-    if resume and all(_clip_done(out_dir, k) for k in range(total)):
+    if resume and all(_is_done(k) for k in range(total)):
         _log("Đã đủ clip — bỏ qua (resume)")
         _p("Đã đủ clip (resume)", 100.0)
         return [str(out_dir / f"clip_{k:02d}.mp4") for k in range(total)]
     # Prompt chuyển động: nhẹ nhàng, chậm, mượt (video sẽ còn được làm chậm 0.7x
     # và blend khi ghép). Xoay vòng vài biến thể cho đa dạng.
-    base_motion = (config.load_overrides().get("flow_motion_prompt")
-                   or config.FLOW_MOTION_PROMPT)
-    motion_variants = [
-        base_motion,
-        base_motion + ", lia máy sang phải rất chậm",
-        base_motion + ", đẩy máy tiến vào từ từ (push-in)",
-        base_motion + ", nâng máy lên nhẹ (tilt-up)",
-        base_motion + ", lia máy sang trái rất chậm",
+    plain_base = (config.load_overrides().get("flow_motion_prompt")
+                  or config.FLOW_MOTION_PROMPT)
+    # Phong cách (2D/3D) sẽ được gắn lên ĐẦU MỌI prompt chuyển động để Veo giữ
+    # đúng nét hoạt hình của ảnh nguồn, không "làm thật hoá" khi tạo chuyển động.
+    style_motion = config.style_info(style).get("motion")
+
+    motion_negative = getattr(config, "MOTION_NEGATIVE", "") or ""
+
+    def _style_wrap(m: str) -> str:
+        m = (m or "").strip()
+        if style_motion and not m.lower().startswith(style_motion.lower()):
+            m = f"{style_motion}, {m}" if m else style_motion
+        # Gắn phủ định CỨNG vào CUỐI mọi prompt (chặn khói/đầu-ngược/méo tay…).
+        if m and motion_negative and motion_negative.strip() not in m:
+            m = f"{m}{motion_negative}"
+        return m
+
+    # Prompt chuyển động RIÊNG cho từng ảnh do AI sinh (bám sát nội dung ảnh, hợp
+    # logic). Đọc từ images/prompts.json (key = chỉ số ảnh). Thiếu → mặc định.
+    ai_motions = _load_motions(img_dir)
+    if ai_motions:
+        _log(f"dùng {len(ai_motions)} prompt chuyển động AI theo từng ảnh")
+    # Biến thể camera mặc định (dự phòng khi ảnh không có motion AI).
+    fallback_variants = [
+        plain_base,
+        plain_base + ", lia máy sang phải rất chậm",
+        plain_base + ", đẩy máy tiến vào từ từ (push-in)",
+        plain_base + ", nâng máy lên nhẹ (tilt-up)",
+        plain_base + ", lia máy sang trái rất chậm",
     ]
     # Một project Flow có thể chỉ hiện khoảng 15 media đầu và tự đổi tên phần
     # vượt giới hạn. Khi Resume, chỉ upload ảnh thực sự cần cho clip còn thiếu.
     # Nhờ đó nâng 15 -> 20 vẫn tạo tiếp 5 clip mà không upload lại 20 ảnh.
     todo_images = sorted({
         img for clip_idx, img in enumerate(plan)
-        if not (resume and _clip_done(out_dir, clip_idx))
+        if not (resume and _is_done(clip_idx))
     })
     img_paths = [str(img_dir / f"{i}.png") for i in todo_images]
 
     _log(f"kế hoạch nguyên liệu ({total}): {plan}")
     if resume:
-        done_idx = [k for k in range(total) if _clip_done(out_dir, k)]
-        _log(f"resume: đã có {len(done_idx)} clip {done_idx}, tạo tiếp phần thiếu")
+        done_idx = [k for k in range(total) if _is_done(k)]
+        _log(f"resume: đã có {len(done_idx)} clip {done_idx}, tạo tiếp phần thiếu"
+             + (f" (gồm {len(fallback_idx)} clip tĩnh cần làm lại: "
+                f"{sorted(fallback_idx)})" if fallback_idx else ""))
     saved: list[str] = []
     with BrowserSession() as sess:
         page = sess.new_page()
@@ -693,8 +876,10 @@ def generate_clips(
             raise RuntimeError("Không bấm được New project/Dự án mới.")
         page.wait_for_timeout(2500)
 
-        _p("Cài đặt Thành phần · 16:9 · Veo 3.1 Fast · 8s · x1...", 6.0)
-        _log("cài đặt Thành phần/16:9/Veo3.1Fast/8s/x1")
+        _p(f"Cài đặt Thành phần · {params.aspect_ratio} · "
+           f"{params.flow_model} · {params.clip_seconds}s · x1...", 6.0)
+        _log(f"cài đặt Thành phần/{params.aspect_ratio}/"
+             f"{params.flow_model}/{params.clip_seconds}s/x1")
         _configure_settings(page, sels)
 
         _p("Upload ảnh vào Flow...", 8.0)
@@ -702,52 +887,91 @@ def generate_clips(
         _upload_images(page, sels, img_paths, progress_cb)
         _log("upload ảnh xong")
 
+        failed_idx: list[tuple[int, str]] = []  # (clip_idx, img) Veo KHÔNG ra clip động
         for clip_idx, img in enumerate(plan):
             pct = 10.0 + (clip_idx / max(total, 1)) * 88.0
             dest = out_dir / f"clip_{clip_idx:02d}.mp4"
-            # RESUME: clip đã có sẵn → bỏ qua, không tạo lại.
-            if resume and _clip_done(out_dir, clip_idx):
+            # RESUME: clip đã có sẵn (là clip Veo thật) → bỏ qua.
+            if resume and _is_done(clip_idx):
                 _log(f"--- CLIP {clip_idx+1}/{total} (ảnh {img}) — ĐÃ CÓ, bỏ qua")
                 saved.append(str(dest))
                 plan_map[f"clip_{clip_idx:02d}.mp4"] = img
                 continue
             _log(f"--- CLIP {clip_idx+1}/{total}  (ảnh {img}) ---")
-            _p(f"[{clip_idx+1}/{total}] Clip từ ảnh {img}: thêm nguyên liệu...",
-               pct)
-            # Đảm bảo không còn menu/overlay & xoá nguyên liệu vòng trước
-            try:
-                page.keyboard.press("Escape")
-                page.wait_for_timeout(300)
-            except Exception:
-                pass
-            _clear_ingredients(page, sels)
-            _add_ingredient(page, sels, img)
-            motion = motion_variants[clip_idx % len(motion_variants)]
-            if motion:
-                fill_first(page, sels["prompt_box"], motion, 5000)
-            prev_count = _clip_play_count(page)   # số clip xong trước khi tạo
-            _log(f"    bấm tạo (clip xong hiện tại={prev_count})")
-            _p(f"[{clip_idx+1}/{total}] Đang tạo clip từ ảnh {img}...", pct)
-            if not _click(page, sels["generate_button"], 8000):
-                _dump_buttons(page, "no-generate")
-                raise RuntimeError("Không bấm được 'Bắt đầu tạo' (generate_button).")
-            dest = out_dir / f"clip_{clip_idx:02d}.mp4"
-            if not _wait_and_download_clip(
-                    page, sels, dest, config.BROWSER.clip_wait_sec, prev_count):
-                raise RuntimeError(
-                    f"Clip {clip_idx} (ảnh {img}): không tạo/tải được trong "
-                    f"{config.BROWSER.clip_wait_sec}s.")
+
+            # BẮT BUỘC ra clip ĐỘNG thật từ ĐÚNG ảnh này. Tạo lại TOÀN BỘ tối đa
+            # _CLIP_FULL_ATTEMPTS lần (mỗi lần làm mới nguyên liệu + bấm tạo, bên
+            # trong còn tự bấm Retry). KHÔNG thay bằng ảnh tĩnh/clip khác.
+            success = False
+            for attempt in range(1, _CLIP_FULL_ATTEMPTS + 1):
+                tag = f"(lần {attempt}/{_CLIP_FULL_ATTEMPTS})"
+                _p(f"[{clip_idx+1}/{total}] Clip từ ảnh {img}: thêm nguyên liệu "
+                   f"{tag}...", pct)
+                # Đảm bảo không còn menu/overlay & xoá nguyên liệu vòng trước
+                try:
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(300)
+                except Exception:
+                    pass
+                _clear_ingredients(page, sels)
+                _add_ingredient(page, sels, img)
+                # Ưu tiên motion AI riêng cho ảnh này; thiếu → biến thể mặc định.
+                raw_motion = (ai_motions.get(str(img))
+                              or fallback_variants[clip_idx % len(fallback_variants)])
+                motion = _style_wrap(raw_motion)
+                if motion:
+                    _log(f"    motion ảnh {img} {tag}: {motion[:90]}"
+                         + ("…" if len(motion) > 90 else ""))
+                    fill_first(page, sels["prompt_box"], motion, 5000)
+                prev_count = _clip_play_count(page)   # số clip xong trước khi tạo
+                _log(f"    bấm tạo {tag} (clip xong hiện tại={prev_count})")
+                _p(f"[{clip_idx+1}/{total}] Đang tạo clip từ ảnh {img} {tag}...", pct)
+                if not _click(page, sels["generate_button"], 8000):
+                    _dump_buttons(page, "no-generate")
+                    raise RuntimeError("Không bấm được 'Bắt đầu tạo' (generate_button).")
+                if _wait_and_download_clip(
+                        page, sels, dest, config.BROWSER.clip_wait_sec, prev_count):
+                    success = True
+                    break
+                _log(f"    ⚠ clip {clip_idx} (ảnh {img}) chưa ra clip động {tag}"
+                     + (" — thử tạo lại toàn bộ…" if attempt < _CLIP_FULL_ATTEMPTS
+                        else " — HẾT lượt."))
+
+            if not success:
+                # KHÔNG thay thế bằng bất cứ thứ gì (ảnh tĩnh / clip ảnh khác đều
+                # sai yêu cầu). Đánh dấu lỗi → cuối vòng DỪNG để không ghép video
+                # sai; resume sẽ tạo lại đúng clip này. Xoá file rác nếu có.
+                _log(f"    ✗ Veo KHÔNG tạo được clip động cho clip {clip_idx} "
+                     f"(ảnh {img}) sau {_CLIP_FULL_ATTEMPTS} lần tạo lại.")
+                try:
+                    if dest.exists():
+                        dest.unlink()
+                except OSError:
+                    pass
+                failed_idx.append((clip_idx, img))
+                fallback_idx.add(clip_idx)   # đánh dấu → resume Veo làm lại
+                _save_plan()
+                continue
             _log(f"    ✓ ĐÃ LƯU {dest.name} "
                  f"({dest.stat().st_size//1024} KB)")
             saved.append(str(dest))
             plan_map[f"clip_{clip_idx:02d}.mp4"] = img
-            # Lưu kế hoạch + mapping sau mỗi clip (giữ 'plan' để resume dùng lại)
-            try:
-                plan_file.write_text(json.dumps(
-                    {"plan": plan, "clips": plan_map}, ensure_ascii=False),
-                    encoding="utf-8")
-            except Exception:
-                pass
+            fallback_idx.discard(clip_idx)   # đã là clip Veo thật → hết fallback
+            _save_plan()                     # giữ 'plan'+'fallback' để resume
+
+    # BẮT BUỘC mỗi clip là video động thật từ đúng ảnh của nó. Nếu còn clip Veo
+    # KHÔNG tạo được → coi là LỖI: DỪNG, KHÔNG ghép video (tránh video sai/thiếu
+    # chuyển động). Các clip lỗi đã đánh dấu fallback nên bấm TẠO LẠI (resume) sẽ
+    # chỉ tạo lại đúng những clip này, giữ nguyên các clip đã xong.
+    if failed_idx:
+        fb = [f"clip_{k:02d}(ảnh {im})" for k, im in failed_idx]
+        msg = (f"Veo KHÔNG tạo được {len(failed_idx)} clip động (mỗi clip đã thử "
+               f"tạo lại {_CLIP_FULL_ATTEMPTS} lần): {', '.join(fb)}. ĐÃ DỪNG, "
+               f"không ghép video với clip thay thế. Hãy bấm TẠO LẠI (resume) để "
+               f"tạo lại đúng các clip này (các clip khác giữ nguyên).")
+        _log("✗ " + msg)
+        _p("✗ " + msg, 99.0)
+        raise RuntimeError(msg)
 
     _p("Xong tạo clip", 100.0)
     return saved
