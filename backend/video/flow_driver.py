@@ -705,12 +705,16 @@ def generate_clips(
     resume: bool = False,
     project_name: str | None = None,
     style: str | None = None,
+    only: Optional[list[int]] = None,
 ) -> list[str]:
     """
     Tạo clip (chế độ THÀNH PHẦN). Trả về danh sách path clip.
     resume=True: GIỮ clip đã tải, dùng lại kế hoạch cũ (_plan.json) và chỉ tạo
     tiếp clip còn thiếu. Nếu đã đủ → không mở trình duyệt.
     restart (mặc định): XOÁ clip cũ + kế hoạch cũ, làm lại từ đầu.
+    only=[k,...]: CHỈ tạo lại đúng các clip theo chỉ số (clip_XX), GIỮ NGUYÊN
+    mọi clip khác. BẮT BUỘC có _plan.json hợp lệ (để biết clip k dùng ảnh nào,
+    giữ ánh xạ 1:1 mỗi ảnh xuất hiện đúng 1 lần) — nếu không có sẽ báo lỗi.
     """
     global _LOGP
     params = params or config.PARAMS
@@ -720,6 +724,14 @@ def generate_clips(
     out_dir.mkdir(parents=True, exist_ok=True)
     plan_file = out_dir / "_plan.json"
 
+    # only-mode: tạo lại clip lẻ → coi như resume (giữ clip khác + kế hoạch cũ),
+    # nhưng ÉP tạo lại đúng những clip trong danh sách.
+    only_set: set[int] = set()
+    if only is not None:
+        only_set = {int(k) for k in only if 0 <= int(k) < params.image_count}
+    single_mode = bool(only_set)
+    resume_eff = resume or single_mode
+
     for i in range(params.image_count):
         if not (img_dir / f"{i}.png").exists():
             raise FileNotFoundError(
@@ -727,7 +739,7 @@ def generate_clips(
 
     # Kế hoạch 1:1 bắt buộc: N ảnh khác nhau → N clip; clip 0 dùng ảnh 0.
     plan: list[int] = []
-    if resume and plan_file.exists():
+    if resume_eff and plan_file.exists():
         try:
             raw = json.loads(plan_file.read_text(encoding="utf-8"))
             if isinstance(raw, dict) and isinstance(raw.get("plan"), list):
@@ -736,6 +748,13 @@ def generate_clips(
             plan = []
     valid_plan = (len(plan) == params.image_count and plan[:1] == [0]
                   and set(plan) == set(range(params.image_count)))
+    # only-mode PHẢI có plan hợp lệ đã lưu — nếu không, không biết clip k dùng ảnh
+    # nào; tạo lại với plan random sẽ phá ánh xạ 1:1 (ảnh trùng/thiếu). Báo lỗi rõ.
+    if single_mode and not valid_plan:
+        raise RuntimeError(
+            "Chưa có kế hoạch clip hợp lệ (_plan.json) để tạo lại clip lẻ. "
+            "Hãy bấm 'Làm lại từ đầu' ở phần Clip một lần để tạo kế hoạch, "
+            "rồi mới tạo lại từng clip.")
     # Cho phép mở rộng pipeline (ví dụ 15 -> 20) mà vẫn giữ clip cũ. Với ánh
     # xạ 1:1 chuẩn, clip_k luôn dùng ảnh k; chỉ tạo tiếp các index còn thiếu.
     old_plan_can_extend = (
@@ -744,7 +763,7 @@ def generate_clips(
         and set(plan).issubset(set(range(params.image_count)))
         and all(_clip_done(out_dir, k) for k in range(len(plan)))
     )
-    if resume and not valid_plan and old_plan_can_extend:
+    if resume_eff and not valid_plan and old_plan_can_extend:
         # Giữ nguyên mapping clip cũ; nối thêm đúng những ảnh chưa từng dùng.
         plan = [*plan, *(i for i in range(params.image_count) if i not in plan)]
         valid_plan = True
@@ -756,7 +775,7 @@ def generate_clips(
     # nếu không, file .mp4 tĩnh trông y hệt clip thật nên resume sẽ bỏ qua và ảnh
     # tĩnh "dính" mãi trong video. Đọc lại tập fallback đã lưu ở lần chạy trước.
     fallback_idx: set[int] = set()
-    if resume and plan_file.exists():
+    if resume_eff and plan_file.exists():
         try:
             raw = json.loads(plan_file.read_text(encoding="utf-8"))
             fb = raw.get("fallback") if isinstance(raw, dict) else None
@@ -767,7 +786,10 @@ def generate_clips(
 
     def _is_done(k: int) -> bool:
         """RESUME coi clip k là XONG khi có file hợp lệ VÀ không phải clip tĩnh
-        dự phòng (clip tĩnh cần Veo tạo lại thành video thật)."""
+        dự phòng (clip tĩnh cần Veo tạo lại thành video thật). only-mode: clip
+        được chọn luôn coi là CHƯA xong để ép tạo lại (ghi đè)."""
+        if k in only_set:
+            return False
         return _clip_done(out_dir, k) and k not in fallback_idx
 
     def _save_plan() -> None:
@@ -779,7 +801,7 @@ def generate_clips(
         except Exception:
             pass
 
-    if not resume:
+    if not resume_eff:
         # RESTART: xoá clip cũ + kế hoạch + log
         for old in out_dir.glob("clip_*.mp4"):
             try:
@@ -792,8 +814,9 @@ def generate_clips(
         _LOGP.write_text("", encoding="utf-8")
     except Exception:
         pass
-    _log(f"=== BẮT ĐẦU tạo clip project {project_id} "
-         f"({'RESUME' if resume else 'RESTART'}) ===")
+    _mode_label = (f"ONLY {sorted(only_set)}" if single_mode
+                   else "RESUME" if resume else "RESTART")
+    _log(f"=== BẮT ĐẦU tạo clip project {project_id} ({_mode_label}) ===")
 
     def _p(msg, pct):
         if progress_cb:
@@ -807,7 +830,7 @@ def generate_clips(
     _save_plan()
 
     # Resume mà đã đủ clip → khỏi mở trình duyệt.
-    if resume and all(_is_done(k) for k in range(total)):
+    if resume_eff and all(_is_done(k) for k in range(total)):
         _log("Đã đủ clip — bỏ qua (resume)")
         _p("Đã đủ clip (resume)", 100.0)
         return [str(out_dir / f"clip_{k:02d}.mp4") for k in range(total)]
@@ -848,12 +871,12 @@ def generate_clips(
     # Nhờ đó nâng 15 -> 20 vẫn tạo tiếp 5 clip mà không upload lại 20 ảnh.
     todo_images = sorted({
         img for clip_idx, img in enumerate(plan)
-        if not (resume and _is_done(clip_idx))
+        if not (resume_eff and _is_done(clip_idx))
     })
     img_paths = [str(img_dir / f"{i}.png") for i in todo_images]
 
     _log(f"kế hoạch nguyên liệu ({total}): {plan}")
-    if resume:
+    if resume_eff:
         done_idx = [k for k in range(total) if _is_done(k)]
         _log(f"resume: đã có {len(done_idx)} clip {done_idx}, tạo tiếp phần thiếu"
              + (f" (gồm {len(fallback_idx)} clip tĩnh cần làm lại: "
@@ -892,11 +915,13 @@ def generate_clips(
             pct = 10.0 + (clip_idx / max(total, 1)) * 88.0
             dest = out_dir / f"clip_{clip_idx:02d}.mp4"
             # RESUME: clip đã có sẵn (là clip Veo thật) → bỏ qua.
-            if resume and _is_done(clip_idx):
+            if resume_eff and _is_done(clip_idx):
                 _log(f"--- CLIP {clip_idx+1}/{total} (ảnh {img}) — ĐÃ CÓ, bỏ qua")
                 saved.append(str(dest))
                 plan_map[f"clip_{clip_idx:02d}.mp4"] = img
                 continue
+            # TUẦN TỰ: clip trước đã render + tải xong (_wait_and_download_clip
+            # chặn đồng bộ) mới sang clip này — KHÔNG nghỉ thêm giữa các clip.
             _log(f"--- CLIP {clip_idx+1}/{total}  (ảnh {img}) ---")
 
             # BẮT BUỘC ra clip ĐỘNG thật từ ĐÚNG ảnh này. Tạo lại TOÀN BỘ tối đa

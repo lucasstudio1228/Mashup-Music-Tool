@@ -130,6 +130,26 @@ def _select_model(page, sels) -> None:
         page.wait_for_timeout(800)
 
 
+def _start_new_chat(page) -> None:
+    """Bắt đầu cuộc trò chuyện MỚI để CẮT ngữ cảnh dài. Hội thoại quá dài (vd
+    ảnh 37/41 trong cùng 1 chat) khiến Gemini hay trả CHỮ / từ chối / chậm →
+    time-out. Mỗi prompt đã tự chứa khối danh tính nhân vật nên KHÔNG cần giữ
+    mạch chat. Ưu tiên bấm nút 'Trò chuyện mới'; không có → reload thẳng
+    GEMINI_URL (URL /app luôn mở chat trống)."""
+    sels = config.get_selectors("gemini")
+    clicked = False
+    try:
+        clicked = click_first(page, sels.get("new_chat", []), timeout_ms=3000)
+    except Exception:
+        clicked = False
+    if not clicked:
+        try:
+            page.goto(config.GEMINI_URL, wait_until="domcontentloaded")
+        except Exception:
+            pass
+    page.wait_for_timeout(1500)
+
+
 def _wait_new_image(page, seen: set[str], timeout_sec: int) -> Optional[str]:
     """Chờ 1 ảnh THẬT mới (đủ lớn, chưa có) và đã load ổn định. Trả về src."""
     deadline = time.time() + timeout_sec
@@ -269,11 +289,14 @@ def generate_images(
     project_name: str | None = None,
     prompts_override: Optional[dict] = None,
     style: Optional[str] = None,
+    only: Optional[list[int]] = None,
 ) -> list[str]:
     """
     Trả về danh sách đường dẫn ảnh đã tạo (0..n) qua Gemini web.
     resume=True: BỎ QUA ảnh đã có (chỉ tạo ảnh còn thiếu). Nếu đã đủ → không
     mở trình duyệt.
+    only=[i,...]: CHỈ tạo lại đúng các ảnh trong danh sách (ghi đè), GIỮ NGUYÊN
+    mọi ảnh khác — dùng cho nút "Tạo lại 1 ảnh" lẻ.
     Ảnh 0 giữ SẠCH (không chữ): tiêu đề được overlay ở bước ghép video
     (service.step_assemble) lên clip intro + thumbnail.png bằng font thật, tránh
     chữ nướng sẵn bị Veo tạo lại thành bóng ma / chồng chéo.
@@ -288,10 +311,17 @@ def generate_images(
             progress_cb(msg, pct)
 
     n = params.image_count
+    only_set = None
+    if only is not None:
+        only_set = sorted({int(i) for i in only if 0 <= int(i) < n})
+        if not only_set:
+            _p("Không có ảnh hợp lệ để tạo lại.", 100.0)
+            return [str(out_dir / f"{i}.png") for i in range(n) if _has_image(out_dir, i)]
     # RESTART: XOÁ hết ảnh cũ trước khi tạo, để KHÔNG bao giờ trộn ảnh mới với
     # ảnh cũ/của lần render trước. Nếu run mới bị dở dang thì bước clip sẽ báo
     # "thiếu ảnh" rõ ràng thay vì âm thầm dùng ảnh cũ để ghép.
-    if not resume:
+    # only-mode KHÔNG xoá gì (chỉ ghi đè đúng ảnh được chọn).
+    if not resume and only_set is None:
         removed = 0
         for old in out_dir.glob("*.png"):
             try:
@@ -301,12 +331,16 @@ def generate_images(
                 pass
         if removed:
             _p(f"Xoá {removed} ảnh cũ (restart)", 1.0)
-    todo = [i for i in range(n) if not (resume and _has_image(out_dir, i))]
-    if resume and not todo:
-        _p("Đã đủ ảnh — bỏ qua (resume)", 100.0)
-        return [str(out_dir / f"{i}.png") for i in range(n) if _has_image(out_dir, i)]
-    if resume:
-        _p(f"Resume: còn thiếu ảnh {todo}", 1.0)
+    if only_set is not None:
+        todo = only_set
+        _p(f"Tạo lại ảnh cụ thể: {todo}", 1.0)
+    else:
+        todo = [i for i in range(n) if not (resume and _has_image(out_dir, i))]
+        if resume and not todo:
+            _p("Đã đủ ảnh — bỏ qua (resume)", 100.0)
+            return [str(out_dir / f"{i}.png") for i in range(n) if _has_image(out_dir, i)]
+        if resume:
+            _p(f"Resume: còn thiếu ảnh {todo}", 1.0)
 
     saved: list[str] = []
     seen: set[str] = set()
@@ -327,37 +361,75 @@ def generate_images(
         except Exception:
             pass
 
+        # BỀN HOÁ: mỗi ảnh thử tối đa _IMAGE_ATTEMPTS lần; và cứ _NEW_CHAT_EVERY
+        # ảnh lại mở chat mới để CẮT ngữ cảnh dài (nguyên nhân gốc khiến ảnh ~37/41
+        # bị time-out: hội thoại quá dài → Gemini trả chữ/từ chối). Ảnh lưu NGAY
+        # từng cái nên nếu vẫn fail thì resume tạo tiếp, KHÔNG mất ảnh đã có.
+        _IMAGE_ATTEMPTS = 3
+        _NEW_CHAT_EVERY = int(getattr(config.BROWSER, "image_new_chat_every", 8) or 8)
+        done_count = 0
         for k, i in enumerate(todo):
             pct = 6.0 + (k / max(len(todo), 1)) * 90.0
-            _p(f"[{k+1}/{len(todo)}] Gửi prompt ảnh {i}...", pct)
             prompt = _prompt_for(i, topic, params, prompts_override, style)
 
-            if not fill_first(page, sels["prompt_box"], prompt):
-                raise RuntimeError("Không tìm thấy ô nhập prompt Gemini "
-                                   "(cập nhật selector 'prompt_box').")
-            page.wait_for_timeout(400)
-            if not click_first(page, sels["send_button"], timeout_ms=4000):
-                page.keyboard.press("Enter")
+            # Cắt ngữ cảnh định kỳ (trước khi gửi), tránh chat phình quá dài.
+            if _NEW_CHAT_EVERY > 0 and done_count > 0 \
+                    and done_count % _NEW_CHAT_EVERY == 0:
+                _p(f"Mở cuộc trò chuyện mới (cắt ngữ cảnh dài) trước ảnh {i}...", pct)
+                _start_new_chat(page)
+                _select_model(page, sels)
 
-            _p(f"[{i+1}/{n}] Đang chờ Gemini tạo ảnh {i}...", pct)
-            src = _wait_new_image(page, seen, config.BROWSER.image_wait_sec)
-            if not src:
-                raise RuntimeError(
-                    f"Ảnh {i}: chờ {config.BROWSER.image_wait_sec}s không thấy "
-                    f"ảnh mới đủ lớn. Có thể Gemini trả lời bằng chữ (model chưa "
-                    f"bật tạo ảnh) hoặc bị giới hạn.")
-
-            _p(f"[{i+1}/{n}] Đang tải ảnh {i}...", pct + 3.0)
+            last_err = ""
+            saved_ok = False
             dest = out_dir / f"{i}.png"
-            # Cho thêm thời gian để Gemini trả lời XONG (thanh nút ⋯ xuất hiện).
-            if not _download_new_image(page, sels, src, dest, wait_sec=90):
+            for attempt in range(1, _IMAGE_ATTEMPTS + 1):
+                tag = f"(lần {attempt}/{_IMAGE_ATTEMPTS})"
+                if attempt > 1:
+                    # Thử lại: mở CHAT MỚI + chọn lại model + chờ hồi (rate-limit),
+                    # rồi gửi lại prompt tự-chứa-danh-tính này từ ngữ cảnh sạch.
+                    _p(f"[{k+1}/{len(todo)}] Ảnh {i} lỗi ({last_err[:70]}) — "
+                       f"thử lại {tag}...", pct)
+                    _start_new_chat(page)
+                    _select_model(page, sels)
+                    page.wait_for_timeout(min(6000 * attempt, 18000))
+
+                _p(f"[{k+1}/{len(todo)}] Gửi prompt ảnh {i} {tag}...", pct)
+                if not fill_first(page, sels["prompt_box"], prompt):
+                    last_err = "không tìm thấy ô nhập prompt"
+                    continue
+                page.wait_for_timeout(400)
+                if not click_first(page, sels["send_button"], timeout_ms=4000):
+                    page.keyboard.press("Enter")
+
+                _p(f"[{i+1}/{n}] Đang chờ Gemini tạo ảnh {i} {tag}...", pct)
+                src = _wait_new_image(page, seen, config.BROWSER.image_wait_sec)
+                if not src:
+                    last_err = (f"chờ {config.BROWSER.image_wait_sec}s không thấy "
+                                f"ảnh mới (Gemini có thể trả chữ / bị giới hạn)")
+                    continue
+
+                _p(f"[{i+1}/{n}] Đang tải ảnh {i} {tag}...", pct + 3.0)
+                if not _download_new_image(page, sels, src, dest, wait_sec=90):
+                    # Đã có ảnh nhưng tải hỏng → đánh dấu src đã thấy để lần thử
+                    # sau nhận ĐÚNG ảnh mới, không "dính" lại ảnh này.
+                    seen.add(src)
+                    last_err = "không tải được ảnh (menu ⋯/chuột phải/src đều fail)"
+                    continue
+
+                seen.add(src)
+                saved.append(str(dest))
+                saved_ok = True
+                done_count += 1
+                _p(f"[{i+1}/{n}] Đã lưu ảnh {i} {tag}", pct + 6.0)
+                break
+                # Ảnh 0 giữ SẠCH — tiêu đề overlay ở bước ghép (step_assemble).
+
+            if not saved_ok:
                 raise RuntimeError(
-                    f"Ảnh {i}: không tải được (menu ⋯ / chuột phải / src đều "
-                    f"thất bại). CHẨN ĐOÁN → {_diagnostic(page)}")
-            seen.add(src)
-            saved.append(str(dest))
-            _p(f"[{i+1}/{n}] Đã lưu ảnh {i}", pct + 6.0)
-            # Ảnh 0 giữ SẠCH — tiêu đề overlay ở bước ghép (service.step_assemble).
+                    f"Ảnh {i}: thất bại sau {_IMAGE_ATTEMPTS} lần thử "
+                    f"({last_err}). Đã tạo {done_count}/{len(todo)} ảnh — bấm "
+                    f"'Tạo tiếp ảnh thiếu' (resume) để làm nốt phần còn lại mà "
+                    f"KHÔNG mất ảnh đã có. CHẨN ĐOÁN → {_diagnostic(page)}")
 
     _p("Xong tạo ảnh", 100.0)
     # Trả về TẤT CẢ ảnh hiện có (gồm ảnh cũ khi resume + ảnh mới tạo).

@@ -185,8 +185,10 @@ export interface VideoJobInfo {
 export interface VideoStatus {
   images:         string[];
   image_count:    number;
+  image_indices?: number[];
   clips:          string[];
   clip_count:     number;
+  clip_indices?:  number[];
   final_exists:   boolean;
   final_path?:    string | null;
   thumbnail_path?: string | null;

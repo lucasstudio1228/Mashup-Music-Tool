@@ -148,7 +148,7 @@ def generate_ingredient_plan(image_count: int, rest_clips: int,
 # lời hướng dẫn cho AI viết prompt, và gợi ý phong cách cho clip (Flow/Veo).
 # Đổi khi thay đổi định nghĩa phong cách. Cache prompts.json có style_version
 # KHÁC giá trị này (hoặc khác style_key) sẽ bị coi là cũ → sinh lại prompt.
-STYLE_VERSION = "styles-v4"
+STYLE_VERSION = "styles-v5"
 DEFAULT_STYLE = "2d"
 
 STYLES: dict[str, dict[str, str]] = {
@@ -322,6 +322,10 @@ class BrowserConfig:
     # Thời gian tối đa chờ 1 ảnh / 1 clip render xong (giây)
     image_wait_sec:  int  = 180
     clip_wait_sec:   int  = 900            # Veo có thể lâu vài phút
+    # Cứ tạo bao nhiêu ảnh thì mở CHAT MỚI để cắt ngữ cảnh dài (0 = không cắt).
+    # Hội thoại quá dài (vd ảnh ~37/41 cùng 1 chat) khiến Gemini trả chữ/từ chối
+    # → time-out. Mỗi prompt tự chứa danh tính nhân vật nên cắt chat vẫn đồng bộ.
+    image_new_chat_every: int = 8
     # None = dùng Chromium bundled của Playwright (ổn định nhất, chạy
     # `playwright install chromium` 1 lần). Đặt "chrome" nếu muốn dùng Google
     # Chrome đã cài; "msedge" cho Edge. (Cốc Cốc không hỗ trợ trực tiếp.)
@@ -421,6 +425,18 @@ GEMINI_SELECTORS: dict[str, list[str]] = {
         "button[aria-label*='Tải']",
         "a[download]",
     ],
+    # Nút "Trò chuyện mới" — cắt ngữ cảnh dài (hội thoại quá dài khiến Gemini
+    # hay trả CHỮ/từ chối). Không bấm được → driver reload thẳng GEMINI_URL.
+    "new_chat": [
+        "button[aria-label*='Cuộc trò chuyện mới']",
+        "a[aria-label*='Cuộc trò chuyện mới']",
+        "button[aria-label*='Trò chuyện mới']",
+        "a[aria-label*='Trò chuyện mới']",
+        "button[aria-label*='New chat']",
+        "a[aria-label*='New chat']",
+        "button[aria-label*='New conversation']",
+        "[data-test-id='new-chat-button']",
+    ],
     # Nút "⋯" dưới ảnh — aria-label THẬT: "Hiện thêm tuỳ chọn".
     "more_button": [
         "button[aria-label='Hiện thêm tuỳ chọn']",
@@ -458,6 +474,15 @@ FLOW_SELECTORS: dict[str, list[str]] = {
     "settings_trigger": [
         "button[aria-label='Settings trigger']",
         "button[aria-label='Điều kiện kích hoạt cài đặt']",
+        # Flow đôi khi render chip Settings KHÔNG phải thẻ <button> (div/role),
+        # nên khớp mọi thẻ theo aria-label + qua role engine (khớp accessible
+        # name, đã chuẩn hoá khoảng trắng) cho bền với thay đổi UI.
+        "[aria-label='Settings trigger']",
+        "[aria-label='Điều kiện kích hoạt cài đặt']",
+        "role=button[name='Settings trigger']",
+        "role=button[name='Điều kiện kích hoạt cài đặt']",
+        # Fallback cuối: chip cạnh nút 'Start generation' chứa 'crop_16_9'/tỉ lệ.
+        "[role='button']:has-text('crop_16_9')",
     ],
     # Chế độ Khung hình (start+end frame)
     "mode_frames": [

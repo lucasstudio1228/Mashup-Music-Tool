@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import {
   useVideoStatus, useGenImages, useGenClips, useAssemble, useRunAll, useRebuild,
-  videoDownloadUrl, videoThumbnailUrl,
+  useRegenImage, useRegenClip, useRegenMotions,
+  videoDownloadUrl, videoThumbnailUrl, videoImageUrl, videoClipUrl,
 } from "../../api/video";
 import { useProject, useUpdateProject } from "../../api/projects";
 
@@ -47,10 +48,20 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
   const assemble  = useAssemble(projectId);
   const runAll    = useRunAll(projectId);
   const rebuild   = useRebuild(projectId);
+  const regenImage   = useRegenImage(projectId);
+  const regenClip    = useRegenClip(projectId);
+  const regenMotions = useRegenMotions(projectId);
   const [idea, setIdea] = useState("");
   // Nạp ý tưởng đã lưu của project vào ô nhập (khi tải xong / đổi project).
   const savedIdea = project?.video_idea ?? "";
   useEffect(() => { setIdea(savedIdea); }, [savedIdea, projectId]);
+  // Cache-buster: sau mỗi lần 1 job hoàn thành, đổi query ?t= để trình duyệt tải
+  // lại ảnh/clip mới (thay vì bản cache cũ) trong gallery.
+  const [bust, setBust] = useState(() => Date.now());
+  const jobStatus = st?.job?.status;
+  useEffect(() => {
+    if (jobStatus === "completed") setBust(Date.now());
+  }, [jobStatus]);
   const autoVideo = project?.auto_video ?? false;
   const videoStyle = project?.video_style ?? "2d";
   const ideaDirty = idea.trim() !== savedIdea.trim();
@@ -75,9 +86,14 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
     images: "Đang tạo ảnh", clips: "Đang tạo clip",
     assemble: "Đang ghép video", full: "Đang chạy toàn bộ",
     rebuild: "Đang tạo lại video từ ảnh",
+    motions: "Đang sinh lại prompt chuyển động",
   };
 
+  const imageIndices = st.image_indices ?? [];
+  const clipIndices  = st.clip_indices ?? [];
+
   return (
+    <div className="space-y-6">
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
       {/* Cột trái: trạng thái + tiến độ */}
       <div className="space-y-4">
@@ -349,6 +365,14 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
                   Làm lại từ đầu
                 </button>
               </div>
+              <button className={`${ghost} mt-2 w-full`} disabled={busy}
+                      onClick={() => {
+                        if (confirm("Sinh lại CHỈ prompt chuyển động (motion) từ prompt ảnh đã lưu?\n\nKhông tạo lại ảnh/clip — lần tạo clip kế tiếp sẽ dùng motion mới.")) {
+                          regenMotions.mutate(undefined);
+                        }
+                      }}>
+                🔄 Sinh lại chỉ Motion (giữ ảnh/clip)
+              </button>
             </div>
             {/* Bước 3 — Ghép nhạc */}
             <div>
@@ -371,6 +395,79 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
           </ul>
         </Section>
       </div>
+    </div>
+
+      {/* Gallery: xem trước + tạo lại từng ảnh/clip lẻ */}
+      {imageIndices.length > 0 && (
+        <Section title={`Ảnh đã tạo — ${imageIndices.length}/${p.image_count} (bấm 🔄 để tạo lại 1 ảnh)`}>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-5">
+            {imageIndices.map((i) => (
+              <div key={i} className="overflow-hidden rounded-lg border border-white/10 bg-background">
+                <div className="relative">
+                  <img
+                    src={videoImageUrl(projectId, i, bust)}
+                    alt={`Ảnh ${i}`}
+                    loading="lazy"
+                    className="aspect-video w-full object-cover"
+                  />
+                  <span className="absolute left-1 top-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-semibold text-white">
+                    {i === 0 ? "00 · intro" : String(i).padStart(2, "0")}
+                  </span>
+                </div>
+                <button
+                  className={`${ghost} w-full rounded-none rounded-b-lg py-1.5 text-xs`}
+                  disabled={busy}
+                  onClick={() => {
+                    if (confirm(`Tạo lại ảnh ${i} (ghi đè), giữ nguyên các ảnh khác?\n\nDùng lại prompt đã lưu để nhân vật vẫn khớp cả bộ.`)) {
+                      regenImage.mutate(i);
+                    }
+                  }}
+                >
+                  🔄 Tạo lại ảnh {i}
+                </button>
+              </div>
+            ))}
+          </div>
+        </Section>
+      )}
+
+      {clipIndices.length > 0 && (
+        <Section title={`Clip đã tạo — ${clipIndices.length}/${p.total_clips} (bấm 🔄 để tạo lại 1 clip)`}>
+          <p className="mb-3 text-xs text-gray-500">
+            Tạo lại 1 clip cần đã có kế hoạch clip (bấm <b>Làm lại từ đầu</b> ở phần
+            Clip một lần) để giữ đúng ánh xạ ảnh↔clip 1:1.
+          </p>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4">
+            {clipIndices.map((i) => (
+              <div key={i} className="overflow-hidden rounded-lg border border-white/10 bg-background">
+                <div className="relative">
+                  <video
+                    src={videoClipUrl(projectId, i, bust)}
+                    controls
+                    preload="metadata"
+                    muted
+                    className="aspect-video w-full bg-black object-cover"
+                  />
+                  <span className="pointer-events-none absolute left-1 top-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-semibold text-white">
+                    {i === 0 ? "00 · intro" : `clip ${String(i).padStart(2, "0")}`}
+                  </span>
+                </div>
+                <button
+                  className={`${ghost} w-full rounded-none rounded-b-lg py-1.5 text-xs`}
+                  disabled={busy}
+                  onClick={() => {
+                    if (confirm(`Tạo lại clip ${i} (ghi đè), giữ nguyên các clip khác?`)) {
+                      regenClip.mutate(i);
+                    }
+                  }}
+                >
+                  🔄 Tạo lại clip {i}
+                </button>
+              </div>
+            ))}
+          </div>
+        </Section>
+      )}
     </div>
   );
 }

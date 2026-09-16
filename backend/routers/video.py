@@ -138,6 +138,46 @@ def rebuild(project_id: int, body: RebuildBody = RebuildBody(),
     return {"status": "submitted", "kind": "rebuild", "mode": mode}
 
 
+@router.post("/images/{index}/regenerate")
+def regen_image(project_id: int, index: int,
+                db: Session = Depends(get_session)):
+    """Tạo lại ĐÚNG 1 ảnh (ghi đè), giữ nguyên ảnh khác + dùng lại prompt đã lưu."""
+    project = _project_or_404(db, project_id)
+    _guard_busy()
+    if not (0 <= index < config.PARAMS.image_count):
+        raise HTTPException(400, f"Chỉ số ảnh {index} không hợp lệ "
+                                 f"(0..{config.PARAMS.image_count - 1}).")
+    video_job_manager.submit(project_id, "images", service.regen_image,
+                             index, project.name, project.video_style)
+    return {"status": "submitted", "kind": "images", "index": index,
+            "single": True}
+
+
+@router.post("/clips/{index}/regenerate")
+def regen_clip(project_id: int, index: int,
+               db: Session = Depends(get_session)):
+    """Tạo lại ĐÚNG 1 clip (ghi đè), giữ nguyên clip khác (cần _plan.json)."""
+    project = _project_or_404(db, project_id)
+    _guard_busy()
+    if not (0 <= index < config.PARAMS.image_count):
+        raise HTTPException(400, f"Chỉ số clip {index} không hợp lệ "
+                                 f"(0..{config.PARAMS.image_count - 1}).")
+    video_job_manager.submit(project_id, "clips", service.regen_clip,
+                             index, project.name, project.video_style)
+    return {"status": "submitted", "kind": "clips", "index": index,
+            "single": True}
+
+
+@router.post("/motions/regenerate")
+def regen_motions(project_id: int, db: Session = Depends(get_session)):
+    """Sinh lại CHỈ prompt chuyển động (motions) từ prompt ảnh đã lưu."""
+    project = _project_or_404(db, project_id)
+    _guard_busy()
+    video_job_manager.submit(project_id, "motions", service.regen_motions,
+                             project.name, project.video_style)
+    return {"status": "submitted", "kind": "motions"}
+
+
 @router.post("/cancel")
 def cancel(project_id: int, db: Session = Depends(get_session)):
     """Huỷ tác vụ video đang chạy (hợp tác — dừng ở ranh giới ảnh/clip kế)."""
@@ -169,6 +209,28 @@ def download(project_id: int, db: Session = Depends(get_session)):
                    for c in (project.name or "video")).strip()
     return FileResponse(str(final), media_type="video/mp4",
                         filename=f"{safe or 'video'}_final.mp4")
+
+
+@router.get("/image/{index}")
+def get_image(project_id: int, index: int,
+              db: Session = Depends(get_session)):
+    """Trả ảnh {index}.png để UI hiển thị gallery (xem trước)."""
+    project = _project_or_404(db, project_id)
+    img = config.images_dir(project_id, project.name) / f"{index}.png"
+    if not img.exists():
+        raise HTTPException(404, f"Chưa có ảnh {index}.")
+    return FileResponse(str(img), media_type="image/png")
+
+
+@router.get("/clip/{index}")
+def get_clip(project_id: int, index: int,
+             db: Session = Depends(get_session)):
+    """Trả clip_{index}.mp4 để UI xem trước từng clip."""
+    project = _project_or_404(db, project_id)
+    clip = config.clips_dir(project_id, project.name) / f"clip_{index:02d}.mp4"
+    if not clip.exists():
+        raise HTTPException(404, f"Chưa có clip {index}.")
+    return FileResponse(str(clip), media_type="video/mp4")
 
 
 @router.get("/thumbnail")

@@ -39,6 +39,37 @@ export const useGenClips  = (pid: number) => useVideoAction(pid, "clips");
 export const useAssemble  = (pid: number) => useVideoAction(pid, "assemble");
 export const useRunAll    = (pid: number) => useVideoAction(pid, "run-all");
 export const useRebuild   = (pid: number) => useVideoAction(pid, "rebuild");
+export const useRegenMotions = (pid: number) => useVideoAction(pid, "motions/regenerate");
+
+// Tạo lại 1 ảnh / 1 clip lẻ theo chỉ số — giữ nguyên các cái khác.
+export function useRegenImage(projectId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (index: number) =>
+      api.post(`${base(projectId)}/images/${index}/regenerate`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["video", projectId] }),
+  });
+}
+
+export function useRegenClip(projectId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (index: number) =>
+      api.post(`${base(projectId)}/clips/${index}/regenerate`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["video", projectId] }),
+  });
+}
+
+// URL xem trước ảnh/clip lẻ (kèm cache-buster để sau khi tạo lại thấy bản mới).
+export function videoImageUrl(projectId: number, index: number, bust?: string | number): string {
+  const q = bust != null ? `?t=${encodeURIComponent(String(bust))}` : "";
+  return `${API_BASE}${base(projectId)}/image/${index}${q}`;
+}
+
+export function videoClipUrl(projectId: number, index: number, bust?: string | number): string {
+  const q = bust != null ? `?t=${encodeURIComponent(String(bust))}` : "";
+  return `${API_BASE}${base(projectId)}/clip/${index}${q}`;
+}
 
 export function videoDownloadUrl(projectId: number): string {
   return `${API_BASE}${base(projectId)}/download`;

@@ -117,6 +117,23 @@ def _resolve_prompts(
     )
     if result:
         prompts, motions = result
+        # Bộ prompt lớn (vd 41 shot) thỉnh thoảng model bỏ sót / không đủ
+        # 'motions' trong 1 lượt → nếu để trống, flow_driver rơi về chuyển động
+        # camera GENERIC (mất anti-hallucination: khói/đầu-ngược/méo tay). Sinh
+        # BỔ SUNG motion bằng call riêng (nhỏ & ổn định hơn) từ chính prompt.
+        if len(motions) < P.image_count:
+            try:
+                from .prompt_gen import generate_motions_for_prompts
+                _log(f"Motion {len(motions)}/{P.image_count} — sinh bổ sung riêng…")
+                m2 = generate_motions_for_prompts(
+                    prompts=prompts, idea=idea,
+                    style=config.style_info(style_key)["brief"],
+                    api_config=get_api_config_from_db(str(DB_PATH)),
+                    log=lambda m: _log(m))
+                if m2 and len(m2) == P.image_count:
+                    motions = m2
+            except Exception:
+                pass
         try:
             prompts_path.write_text(
                 json.dumps({"idea": idea, "title": title,
@@ -173,6 +190,23 @@ def list_media(project_id: int, project_name: str | None = None) -> dict:
     thumb = final_d / "thumbnail.png"
     images = sorted(str(p) for p in img_dir.glob("*.png")) if img_dir.exists() else []
     clips = sorted(str(p) for p in clip_dir.glob("clip_*.mp4")) if clip_dir.exists() else []
+    # Chỉ số ảnh/clip đang có (để UI vẽ gallery + nút "Tạo lại" từng cái).
+    image_indices: list[int] = []
+    if img_dir.exists():
+        for p in img_dir.glob("*.png"):
+            try:
+                image_indices.append(int(p.stem))
+            except ValueError:
+                pass
+    clip_indices: list[int] = []
+    if clip_dir.exists():
+        for p in clip_dir.glob("clip_*.mp4"):
+            try:
+                clip_indices.append(int(p.stem.split("_")[1]))
+            except (ValueError, IndexError):
+                pass
+    image_indices.sort()
+    clip_indices.sort()
     audio = find_latest_audio(project_id, project_name)
     audio_dur = None
     if audio:
@@ -183,8 +217,10 @@ def list_media(project_id: int, project_name: str | None = None) -> dict:
     return {
         "images": images,
         "image_count": len(images),
+        "image_indices": image_indices,
         "clips": clips,
         "clip_count": len(clips),
+        "clip_indices": clip_indices,
         "final_exists": final.exists(),
         "final_path": str(final) if final.exists() else None,
         "thumbnail_path": str(thumb) if thumb.exists() else None,
@@ -229,6 +265,105 @@ def step_clips(project_id: int,
     return generate_clips(project_id, config.PARAMS, progress_cb,
                           resume=(mode == "resume"), project_name=project_name,
                           style=config.normalize_style(style_key))
+
+
+def _load_saved_prompts(project_id: int,
+                        project_name: str | None) -> Optional[dict]:
+    """Đọc THẲNG bộ prompt ảnh đã lưu (images/prompts.json → 'prompts') để tạo
+    lại đúng 1 ảnh mà KHÔNG lệ thuộc điều kiện cache phong cách. Trả None nếu
+    chưa có (→ driver dùng DEFAULT_PROMPTS)."""
+    prompts_path = config.images_dir(project_id, project_name) / "prompts.json"
+    if not prompts_path.exists():
+        return None
+    try:
+        saved = json.loads(prompts_path.read_text(encoding="utf-8"))
+        pr = saved.get("prompts")
+        if isinstance(pr, dict) and pr:
+            return {str(k): v for k, v in pr.items()}
+    except Exception:
+        pass
+    return None
+
+
+def regen_image(project_id: int,
+                progress_cb: Callable[[str, float], None],
+                index: int,
+                project_name: str | None = None,
+                style_key: str | None = None) -> list[str]:
+    """Tạo lại ĐÚNG 1 ảnh (ghi đè), GIỮ NGUYÊN mọi ảnh khác. Dùng lại prompt đã
+    lưu để nhân vật/bối cảnh vẫn khớp cả bộ."""
+    from .gemini_driver import generate_images
+    style_key = config.normalize_style(style_key)
+    prompts_override = _load_saved_prompts(project_id, project_name)
+    return generate_images(
+        project_id, (project_name or "Healing"), config.PARAMS, progress_cb,
+        project_name=project_name, prompts_override=prompts_override,
+        style=style_key, only=[int(index)])
+
+
+def regen_clip(project_id: int,
+               progress_cb: Callable[[str, float], None],
+               index: int,
+               project_name: str | None = None,
+               style_key: str | None = None) -> list[str]:
+    """Tạo lại ĐÚNG 1 clip (ghi đè), GIỮ NGUYÊN mọi clip khác. Cần _plan.json
+    hợp lệ (flow_driver sẽ báo lỗi rõ nếu thiếu) để giữ ánh xạ ảnh↔clip 1:1."""
+    from .flow_driver import generate_clips
+    return generate_clips(
+        project_id, config.PARAMS, progress_cb, project_name=project_name,
+        style=config.normalize_style(style_key), only=[int(index)])
+
+
+def regen_motions(project_id: int,
+                  progress_cb: Callable[[str, float], None],
+                  project_name: str | None = None,
+                  style_key: str | None = None) -> dict:
+    """Sinh LẠI CHỈ bộ prompt chuyển động (motions) từ prompt ảnh đã lưu và ghi
+    đè 'motions' trong images/prompts.json. KHÔNG tạo lại ảnh/clip — lần tạo clip
+    sau sẽ dùng motion mới. Trả {"count": N} khi thành công."""
+    from backend.core_bridge import get_api_config_from_db
+    from backend.database import DB_PATH
+    from .prompt_gen import generate_motions_for_prompts
+
+    def _log(m: str):
+        if progress_cb:
+            progress_cb(m, 1.0)
+
+    prompts_path = config.images_dir(project_id, project_name) / "prompts.json"
+    if not prompts_path.exists():
+        raise RuntimeError(
+            "Chưa có bộ prompt (images/prompts.json). Hãy tạo ảnh từ 'Ý tưởng' "
+            "một lần để sinh prompt, rồi mới sinh lại motion.")
+    try:
+        saved = json.loads(prompts_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"Không đọc được prompts.json ({e}).")
+    prompts = saved.get("prompts")
+    if not isinstance(prompts, dict) or not prompts:
+        raise RuntimeError("prompts.json không có 'prompts' hợp lệ.")
+    idea = (saved.get("idea") or "").strip()
+    style_key = config.normalize_style(style_key or saved.get("style_key"))
+
+    _log(f"Sinh lại motion cho {len(prompts)} prompt…")
+    motions = generate_motions_for_prompts(
+        prompts={str(k): v for k, v in prompts.items()},
+        idea=idea,
+        style=config.style_info(style_key)["brief"],
+        api_config=get_api_config_from_db(str(DB_PATH)),
+        log=_log)
+    if not motions or len(motions) != len(prompts):
+        raise RuntimeError(
+            "AI chưa sinh lại đủ bộ motion (kiểm tra API key/model ở ⚙️ "
+            "Settings rồi thử lại).")
+
+    saved["motions"] = motions
+    try:
+        prompts_path.write_text(
+            json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        raise RuntimeError(f"Không lưu được motion mới ({e}).")
+    _log(f"Đã cập nhật {len(motions)} prompt chuyển động — tạo clip lần sau sẽ dùng.")
+    return {"count": len(motions)}
 
 
 def step_assemble(project_id: int,

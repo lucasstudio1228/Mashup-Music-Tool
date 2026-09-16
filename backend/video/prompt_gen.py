@@ -87,8 +87,11 @@ Mỗi shot = 1 prompt tạo ảnh CỰC KÌ CHI TIẾT.
    NGHIÊM CẤM bịa nhân vật/bối cảnh không có trong ý tưởng (đặc biệt KHÔNG được
    mặc định thành "người trẻ hoodie sage + cabin gỗ + mèo tam thể" — đó là mẫu cũ).
 
-2. CHARACTER BIBLE CỐ ĐỊNH (ghi vào trường "character_bible")
-   Trước khi viết bất kì prompt nào, bạn PHẢI khoá hồ sơ nhân vật chính:
+2. CHARACTER BIBLE + CHARACTER SHEET (khoá danh tính nhân vật)
+   Trước khi viết bất kì prompt nào, bạn PHẢI khoá hồ sơ nhân vật chính, GHI VÀO
+   HAI trường riêng:
+
+   (A) "character_bible" — hồ sơ ĐẦY ĐỦ để tham chiếu:
    • Ngoại hình CỤ THỂ: tuổi, tóc (kiểu/dài/ngắn/màu), mắt (màu/hình dáng),
      da, vóc dáng, biểu cảm mặc định
    • Trang phục CỐ ĐỊNH: mô tả TỪNG MÓN (chất liệu, màu chính xác, hoạ tiết nếu
@@ -97,11 +100,25 @@ Mỗi shot = 1 prompt tạo ảnh CỰC KÌ CHI TIẾT.
      trào – lắng)
    • BẢNG MÀU CHÍNH: 5–7 màu chủ đạo (ghi tên cụ thể, VD "xanh ngọc bích #6EC4A7"
      thay vì chỉ "xanh"), kèm vai trò (màu chính nhân vật / màu nền / màu accent)
-   Mọi shot phải dùng CHÍNH XÁC thông tin này — một nhân vật, một phim.
 
-3. MỖI PROMPT PHẢI TỰ CHỨA + CỰC KÌ CHI TIẾT (90–140 từ)
-   Mỗi prompt PHẢI tự lặp lại đầy đủ ngoại hình nhân vật + trang phục + đạo cụ
-   (KHÔNG viết "nhân vật như trên"). Đồng thời PHẢI bao gồm TẤT CẢ các lớp sau:
+   (B) "character_sheet" — KHỐI DANH TÍNH CÔ ĐỌNG (40–70 từ) để COPY NGUYÊN VĂN
+   vào MỌI shot. ĐÂY LÀ CHÌA KHOÁ ĐỒNG BỘ NHÂN VẬT — hệ thống sẽ TỰ ĐỘNG dán
+   khối này (y hệt, không đổi một chữ) vào đầu TỪNG prompt ảnh. Vì vậy nó phải:
+   • CHỈ chứa danh tính CỐ ĐỊNH, không đổi giữa các shot: giới tính/tuổi/dân tộc,
+     khuôn mặt + tóc + mắt + da + vóc dáng, TỪNG món trang phục kèm MÀU CHÍNH XÁC
+     (+ hex), đạo cụ cố định, và 3–5 hex bảng màu chủ đạo.
+   • TUYỆT ĐỐI KHÔNG chứa: bối cảnh, hành động, tư thế, cảm xúc, góc máy, ánh sáng,
+     thời điểm trong ngày (những thứ đó thay đổi theo shot → viết trong từng prompt).
+   • Viết thành 1 khối liền mạch, dày token danh tính, có thể dán lặp lại y nguyên.
+   Mọi shot dùng CHÍNH XÁC danh tính này — một nhân vật, một phim.
+
+3. MỖI PROMPT MÔ TẢ CẢNH (KHÔNG tự bịa lại ngoại hình) — 70–120 từ
+   QUAN TRỌNG: KHÔNG mô tả lại / diễn giải lại ngoại hình, trang phục, màu sắc
+   nhân vật trong prompt (danh tính đã được khối "character_sheet" dán tự động
+   vào đầu prompt — mô tả lại chỉ gây LỆCH hình dáng giữa các shot). Chỉ gọi
+   "nhân vật chính". TUYỆT ĐỐI không đổi màu/trang phục/kiểu tóc/đạo cụ so với
+   character_sheet. Prompt của bạn tập trung vào phần THAY ĐỔI theo shot và PHẢI
+   bao gồm các lớp sau:
    a) GÓC MÁY & BỐ CỤC: loại shot (extreme wide / wide / medium / close-up /
       extreme close-up / over-the-shoulder / low-angle / bird's-eye / dutch angle),
       vị trí nhân vật trong khung (rule of thirds, centered, silhouette...)
@@ -189,12 +206,13 @@ Mỗi shot = 1 prompt tạo ảnh CỰC KÌ CHI TIẾT.
 ═══ OUTPUT FORMAT ═══
 CHỈ trả về JSON (không giải thích, không markdown):
 {{
-  "character_bible": "hồ sơ nhân vật cố định (ngoại hình + trang phục + đạo cụ + bảng màu 5-7 màu + bối cảnh + hành trình)",
+  "character_bible": "hồ sơ nhân vật cố định ĐẦY ĐỦ (ngoại hình + trang phục + đạo cụ + bảng màu 5-7 màu + bối cảnh + hành trình)",
+  "character_sheet": "KHỐI danh tính CÔ ĐỌNG 40-70 từ, chỉ danh tính cố định (giới tính/tuổi/dân tộc + mặt/tóc/mắt/da/vóc dáng + từng món trang phục kèm hex + đạo cụ + 3-5 hex palette), KHÔNG bối cảnh/hành động/góc máy/ánh sáng — sẽ được dán y nguyên vào đầu mọi shot",
   "prompts": {{
-    "0": "prompt thumbnail 90-140 từ, KHÔNG chữ, chừa negative space nửa trái",
-    "1": "prompt shot 1 (90-140 từ, không chữ, tự chứa, đủ 7 lớp chi tiết)",
+    "0": "prompt thumbnail 70-120 từ, KHÔNG chữ, chừa negative space nửa trái, KHÔNG tả lại ngoại hình (gọi 'nhân vật chính')",
+    "1": "prompt shot 1 (70-120 từ, không chữ, đủ các lớp cảnh, KHÔNG tả lại ngoại hình)",
     "...": "...",
-    "{n - 1}": "prompt shot cuối (90-140 từ, không chữ)"
+    "{n - 1}": "prompt shot cuối (70-120 từ, không chữ)"
   }},
   "motions": {{
     "0": "prompt chuyển động clip từ ảnh 0 (50-100 từ, hợp logic vật lý, 3 tầng + cụm phủ định cuối)",
@@ -203,8 +221,10 @@ CHỈ trả về JSON (không giải thích, không markdown):
     "{n - 1}": "prompt chuyển động clip cuối (50-100 từ)"
   }}
 }}
-Bắt buộc: "prompts" VÀ "motions" đều đủ {n} khoá "0".."{n - 1}". Mỗi prompt
-ảnh 90–140 từ; mỗi prompt motion 50–100 từ, hợp logic vật lý, có cụm phủ định."""
+Bắt buộc: có trường "character_sheet"; "prompts" VÀ "motions" đều đủ {n} khoá
+"0".."{n - 1}". Mỗi prompt ảnh 70–120 từ (KHÔNG tả lại ngoại hình nhân vật —
+danh tính do character_sheet lo); mỗi prompt motion 50–100 từ, hợp logic vật lý,
+có cụm phủ định."""
 
 
 def _motion_system(style_brief: str) -> str:
@@ -340,6 +360,18 @@ def generate_motions_for_prompts(
     return out
 
 
+def _with_character_lock(sheet: str, scene: str) -> str:
+    """Ghép KHỐI danh tính cố định (sheet) vào ĐẦU prompt cảnh (scene) — y nguyên
+    cho mọi shot để nhân vật đồng bộ. `sheet` rỗng → trả nguyên `scene`."""
+    sheet = (sheet or "").strip()
+    scene = (scene or "").strip()
+    if not sheet:
+        return scene
+    return (f"NHÂN VẬT (GIỮ CỐ ĐỊNH TUYỆT ĐỐI Ở MỌI SHOT — không đổi khuôn mặt, "
+            f"tóc, trang phục, màu sắc, đạo cụ): {sheet}\n\n"
+            f"BỐI CẢNH & DIỄN XUẤT SHOT NÀY: {scene}")
+
+
 def _extract_json(text: str) -> Optional[dict]:
     """Lấy object JSON đầu tiên trong text (chịu được rào ```json)."""
     if not text:
@@ -460,6 +492,20 @@ def generate_prompts(
             _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — thử lại…")
             continue
 
+        # ĐỒNG BỘ NHÂN VẬT: dán KHỐI danh tính (character_sheet) y NGUYÊN vào đầu
+        # MỌI prompt. Không dựa vào việc model tự tả lại ngoại hình ở mỗi shot
+        # (nó paraphrase khác nhau → Gemini vẽ nhân vật lệch). Cùng một chuỗi
+        # danh tính cho tất cả shot → hình dáng/trang phục/màu giống hệt.
+        sheet = data.get("character_sheet")
+        if not isinstance(sheet, str) or len(sheet.strip()) < 20:
+            # Model quên viết sheet cô đọng → lấy tạm character_bible làm chốt.
+            sheet = data.get("character_bible")
+        sheet = sheet.strip() if isinstance(sheet, str) else ""
+        if sheet:
+            _log(f"Khoá danh tính nhân vật ({len(sheet)} ký tự) — dán vào mọi shot.")
+        else:
+            _log("Cảnh báo: thiếu character_sheet — nhân vật có thể lệch giữa shot.")
+
         # Chuẩn hoá key về str và kiểm tra đủ 0..N-1
         out: dict[str, str] = {}
         missing = None
@@ -468,7 +514,7 @@ def generate_prompts(
             if not isinstance(val, str) or not val.strip():
                 missing = i
                 break
-            out[str(i)] = val.strip()
+            out[str(i)] = _with_character_lock(sheet, val.strip())
         if missing is not None:
             last_reason = (f"thiếu prompt cho ảnh {missing} "
                            f"({len(out)}/{image_count})")
