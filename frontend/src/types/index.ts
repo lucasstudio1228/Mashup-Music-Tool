@@ -59,7 +59,7 @@ export interface Track {
   added_at: string;
 }
 
-export type MixStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type MixStatus = 'pending' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
 
 export interface Mix {
   id: number;
@@ -182,7 +182,7 @@ export interface VideoParamsInfo {
   slow_speed:     number;
 }
 
-export type VideoJobStatus = 'pending' | 'running' | 'completed' | 'failed';
+export type VideoJobStatus = 'pending' | 'running' | 'paused' | 'completed' | 'failed';
 
 export interface VideoJobInfo {
   kind:    string;   // images | clips | assemble | full

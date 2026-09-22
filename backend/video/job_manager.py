@@ -5,6 +5,7 @@ không chạy song song). SSE progress theo project_id. Mẫu giống stem_job_m
 from __future__ import annotations
 import asyncio
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
@@ -20,7 +21,7 @@ class JobCancelled(Exception):
 class VideoJob:
     project_id: int
     kind: str                      # images | clips | assemble | full
-    status: str = "pending"        # pending|running|completed|failed|cancelled
+    status: str = "pending"        # pending|running|paused|completed|failed|cancelled
     percent: float = 0.0
     message: str = ""
     error: Optional[str] = None
@@ -34,6 +35,7 @@ class VideoJobManager:
         self._jobs: dict[int, VideoJob] = {}
         self._queues: dict[int, asyncio.Queue] = {}
         self._cancels: dict[int, threading.Event] = {}
+        self._pauses: dict[int, threading.Event] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._lock = threading.Lock()
 
@@ -41,7 +43,7 @@ class VideoJobManager:
 
     def is_busy(self) -> bool:
         with self._lock:
-            return any(j.status in ("pending", "running")
+            return any(j.status in ("pending", "running", "paused")
                        for j in self._jobs.values())
 
     def get(self, project_id: int) -> Optional[VideoJob]:
@@ -53,17 +55,43 @@ class VideoJobManager:
             self._jobs[project_id] = VideoJob(project_id=project_id, kind=kind)
             self._queues.setdefault(project_id, asyncio.Queue())
             self._cancels[project_id] = threading.Event()
+            self._pauses[project_id] = threading.Event()
         self._executor.submit(self._run, project_id, fn, args, kwargs)
 
     def cancel(self, project_id: int) -> bool:
         """Yêu cầu huỷ hợp tác: đặt cờ → progress callback kế tiếp ném
-        JobCancelled → dừng ở ranh giới bước/ảnh/clip gần nhất."""
+        JobCancelled → dừng ở ranh giới bước/ảnh/clip gần nhất. Job đang tạm
+        dừng cũng huỷ được (bỏ chặn pause để callback ném JobCancelled)."""
         with self._lock:
             job = self._jobs.get(project_id)
             ev = self._cancels.get(project_id)
-            if not job or not ev or job.status not in ("pending", "running"):
+            pause = self._pauses.get(project_id)
+            if not job or not ev or job.status not in ("pending", "running", "paused"):
                 return False
             ev.set()
+            if pause is not None:
+                pause.set()   # đánh thức vòng chờ pause để nó thấy cờ huỷ
+            return True
+
+    def pause(self, project_id: int) -> bool:
+        """Tạm dừng hợp tác: callback kế tiếp sẽ chặn tại checkpoint (giữ
+        nguyên state trong RAM), resume tiếp tục ngay không phải chạy lại."""
+        with self._lock:
+            job = self._jobs.get(project_id)
+            pause = self._pauses.get(project_id)
+            if not job or not pause or job.status != "running":
+                return False
+            pause.set()
+            return True
+
+    def resume(self, project_id: int) -> bool:
+        """Bỏ chặn để job đang tạm dừng chạy tiếp từ đúng checkpoint."""
+        with self._lock:
+            job = self._jobs.get(project_id)
+            pause = self._pauses.get(project_id)
+            if not job or not pause or job.status != "paused":
+                return False
+            pause.clear()
             return True
 
     def _run(self, project_id, fn, args, kwargs):
@@ -94,10 +122,24 @@ class VideoJobManager:
 
     def _progress(self, project_id):
         ev = self._cancels.get(project_id)
+        pause = self._pauses.get(project_id)
 
         def cb(message: str, percent: float):
             if ev is not None and ev.is_set():
                 raise JobCancelled()
+            # Tạm dừng: chặn tại checkpoint này, giữ nguyên state; vẫn cho phép
+            # huỷ (ev) trong lúc chờ. Resume → pause.clear() → chạy tiếp.
+            if pause is not None and pause.is_set():
+                self._update(project_id, status="paused",
+                             message="Đã tạm dừng — bấm Tiếp tục để chạy tiếp")
+                self._push(project_id, {"type": "progress",
+                                        "message": "Đã tạm dừng",
+                                        "percent": round(percent, 1)})
+                while pause.is_set():
+                    if ev is not None and ev.is_set():
+                        raise JobCancelled()
+                    time.sleep(0.3)
+                self._update(project_id, status="running")
             self._update(project_id, message=message, percent=percent)
             self._push(project_id, {"type": "progress",
                                     "message": message,

@@ -11,7 +11,7 @@ export function useVideoStatus(projectId: number) {
     // Poll khi có job đang chạy để cập nhật % + message
     refetchInterval: (q) => {
       const s = q.state.data?.job?.status;
-      return (s === "pending" || s === "running") ? 1500 : false;
+      return (s === "pending" || s === "running" || s === "paused") ? 1500 : false;
     },
   });
 }
@@ -45,6 +45,22 @@ export function useCancelVideo(projectId: number) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () => api.post(`${base(projectId)}/cancel`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["video", projectId] }),
+  });
+}
+
+export function usePauseVideo(projectId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post(`${base(projectId)}/pause`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["video", projectId] }),
+  });
+}
+
+export function useResumeVideo(projectId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post(`${base(projectId)}/resume`),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["video", projectId] }),
   });
 }

@@ -20,8 +20,8 @@ const SR_LABEL: Record<number, string> = {
 const MIN_TRACKS = 15;
 
 export default function MixSettingsPanel({ trackCount, disabled, onStart }: Props) {
-  const [duration, setDuration] = useState(60);
-  const [crossfade, setCrossfade] = useState(15);
+  const [duration, setDuration] = useState(120);
+  const [crossfade, setCrossfade] = useState(5);
   const [sampleRate, setSampleRate] = useState(0);        // mặc định Auto
   const [bitDepth, setBitDepth] = useState<24 | 32>(32);  // mặc định 32-bit float
 

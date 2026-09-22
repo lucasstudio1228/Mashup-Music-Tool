@@ -261,6 +261,26 @@ def cancel(project_id: int, db: Session = Depends(get_session)):
     return {"status": "cancelling", "project_id": project_id}
 
 
+@router.post("/pause")
+def pause(project_id: int, db: Session = Depends(get_session)):
+    """Tạm dừng tác vụ video đang chạy (dừng ở checkpoint kế, giữ nguyên state)."""
+    _project_or_404(db, project_id)
+    ok = video_job_manager.pause(project_id)
+    if not ok:
+        raise HTTPException(409, "Không có tác vụ video nào đang chạy để tạm dừng.")
+    return {"status": "pausing", "project_id": project_id}
+
+
+@router.post("/resume")
+def resume(project_id: int, db: Session = Depends(get_session)):
+    """Tiếp tục tác vụ video đang tạm dừng từ đúng checkpoint đang dở."""
+    _project_or_404(db, project_id)
+    ok = video_job_manager.resume(project_id)
+    if not ok:
+        raise HTTPException(409, "Không có tác vụ video nào đang tạm dừng để tiếp tục.")
+    return {"status": "resuming", "project_id": project_id}
+
+
 @router.get("/progress")
 async def progress(project_id: int):
     async def gen():

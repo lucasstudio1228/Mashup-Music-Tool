@@ -271,6 +271,26 @@ def cancel_mix(mix_id: int, session: Session = Depends(get_session)):
     return {"status": "cancelling", "mix_id": mix_id}
 
 
+@router.post("/mixes/{mix_id}/pause")
+def pause_mix(mix_id: int, session: Session = Depends(get_session)):
+    """Tạm dừng mix đang render (dừng ở bước kế, giữ nguyên state để tiếp tục)."""
+    _get_mix_or_404(session, mix_id)
+    ok = job_manager.pause(mix_id)
+    if not ok:
+        raise HTTPException(409, "Mix này không đang render để tạm dừng.")
+    return {"status": "pausing", "mix_id": mix_id}
+
+
+@router.post("/mixes/{mix_id}/resume")
+def resume_mix(mix_id: int, session: Session = Depends(get_session)):
+    """Tiếp tục mix đang tạm dừng từ đúng bước đang dở."""
+    _get_mix_or_404(session, mix_id)
+    ok = job_manager.resume(mix_id)
+    if not ok:
+        raise HTTPException(409, "Mix này không đang tạm dừng để tiếp tục.")
+    return {"status": "resuming", "mix_id": mix_id}
+
+
 @router.get("/mixes/{mix_id}/progress")
 async def mix_progress(mix_id: int):
     async def event_generator():

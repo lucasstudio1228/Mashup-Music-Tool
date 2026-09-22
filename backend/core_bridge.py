@@ -261,13 +261,14 @@ def run_mix_job(
         pct = (written / total) if total else 0.0
         progress_cb(5, "Rendering audio", 58.0 + pct * 30.0)
 
+    # Duration là SOFT target: playlist đã dừng thêm bài ngay khi vượt target,
+    # nên KHÔNG cắt cứng — để bài nhạc cuối cùng phát trọn vẹn (hard_cut=False).
     timestamps = render_mix(
         playlist=playlist,
         output_path=output_wav,
         crossfade_sec=crossfade_seconds,
         target_sr=sample_rate,
         bit_depth=bit_depth,
-        target_seconds=target_seconds,
         progress_callback=render_progress,
         preloaded_audio=preloaded,    # ← key mới
     )

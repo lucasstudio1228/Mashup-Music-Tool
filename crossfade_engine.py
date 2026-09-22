@@ -102,6 +102,7 @@ def render_mix(
     target_seconds: float | None = None,
     progress_callback=None,
     preloaded_audio: dict | None = None,
+    hard_cut: bool = False,
 ) -> list[dict]:
     """
     Ghép playlist thành 1 file WAV lossless.
@@ -109,6 +110,10 @@ def render_mix(
     Với mỗi cặp track: bỏ phần dead-air ở đầu/đuôi (analyzer), rồi overlap đúng
     crossfade_sec bằng equal-power curve. Track đầu giữ nguyên fade-in, track
     cuối giữ nguyên fade-out.
+
+    Duration là SOFT target: playlist_generator dừng thêm bài ngay khi vượt
+    target, nên bài cuối luôn được phát TRỌN VẸN (không cắt giữa chừng). Chỉ khi
+    hard_cut=True mới cắt cứng đúng target_seconds (kèm fade-out ở điểm cắt).
 
     Returns: list timestamps {index, name, source_file, start_seconds, end_seconds}
     """
@@ -119,7 +124,8 @@ def render_mix(
         raise ValueError(f"bit_depth phải là 24 hoặc 32, nhận được {bit_depth}")
 
     crossfade_samples = max(int(crossfade_sec * target_sr), 1)
-    target_samples = int(target_seconds * target_sr) if target_seconds else None
+    target_samples = (int(target_seconds * target_sr)
+                      if (target_seconds and hard_cut) else None)
     estimated_total = sum(
         max(t.duration_seconds - crossfade_sec, 1.0) for t in playlist
     ) * target_sr

@@ -120,10 +120,11 @@ def main(input_path, duration, output, crossfade, sample_rate, bit_depth,
                 if total:
                     progress.update(task, completed=min(written / total * 1000, 1000))
 
+            # Soft target: bài cuối phát trọn vẹn, không cắt cứng giữa chừng.
             timestamps = render_mix(
                 playlist, str(out_path), crossfade_sec=crossfade,
                 target_sr=target_sr, bit_depth=bit_depth,
-                target_seconds=target_seconds, progress_callback=on_progress,
+                progress_callback=on_progress,
             )
             progress.update(task, completed=1000)
 

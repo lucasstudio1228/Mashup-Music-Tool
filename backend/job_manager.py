@@ -7,6 +7,7 @@ consume qua stream().
 """
 import asyncio
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
@@ -21,7 +22,7 @@ class JobCancelled(Exception):
 @dataclass
 class JobProgress:
     mix_id: int
-    status: str = "pending"       # pending|running|completed|failed|cancelled
+    status: str = "pending"       # pending|running|paused|completed|failed|cancelled
     step: int = 0                 # 1-6
     step_name: str = ""
     percent: float = 0.0
@@ -38,6 +39,7 @@ class JobManager:
         self._jobs: dict[int, JobProgress] = {}
         self._queues: dict[int, asyncio.Queue] = {}
         self._cancels: dict[int, threading.Event] = {}
+        self._pauses: dict[int, threading.Event] = {}
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -52,18 +54,43 @@ class JobManager:
             self._jobs[mix_id] = JobProgress(mix_id=mix_id, status="pending")
             self._queues.setdefault(mix_id, asyncio.Queue())
             self._cancels[mix_id] = threading.Event()
+            self._pauses[mix_id] = threading.Event()
         self._executor.submit(self._run, mix_id, fn, args, kwargs,
                               on_success, on_failure, on_cancel)
 
     def cancel(self, mix_id: int) -> bool:
         """Yêu cầu huỷ hợp tác: đặt cờ → progress callback kế tiếp ném
-        JobCancelled → job dừng. Trả True nếu job đang chạy/chờ để huỷ."""
+        JobCancelled → job dừng. Trả True nếu job đang chạy/chờ/tạm dừng."""
         with self._lock:
             job = self._jobs.get(mix_id)
             ev = self._cancels.get(mix_id)
-            if not job or not ev or job.status not in ("pending", "running"):
+            pause = self._pauses.get(mix_id)
+            if not job or not ev or job.status not in ("pending", "running", "paused"):
                 return False
             ev.set()
+            if pause is not None:
+                pause.set()   # đánh thức vòng chờ pause để nó thấy cờ huỷ
+            return True
+
+    def pause(self, mix_id: int) -> bool:
+        """Tạm dừng hợp tác: callback kế tiếp sẽ chặn tại bước hiện tại (giữ
+        nguyên state), resume tiếp tục ngay không phải render lại từ đầu."""
+        with self._lock:
+            job = self._jobs.get(mix_id)
+            pause = self._pauses.get(mix_id)
+            if not job or not pause or job.status != "running":
+                return False
+            pause.set()
+            return True
+
+    def resume(self, mix_id: int) -> bool:
+        """Bỏ chặn để job đang tạm dừng render tiếp từ đúng bước đang dở."""
+        with self._lock:
+            job = self._jobs.get(mix_id)
+            pause = self._pauses.get(mix_id)
+            if not job or not pause or job.status != "paused":
+                return False
+            pause.clear()
             return True
 
     def _run(self, mix_id, fn, args, kwargs, on_success, on_failure, on_cancel):
@@ -96,10 +123,24 @@ class JobManager:
 
     def _progress_callback(self, mix_id):
         ev = self._cancels.get(mix_id)
+        pause = self._pauses.get(mix_id)
 
         def callback(step: int, step_name: str, percent: float, message: str = ""):
             if ev is not None and ev.is_set():
                 raise JobCancelled()
+            # Tạm dừng: chặn tại bước này, giữ nguyên state; vẫn cho huỷ khi chờ.
+            if pause is not None and pause.is_set():
+                self._update(mix_id, status="paused",
+                             message="Đã tạm dừng — bấm Tiếp tục để render tiếp")
+                self._push_sse(mix_id, "progress", {
+                    "step": step, "step_name": step_name,
+                    "percent": round(percent, 1), "message": "Đã tạm dừng",
+                })
+                while pause.is_set():
+                    if ev is not None and ev.is_set():
+                        raise JobCancelled()
+                    time.sleep(0.3)
+                self._update(mix_id, status="running")
             self._update(mix_id, step=step, step_name=step_name,
                          percent=percent, message=message)
             self._push_sse(mix_id, "progress", {
@@ -122,13 +163,13 @@ class JobManager:
 
     def is_busy(self) -> bool:
         with self._lock:
-            return any(j.status in ("pending", "running")
+            return any(j.status in ("pending", "running", "paused")
                        for j in self._jobs.values())
 
     def active_count(self) -> int:
         with self._lock:
             return sum(1 for j in self._jobs.values()
-                       if j.status in ("pending", "running"))
+                       if j.status in ("pending", "running", "paused"))
 
     # ---------- SSE plumbing ----------
     def _get_queue(self, mix_id: int) -> asyncio.Queue:

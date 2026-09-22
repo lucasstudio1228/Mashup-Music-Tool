@@ -12,7 +12,7 @@ export function useMixes(projectId: number | undefined) {
     refetchInterval: (query) => {
       const data = query.state.data as Mix[] | undefined;
       const active = data?.some(
-        (m) => m.status === 'running' || m.status === 'pending',
+        (m) => m.status === 'running' || m.status === 'pending' || m.status === 'paused',
       );
       return active ? 2000 : false;
     },
@@ -36,6 +36,28 @@ export function useCancelMix(projectId: number) {
   return useMutation({
     mutationFn: async (mixId: number) =>
       (await api.post(`/api/mixes/${mixId}/cancel`)).data,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['mixes', projectId] });
+    },
+  });
+}
+
+export function usePauseMix(projectId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (mixId: number) =>
+      (await api.post(`/api/mixes/${mixId}/pause`)).data,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['mixes', projectId] });
+    },
+  });
+}
+
+export function useResumeMix(projectId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (mixId: number) =>
+      (await api.post(`/api/mixes/${mixId}/resume`)).data,
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['mixes', projectId] });
     },

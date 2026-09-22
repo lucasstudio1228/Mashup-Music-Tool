@@ -5,6 +5,7 @@ type Badge = { label: string; icon: string; cls: string };
 const CONFIG: Record<MixStatus, Badge> = {
   pending: { label: 'Pending', icon: '🕐', cls: 'bg-yellow-500/15 text-yellow-300' },
   running: { label: 'Running', icon: '🔄', cls: 'bg-blue-500/15 text-blue-300' },
+  paused: { label: 'Tạm dừng', icon: '⏸', cls: 'bg-amber-500/15 text-amber-300' },
   completed: { label: 'Completed', icon: '✅', cls: 'bg-green-500/15 text-green-300' },
   failed: { label: 'Failed', icon: '❌', cls: 'bg-red-500/15 text-red-300' },
   cancelled: { label: 'Đã huỷ', icon: '⛔', cls: 'bg-gray-500/15 text-gray-300' },
