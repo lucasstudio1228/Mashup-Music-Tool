@@ -1,8 +1,9 @@
 """
 video/service.py — Điều phối pipeline Video:
-  1) Tạo 20 ảnh liên kết (Gemini) → media/<project>/images/0..19.png
-  2) Tạo 20 clip 1:1 (Flow/Veo)   → media/<project>/clips/clip_00..19.mp4
-  3) Shuffle T+5 theo duration audio + ghép + gắn nhạc → media/<pid>/final/final.mp4
+  0) Chuẩn bị hồ sơ chung + prompt đầy đủ và kiểm tra chống trùng.
+  1) Tạo N ảnh liên kết (Gemini), N = config.PARAMS.image_count.
+  2) Tạo N clip 1:1 (Flow); clip 0 mở đầu duy nhất.
+  3) Shuffle theo t_window + fade + gắn nhạc → final/final.mp4.
 
 Chạy trong worker thread (Playwright sync API + ffmpeg).
 
@@ -37,126 +38,30 @@ def _resolve_prompts(
     idea: str | None,
     progress_cb: Callable[[str, float], None] | None = None,
     style_key: str | None = None,
-) -> Optional[dict]:
-    """
-    Quyết định bộ prompt tạo ảnh:
-      - CÓ ý tưởng → nhờ OpenAI (GPT) sinh prompt bám sát ý tưởng, lưu vào
-        images/prompts.json. Nếu đã có prompts.json từ ĐÚNG ý tưởng này thì tái
-        dùng. Nếu AI thất bại → RAISE (KHÔNG fallback về nhân vật mặc định, để
-        không tạo video lệch ý tưởng).
-      - KHÔNG có ý tưởng → tái dùng prompts.json cũ nếu có; nếu không → None
-        (driver dùng DEFAULT_PROMPTS = bộ phim mặc định).
-    """
-    def _log(m: str):
-        if progress_cb:
-            progress_cb(m, 1.0)
+    *,
+    allow_rebuild: bool = False,
+) -> dict:
+    from .prompt_workflow import prepare
+    saved = prepare(project_id, project_name, idea, style_key,
+                    log=lambda msg: progress_cb(msg, 1.0) if progress_cb else None,
+                    allow_rebuild=allow_rebuild)
+    return saved["prompts"]
 
-    img_dir = config.images_dir(project_id, project_name)
-    img_dir.mkdir(parents=True, exist_ok=True)
-    prompts_path = img_dir / "prompts.json"
-    idea = (idea or "").strip()
-    style_key = config.normalize_style(style_key)
 
-    def _cache_ok(saved: dict) -> bool:
-        # Cache chỉ dùng lại khi ĐÚNG phong cách + đúng phiên bản style hiện tại.
-        return (saved.get("style_version") == config.STYLE_VERSION
-                and config.normalize_style(saved.get("style_key")) == style_key)
+def step_prepare_prompts(project_id: int, progress_cb, project_name=None,
+                         idea=None, style_key=None) -> dict:
+    prompts = _resolve_prompts(project_id, project_name, idea, progress_cb, style_key)
+    progress_cb("Đã chuẩn bị và kiểm tra bộ prompt; chưa tạo ảnh/video.", 100)
+    return {"count": len(prompts)}
 
-    if not idea:
-        # Không có ý tưởng mới → dùng lại prompts.json nếu tồn tại VÀ đúng phong
-        # cách hiện tại. Cache phong cách cũ (vd 2D/photoreal) → bỏ, để driver
-        # rơi về DEFAULT_PROMPTS (đã kèm wrap_style 3D) thay vì body cũ.
-        if prompts_path.exists():
-            try:
-                saved = json.loads(prompts_path.read_text(encoding="utf-8"))
-                pr = saved.get("prompts")
-                if isinstance(pr, dict) and pr and _cache_ok(saved):
-                    _log("Dùng lại bộ prompt đã lưu từ ý tưởng trước.")
-                    return {str(k): v for k, v in pr.items()}
-                if isinstance(pr, dict) and pr:
-                    _log("Bộ prompt cũ khác phong cách hiện tại — bỏ qua cache.")
-            except Exception:
-                pass
-        return None
 
-    # Có ý tưởng mới → sinh prompt bằng OpenAI (GPT).
-    from backend.core_bridge import get_api_config_from_db
-    from backend.database import DB_PATH
-    from .prompt_gen import generate_prompts
-
-    # Nếu đã có prompts.json sinh từ ĐÚNG ý tưởng này → tái dùng (resume): giữ
-    # nhân vật nhất quán và khỏi gọi lại API. Cache khác ý tưởng thì BỎ, không
-    # được dùng vì sẽ lệch idea hiện tại.
-    if prompts_path.exists():
-        try:
-            saved = json.loads(prompts_path.read_text(encoding="utf-8"))
-            same_idea = (saved.get("idea") or "").strip() == idea
-            if same_idea and _cache_ok(saved):
-                pr = saved.get("prompts")
-                if isinstance(pr, dict) and pr:
-                    _log("Dùng lại bộ prompt đã sinh từ đúng ý tưởng này.")
-                    return {str(k): v for k, v in pr.items()}
-            elif same_idea:
-                # Đúng ý tưởng nhưng prompt sinh theo phong cách CŨ (vd đổi
-                # 2D↔3D) → sinh lại theo phong cách hiện tại.
-                _log("Ý tưởng khớp nhưng khác phong cách — sinh lại prompt.")
-        except Exception:
-            pass
-
-    P = config.PARAMS
-    title = (project_name or "Healing").strip()
-    result = generate_prompts(
-        idea=idea,
-        title=title,
-        keywords=_thumbnail_keywords(),
-        image_count=P.image_count,
-        aspect_ratio=P.aspect_ratio,
-        style=config.style_info(style_key)["brief"],
-        api_config=get_api_config_from_db(str(DB_PATH)),
-        log=lambda m: _log(m),
-    )
-    if result:
-        prompts, motions = result
-        # Bộ prompt lớn (vd 41 shot) thỉnh thoảng model bỏ sót / không đủ
-        # 'motions' trong 1 lượt → nếu để trống, flow_driver rơi về chuyển động
-        # camera GENERIC (mất anti-hallucination: khói/đầu-ngược/méo tay). Sinh
-        # BỔ SUNG motion bằng call riêng (nhỏ & ổn định hơn) từ chính prompt.
-        if len(motions) < P.image_count:
-            try:
-                from .prompt_gen import generate_motions_for_prompts
-                _log(f"Motion {len(motions)}/{P.image_count} — sinh bổ sung riêng…")
-                m2 = generate_motions_for_prompts(
-                    prompts=prompts, idea=idea,
-                    style=config.style_info(style_key)["brief"],
-                    api_config=get_api_config_from_db(str(DB_PATH)),
-                    log=lambda m: _log(m))
-                if m2 and len(m2) == P.image_count:
-                    motions = m2
-            except Exception:
-                pass
-        try:
-            prompts_path.write_text(
-                json.dumps({"idea": idea, "title": title,
-                            "style_version": config.STYLE_VERSION,
-                            "style_key": style_key,
-                            "prompts": prompts,
-                            "motions": motions},
-                           ensure_ascii=False, indent=2),
-                encoding="utf-8")
-        except Exception:
-            pass
-        return prompts
-
-    # QUAN TRỌNG — người dùng ĐÃ nhập ý tưởng nhưng AI không sinh được prompt.
-    # TUYỆT ĐỐI KHÔNG âm thầm fallback về DEFAULT_PROMPTS (nhân vật cabin/hoodie/
-    # mèo) vì sẽ tạo cả 20 ảnh + 20 clip SAI HOÀN TOÀN ý tưởng — đúng lỗi người
-    # dùng gặp. Dừng có thông báo rõ để họ kiểm tra API rồi thử lại.
-    raise RuntimeError(
-        "AI chưa viết được prompt từ ý tưởng của bạn nên đã DỪNG để tránh tạo "
-        "video sai nhân vật/bối cảnh. Hãy kiểm tra API key & model ở ⚙️ Settings "
-        "(model phải là GPT, vd gpt-4o-mini/gpt-4o), rồi bấm tạo lại. "
-        "Nếu muốn dùng bộ phim mặc định, hãy để trống ô ý tưởng."
-    )
+def _validate_saved_workflow(project_id: int, project_name: str | None) -> dict:
+    from .prompt_workflow import read_manifest, validate_manifest
+    saved = read_manifest(project_id, project_name)
+    if saved is None:
+        raise RuntimeError("Chưa có bộ prompt đã lưu. Hãy chuẩn bị prompt trước khi tạo media.")
+    validate_manifest(project_id, saved)
+    return saved
 
 
 def find_latest_audio(project_id: int,
@@ -245,7 +150,8 @@ def step_images(project_id: int,
     from .gemini_driver import generate_images
     style_key = config.normalize_style(style_key)
     prompts_override = _resolve_prompts(project_id, project_name, idea,
-                                        progress_cb, style_key)
+                                        progress_cb, style_key,
+                                        allow_rebuild=(mode == "restart"))
     # Ảnh 0 giữ SẠCH (không chữ). Tiêu đề chỉ overlay ở bước ghép video
     # (step_assemble) lên clip intro + thumbnail.png — tránh chữ nướng sẵn bị
     # Veo tạo lại thành bóng ma/chồng chéo với overlay ghép.
@@ -262,6 +168,7 @@ def step_clips(project_id: int,
     # mode="resume": giữ clip đã tạo, chỉ tạo tiếp clip còn thiếu.
     # style_key: "2d"/"3d" → gợi ý phong cách gắn vào prompt chuyển động.
     from .flow_driver import generate_clips
+    _validate_saved_workflow(project_id, project_name)
     return generate_clips(project_id, config.PARAMS, progress_cb,
                           resume=(mode == "resume"), project_name=project_name,
                           style=config.normalize_style(style_key))
@@ -294,7 +201,7 @@ def regen_image(project_id: int,
     lưu để nhân vật/bối cảnh vẫn khớp cả bộ."""
     from .gemini_driver import generate_images
     style_key = config.normalize_style(style_key)
-    prompts_override = _load_saved_prompts(project_id, project_name)
+    prompts_override = _validate_saved_workflow(project_id, project_name)["prompts"]
     return generate_images(
         project_id, (project_name or "Healing"), config.PARAMS, progress_cb,
         project_name=project_name, prompts_override=prompts_override,
@@ -309,6 +216,7 @@ def regen_clip(project_id: int,
     """Tạo lại ĐÚNG 1 clip (ghi đè), GIỮ NGUYÊN mọi clip khác. Cần _plan.json
     hợp lệ (flow_driver sẽ báo lỗi rõ nếu thiếu) để giữ ánh xạ ảnh↔clip 1:1."""
     from .flow_driver import generate_clips
+    _validate_saved_workflow(project_id, project_name)
     return generate_clips(
         project_id, config.PARAMS, progress_cb, project_name=project_name,
         style=config.normalize_style(style_key), only=[int(index)])
@@ -357,9 +265,10 @@ def regen_motions(project_id: int,
             "Settings rồi thử lại).")
 
     saved["motions"] = motions
+    from .prompt_workflow import validate_manifest, save_manifest
+    saved["prompt_hashes"] = validate_manifest(project_id, saved, len(prompts))
     try:
-        prompts_path.write_text(
-            json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
+        save_manifest(prompts_path, saved)
     except Exception as e:
         raise RuntimeError(f"Không lưu được motion mới ({e}).")
     _log(f"Đã cập nhật {len(motions)} prompt chuyển động — tạo clip lần sau sẽ dùng.")

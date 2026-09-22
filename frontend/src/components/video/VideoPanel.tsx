@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   useVideoStatus, useGenImages, useGenClips, useAssemble, useRunAll, useRebuild,
   useRegenImage, useRegenClip, useRegenMotions, useVideoStyles,
+  usePreparePrompts, usePromptManifest,
   useUploadYoutube, useYoutubeHistory,
   videoDownloadUrl, videoThumbnailUrl, videoImageUrl, videoClipUrl,
 } from "../../api/video";
@@ -46,6 +47,8 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
   const { data: styleData } = useVideoStyles(projectId);
   const updateProject = useUpdateProject(projectId);
   const genImages = useGenImages(projectId);
+  const preparePrompts = usePreparePrompts(projectId);
+  const { data: promptData, refetch: refetchPrompts, error: promptError } = usePromptManifest(projectId);
   const genClips  = useGenClips(projectId);
   const assemble  = useAssemble(projectId);
   const runAll    = useRunAll(projectId);
@@ -67,8 +70,9 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
     if (jobStatus === "completed") {
       setBust(Date.now());
       refetchYtHistory();   // cập nhật lịch sử đăng nháp sau khi job xong
+      refetchPrompts();
     }
-  }, [jobStatus, refetchYtHistory]);
+  }, [jobStatus, refetchYtHistory, refetchPrompts]);
   // Nhạc cụ + phong cách nhạc (dùng để tra kênh YouTube khi đăng nháp).
   const [instrument, setInstrument] = useState("");
   const [musicStyle, setMusicStyle] = useState("");
@@ -104,6 +108,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
   const warn = `${btn} border border-amber-500/30 bg-amber-950/20 text-amber-300 hover:bg-amber-950/40`;
 
   const kindLabel: Record<string, string> = {
+    prompts: "Đang chuẩn bị hồ sơ và bộ prompt",
     images: "Đang tạo ảnh", clips: "Đang tạo clip",
     assemble: "Đang ghép video", full: "Đang chạy toàn bộ",
     rebuild: "Đang tạo lại video từ ảnh",
@@ -116,6 +121,39 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
 
   return (
     <div className="space-y-6">
+    <Section title="Hồ sơ sáng tạo và bộ prompt">
+      <p className="mb-3 text-sm text-gray-400">
+        Một hồ sơ chung cho nhạc, nhân vật và bối cảnh. Tool khoá bố cục, viết đủ cặp ảnh–motion,
+        kiểm tra trùng prompt giữa project và lưu lại để chạy tiếp. Bước này chỉ dùng AI viết chữ,
+        chưa tạo nhạc, ảnh hoặc video. Khi bấm tạo ảnh, Tool cũng tự thực hiện bước này.
+      </p>
+      <button className={ghost} disabled={busy || preparePrompts.isPending || ideaDirty}
+        onClick={() => preparePrompts.mutate({ idea })}>
+        Chuẩn bị / kiểm tra bộ prompt
+      </button>
+      {ideaDirty && <p className="mt-2 text-xs text-amber-300">Lưu ý tưởng bên dưới trước khi chuẩn bị prompt.</p>}
+      {(preparePrompts.error || promptError) && <p className="mt-2 text-sm text-red-300">
+        {String((preparePrompts.error || promptError) as Error)}
+      </p>}
+      {promptData?.manifest && <details className="mt-3 text-sm">
+        <summary className="cursor-pointer text-accent">
+          Xem bộ đã lưu: {Object.keys(promptData.manifest.prompts ?? {}).length} ảnh / {Object.keys(promptData.manifest.motions ?? {}).length} motion
+          {!promptData.manifest.workflow_version && " (bộ cũ)"}
+        </summary>
+        <p className="my-2 text-xs text-amber-200">Kiểm tra đủ cấu trúc không bảo đảm đầu ra giống tuyệt đối; duyệt ảnh và nhạc mẫu trước khi chạy cả bộ.</p>
+        {promptData.manifest.continuity && <div className="my-3 whitespace-pre-wrap text-gray-300">
+          <p>{promptData.manifest.continuity.character_sheet}</p>
+          <p className="mt-2">{promptData.manifest.continuity.scene_sheet}</p>
+        </div>}
+        <div className="max-h-96 space-y-3 overflow-y-auto">
+          {Object.entries(promptData.manifest.prompts ?? {}).map(([key, value]) => <details key={key}>
+            <summary className="cursor-pointer">Ảnh {key} / motion tương ứng{key === "0" ? " — mở đầu duy nhất" : ""}</summary>
+            <p className="whitespace-pre-wrap text-gray-400">{value}</p>
+            <p className="mt-2 whitespace-pre-wrap text-blue-200">{promptData.manifest?.motions?.[key] ?? "Thiếu motion"}</p>
+          </details>)}
+        </div>
+      </details>}
+    </Section>
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
       {/* Cột trái: trạng thái + tiến độ */}
       <div className="space-y-4">

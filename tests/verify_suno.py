@@ -135,15 +135,16 @@ def test_resolve_config():
     results = []
     presets = suno_service.vconfig.SUNO_PRESETS
 
-    # Mặc định (không override) → preset relaxing_flute, Styles/Exclusions nguyên văn.
+    # Mặc định đi theo config hiện tại, không hard-code preset đã bị bỏ.
+    default_preset = suno_service.vconfig.SUNO.preset
     cfg = suno_service.resolve_batch_config(None)
     results.append(("resolve_batch_config(None) chạy được", isinstance(cfg, dict)))
-    results.append(("preset mặc định = relaxing_flute",
-                    cfg["preset"] == "relaxing_flute", cfg.get("preset")))
+    results.append(("preset mặc định khớp config",
+                    cfg["preset"] == default_preset, cfg.get("preset")))
     results.append(("Styles nguyên văn khớp preset",
-                    cfg["styles"] == presets["relaxing_flute"]["styles"]))
+                    cfg["styles"] == presets[default_preset]["styles"]))
     results.append(("Exclusions nguyên văn khớp preset",
-                    cfg["exclusions"] == presets["relaxing_flute"]["exclusions"]))
+                    all(token.strip() in cfg["exclusions"] for token in presets[default_preset]["exclusions"].split(","))))
     results.append(("target_tracks mặc định = 15", cfg["target_tracks"] == 15))
     results.append(("preferred_model mặc định = v6", cfg["preferred_model"] == "v6"))
     results.append(("instrumental = True", cfg["instrumental"] is True))
@@ -151,13 +152,12 @@ def test_resolve_config():
 
     # Override: đổi preset + target + model.
     cfg2 = suno_service.resolve_batch_config({
-        "preset": "lofi_ambient", "target_tracks": 8, "preferred_model": "v5",
+        "preset": "lofi", "target_tracks": 8, "preferred_model": "v5",
         "max_generation_credits": 42,
     })
-    results.append(("override preset = lofi_ambient",
-                    cfg2["preset"] == "lofi_ambient"))
-    results.append(("override Styles theo lofi_ambient",
-                    cfg2["styles"] == presets["lofi_ambient"]["styles"]))
+    results.append(("override preset = lofi", cfg2["preset"] == "lofi"))
+    results.append(("override Styles theo lofi",
+                    cfg2["styles"] == presets["lofi"]["styles"]))
     results.append(("override target_tracks = 8", cfg2["target_tracks"] == 8))
     results.append(("override preferred_model = v5", cfg2["preferred_model"] == "v5"))
     results.append(("override max_generation_credits = 42",

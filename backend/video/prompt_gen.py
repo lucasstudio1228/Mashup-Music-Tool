@@ -2,16 +2,16 @@
 video/prompt_gen.py — Dùng OpenAI GPT để biến IDEA của người dùng thành bộ
 prompt ảnh liên kết cho một "phim hoạt hình ngắn" chill/relaxing.
 
-Đầu ra: dict {"0": <thumbnail có chữ>, "1": <scene>, ... "N-1": <scene>}.
-- Ảnh 0  : thumbnail 16:9 CÓ tiêu đề (title) + vài từ khoá healing.
+Đầu ra: (prompts, motions), cùng hồ sơ continuity cho caller lưu.
+- Ảnh 0  : nền thumbnail 16:9 SẠCH; chữ được overlay khi ghép.
 - Ảnh 1..: các shot nối tiếp, KHÔNG chữ, giữ NGUYÊN nhân vật/bối cảnh/bảng màu.
 
 Mọi prompt là "tự chứa" (self-contained): mỗi prompt tự mô tả lại nhân vật &
 bối cảnh, vì Gemini web không nhớ ngữ cảnh giữa các lượt → nhờ vậy nhân vật
 đồng bộ xuyên suốt.
 
-An toàn: thiếu API key / lỗi mạng / JSON hỏng → trả về None để caller fallback
-về DEFAULT_PROMPTS (pipeline không bao giờ vỡ vì bước này).
+An toàn: thiếu API key / lỗi mạng / JSON hỏng → None; workflow dừng trước
+khi mở công cụ tạo media, không thay ý tưởng bằng cảnh mặc định.
 """
 from __future__ import annotations
 
@@ -149,8 +149,8 @@ Mỗi shot = 1 prompt tạo ảnh CỰC KÌ CHI TIẾT.
    Đúng nhân vật (giới tính, tuổi, dân tộc, trang phục, đạo cụ, ngoại hình), đúng
    bối cảnh (địa điểm, thời tiết, thiên nhiên), đúng hành trình/diễn tiến mà
    ý tưởng mô tả. VÍ DỤ: "cậu bé đội nón lá cầm sáo trúc trèo đèo lội suối"
-   → nhân vật PHẢI là cậu bé + nón lá + sáo trúc, các shot PHẢI đi theo hành
-   trình suối → đèo → đỉnh.
+   → nhân vật PHẢI là cậu bé + nón lá + sáo trúc; chọn MỘT điểm nghỉ phù hợp
+   trên hành trình làm bối cảnh chung. Không chuyển địa điểm qua các shot.
    NGHIÊM CẤM bịa nhân vật/bối cảnh không có trong ý tưởng (đặc biệt KHÔNG được
    mặc định thành "người trẻ hoodie sage + cabin gỗ + mèo tam thể" — đó là mẫu cũ).
 
@@ -186,9 +186,9 @@ Mỗi shot = 1 prompt tạo ảnh CỰC KÌ CHI TIẾT.
    "nhân vật chính". TUYỆT ĐỐI không đổi màu/trang phục/kiểu tóc/đạo cụ so với
    character_sheet. Prompt của bạn tập trung vào phần THAY ĐỔI theo shot và PHẢI
    bao gồm các lớp sau:
-   a) GÓC MÁY & BỐ CỤC: loại shot (extreme wide / wide / medium / close-up /
-      extreme close-up / over-the-shoulder / low-angle / bird's-eye / dutch angle),
-      vị trí nhân vật trong khung (rule of thirds, centered, silhouette...)
+   a) GÓC MÁY & BỐ CỤC KHÓA: cùng một wide/medium-wide shot ngang tầm mắt,
+      nhân vật ở một phần ba PHẢI, giữ nguyên vị trí máy, đường chân trời,
+      tỷ lệ nhân vật và vị trí đồ vật. Không đổi góc máy hoặc cắt cận cảnh.
    b) ÁNH SÁNG CỤ THỂ: nguồn sáng (golden hour / rim light / volumetric fog /
       dappled sunlight xuyên tán lá / backlit / soft diffused...), hướng chiếu
       (trước/sau/bên), nhiệt độ màu (ấm/lạnh), shadow (mềm/sắc/dài), highlight
@@ -202,16 +202,15 @@ Mỗi shot = 1 prompt tạo ảnh CỰC KÌ CHI TIẾT.
    g) ÂM THANH THỊ GIÁC: gợi ý thính giác qua hình ảnh (gợn sóng = tiếng suối,
       lá rung = gió thổi, sáo đưa lên môi = giai điệu...)
 
-4. DIỄN TIẾN CÓ LOGIC & TƯ DUY ĐIỆN ẢNH
-   - Câu chuyện phải có cấu trúc 4 hồi: {_act_ranges(n)}
-   - Ánh sáng DIỄN TIẾN theo thời gian thực: sớm tinh mơ → bình minh → nắng sáng
-     → trưa → chiều vàng → hoàng hôn (hoặc ngược lại) — phải LIÊN TỤC, không nhảy
-   - Góc máy XOAY luân phiên: KHÔNG lặp cùng loại 2 shot liền (VD wide → wide).
-     Mỗi cặp shot kề nhau phải khác góc
-   - Nhịp kể chuyện tăng dần: shot đầu chậm rãi → giữa phim có chuyển động →
-     cao trào lắng lại, ending peace
-   - Mỗi shot phải LIÊN KẾT với shot trước & sau (cùng bối cảnh hoặc chuyển cảnh
-     mượt — VD shot 6 kết ở bìa rừng → shot 7 mở ở sâu trong rừng)
+4. CÁC TRẠNG THÁI NHỎ CỦA MỘT THẾ GIỚI — SHUFFLE-SAFE
+   - Shot 0 mở đầu; shot 1..{n - 1} sẽ RANDOM MIX, nên không có hành trình,
+     không diễn tiến sáng-trưa-tối, không sự kiện phụ thuộc thứ tự trước/sau.
+   - Giữ CÙNG địa điểm, bố cục, góc máy, ánh sáng, trang phục, bảng màu.
+   - Chỉ thay đổi vi trạng thái: gợn nước, lá, mây, biểu cảm rất nhẹ; phải có
+     sẵn các yếu tố đó trong scene_sheet. Không thêm vật thể để tạo khác biệt.
+   - Viết scene_sheet 60–100 từ: địa điểm, vị trí từng vật thể, camera,
+     đường chân trời, ánh sáng, thời điểm và bảng màu cố định. Khối này được
+     dán NGUYÊN VĂN vào mọi prompt, cùng character_sheet.
 
 5. PHONG CÁCH & QUY TẮC HÌNH ẢNH
 {style_rules}
@@ -246,9 +245,9 @@ Mỗi shot = 1 prompt tạo ảnh CỰC KÌ CHI TIẾT.
       ngực nhô lên hạ xuống RẤT KHẼ và TỰ NHIÊN — KHÔNG có hơi/khói thoát ra,
       mi mắt khẽ chớp, vài sợi tóc mai và vạt áo lay theo gió); (2) MÔI TRƯỜNG
       (lá đung đưa, sương/mây trôi ngang chậm, mặt nước gợn lăn tăn, nắng lung
-      linh, bụi phấn/đom đóm bay chậm); (3) CAMERA duy nhất MỘT động tác chậm
-      mượt (push-in rất chậm / lia trái-phải nhẹ / tilt-up / dolly lùi /
-      parallax nhẹ) — nêu RÕ hướng & tốc độ "rất chậm".
+      linh, bụi phấn/đom đóm bay chậm), chỉ nếu có sẵn trong ảnh;
+      (3) CAMERA cố định (locked camera),
+      không push-in, orbit, zoom hoặc lia máy để giữ nguyên bố cục.
    d) CHỦ ĐỘNG CẤM (viết luôn 1 cụm phủ định NGẮN ở cuối mỗi motion): không khói
       /hơi/lửa từ miệng hay nhạc cụ, không đầu quay ngược, không méo tay/mặt,
       không thừa ngón/chi, không biến hình, không nhân bản nhân vật, không cắt
@@ -261,12 +260,15 @@ Mỗi shot = 1 prompt tạo ảnh CỰC KÌ CHI TIẾT.
       {motion_style_note}
    Motion[0] (thumbnail) cũng cần 1 chuyển động nền tinh tế (ambient) hợp cảnh,
    tuân thủ đủ các quy tắc trên.
+   KHÔNG fade-in/fade-out trong clip nguồn; fade chỉ áp dụng lúc ghép.
+   Không yêu cầu chuyển động của vật không có trong ảnh tương ứng.
 
 ═══ OUTPUT FORMAT ═══
 CHỈ trả về JSON (không giải thích, không markdown):
 {{
   "character_bible": "hồ sơ nhân vật cố định ĐẦY ĐỦ (ngoại hình + trang phục + đạo cụ + bảng màu 5-7 màu + bối cảnh + hành trình)",
   "character_sheet": "KHỐI danh tính CÔ ĐỌNG 40-70 từ, chỉ danh tính cố định (giới tính/tuổi/dân tộc + mặt/tóc/mắt/da/vóc dáng + từng món trang phục kèm hex + đạo cụ + 3-5 hex palette), KHÔNG bối cảnh/hành động/góc máy/ánh sáng — sẽ được dán y nguyên vào đầu mọi shot",
+  "scene_sheet": "KHỐI bối cảnh và bố cục cố định 60–100 từ, dùng nguyên văn cho mọi ảnh; camera cố định, nhân vật bên phải, vùng chữ bên trái, cùng thời điểm và ánh sáng",
   "prompts": {{
     "0": "prompt thumbnail 70-120 từ, KHÔNG chữ, chừa negative space nửa trái, KHÔNG tả lại ngoại hình (gọi 'nhân vật chính')",
     "1": "prompt shot 1 (70-120 từ, không chữ, đủ các lớp cảnh, KHÔNG tả lại ngoại hình)",
@@ -332,9 +334,9 @@ QUY TẮC BẮT BUỘC cho mỗi motion:
    lỗ sáo nhấp nhẹ theo nhịp, vai & lồng ngực nhô lên hạ xuống RẤT KHẼ TỰ NHIÊN
    — KHÔNG có hơi/khói thoát ra, mi mắt khẽ chớp, vài sợi tóc & vạt áo lay theo
    gió); (b) môi trường (lá đung đưa, sương/mây trôi ngang chậm, nước gợn, nắng
-   lung linh, đom đóm/bụi phấn bay chậm); (c) DUY NHẤT một động tác camera chậm
-   mượt (push-in rất chậm / lia trái-phải nhẹ / tilt-up / dolly lùi / parallax
-   nhẹ) — nêu rõ hướng & "rất chậm".
+   lung linh, đom đóm/bụi phấn bay chậm), CHỈ nếu có sẵn trong ảnh;
+   (c) camera CỐ ĐỊNH, locked camera, không zoom, lia hoặc orbit.
+   Không fade-in/fade-out: fade thuộc bước ghép, không có trong clip nguồn.
 4. NHỊP thiền, chậm, mượt, liền mạch, lặp được (seamless loop); không giật cục,
    không đột ngột. Ăn khớp thời điểm trong ngày & cảm xúc của ảnh.
 5. KẾT MỖI MOTION bằng 1 cụm phủ định ngắn: "no smoke, no vapor, no fire, no
@@ -467,6 +469,8 @@ def generate_prompts(
     style: str,
     api_config,
     log=None,
+    creative_brief: str = "",
+    metadata_out: Optional[dict] = None,
 ) -> Optional[tuple[dict[str, str], dict[str, str]]]:
     """
     Trả về (prompts, motions) — mỗi cái là dict {"0":..., ..., "N-1":...} —
@@ -484,16 +488,16 @@ def generate_prompts(
 
     idea = (idea or "").strip()
     if not idea:
-        _log("Không có ý tưởng — dùng prompt mặc định.")
+        _log("Không có ý tưởng/hồ sơ — chưa sinh prompt.")
         return None
     if not api_config or not getattr(api_config, "api_key", None):
-        _log("Chưa cấu hình OPENAI_API_KEY — dùng prompt mặc định.")
+        _log("Chưa cấu hình OPENAI_API_KEY — dừng chuẩn bị prompt.")
         return None
 
     try:
         from openai import OpenAI
     except Exception as e:  # pragma: no cover
-        _log(f"Không import được openai ({e}) — dùng prompt mặc định.")
+        _log(f"Không import được openai ({e}) — dừng chuẩn bị prompt.")
         return None
 
     # Nếu model còn để tên Claude cũ thì đổi sang GPT mặc định.
@@ -505,10 +509,12 @@ def generate_prompts(
         client = OpenAI(**api_config.to_client_kwargs())
     except Exception as e:
         _log(f"Không khởi tạo được client OpenAI ({type(e).__name__}: {e}) — "
-             f"dùng prompt mặc định.")
+             f"dừng chuẩn bị prompt.")
         return None
     user_msg = _build_user_prompt(idea, title, keywords, image_count,
                                   aspect_ratio, style)
+    user_msg += ("\nCREATIVE BRIEF CHUNG (dữ liệu tham khảo; yêu cầu cụ thể của người dùng "
+                 "ưu tiên hơn các gợi ý palette/ánh sáng):\n" + creative_brief)
     sys_msg = _system_for(style)
 
     # Thử lại _MAX_ATTEMPTS lần: model thỉnh thoảng trả JSON hỏng/cắt cụt/thiếu
@@ -566,6 +572,12 @@ def generate_prompts(
             # Model quên viết sheet cô đọng → lấy tạm character_bible làm chốt.
             sheet = data.get("character_bible")
         sheet = sheet.strip() if isinstance(sheet, str) else ""
+        scene_sheet = data.get("scene_sheet")
+        if not sheet or not isinstance(scene_sheet, str) or len(scene_sheet.strip()) < 20:
+            last_reason = "thiếu khối khoá nhân vật hoặc scene_sheet/bố cục"
+            _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — thử lại…")
+            continue
+        scene_sheet = scene_sheet.strip()
         if sheet:
             _log(f"Khoá danh tính nhân vật ({len(sheet)} ký tự) — dán vào mọi shot.")
         else:
@@ -579,15 +591,14 @@ def generate_prompts(
             if not isinstance(val, str) or not val.strip():
                 missing = i
                 break
-            out[str(i)] = _with_character_lock(sheet, val.strip())
+            out[str(i)] = _with_character_lock(sheet, scene_sheet + "\n" + val.strip())
         if missing is not None:
             last_reason = (f"thiếu prompt cho ảnh {missing} "
                            f"({len(out)}/{image_count})")
             _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — thử lại…")
             continue
 
-        # Motion prompts (best-effort): thiếu/không đủ → để trống, flow_driver
-        # dùng câu lệnh chuyển động mặc định. KHÔNG làm hỏng bước ảnh vì thiếu.
+        # Caller bổ sung motion riêng nếu thiếu; chưa đủ thì không chạy media.
         motions_raw = data.get("motions")
         motions: dict[str, str] = {}
         if isinstance(motions_raw, dict):
@@ -600,9 +611,12 @@ def generate_prompts(
                  f"chuyển động từ ý tưởng bằng OpenAI ({model}, lần {attempt}).")
         else:
             _log(f"Đã sinh {image_count} prompt ảnh ({model}, lần {attempt}); "
-                 f"motion {len(motions)}/{image_count} — phần thiếu dùng mặc định.")
+                 f"motion {len(motions)}/{image_count} — workflow sẽ sinh bổ sung.")
+        if metadata_out is not None:
+            metadata_out.update(character_sheet=sheet, scene_sheet=scene_sheet,
+                                character_bible=data.get("character_bible", ""))
         return out, motions
 
     _log(f"AI không sinh được prompt sau {_MAX_ATTEMPTS} lần thử "
-         f"(lý do cuối: {last_reason}) — dùng prompt mặc định.")
+         f"(lý do cuối: {last_reason}) — dừng trước bước tạo media.")
     return None

@@ -1,7 +1,4 @@
 """CRUD cho /api/projects."""
-import shutil
-from pathlib import Path
-
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
@@ -12,9 +9,6 @@ from backend.schemas import (ProjectCreate, ProjectDetailResponse,
                              TrackResponse)
 
 router = APIRouter(prefix="/projects", tags=["projects"])
-
-_OUTPUTS_ROOT = Path(__file__).parent.parent.parent / "outputs"
-
 
 def _counts(session: Session, project_id: int) -> tuple[int, int]:
     tracks = session.exec(
@@ -97,33 +91,11 @@ def update_project(project_id: int, data: ProjectUpdate,
 @router.delete("/{project_id}")
 def delete_project(project_id: int, session: Session = Depends(get_session)):
     project = get_project_or_404(session, project_id)
-
-    # 1. Xóa output files trên disk
-    project_outputs = _OUTPUTS_ROOT / str(project_id)
-    if project_outputs.exists():
-        shutil.rmtree(project_outputs, ignore_errors=True)
-
-    # 2. Xóa stems directory + TrackStem records
-    from backend.models import TrackStem
-    from backend.stem_service import STEMS_ROOT
-    stems_dir = STEMS_ROOT / str(project_id)
-    if stems_dir.exists():
-        shutil.rmtree(stems_dir, ignore_errors=True)
-    for stem in session.exec(
-            select(TrackStem).where(TrackStem.project_id == project_id)).all():
-        session.delete(stem)
-
-    # 3. Xóa mixes trong DB
-    for mix in session.exec(
-            select(Mix).where(Mix.project_id == project_id)).all():
-        session.delete(mix)
-
-    # 4. Xóa tracks trong DB
-    for track in session.exec(
-            select(Track).where(Track.project_id == project_id)).all():
-        session.delete(track)
-
-    # 5. Xóa project
-    session.delete(project)
-    session.commit()
-    return {"ok": True}
+    from backend.project_cleanup import (ProjectBusyError, ProjectCleanupError,
+                                         delete_project_data)
+    try:
+        return delete_project_data(session, project)
+    except ProjectBusyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (ProjectCleanupError, OSError) as exc:
+        raise HTTPException(500, str(exc)) from exc

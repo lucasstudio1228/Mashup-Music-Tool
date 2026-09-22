@@ -72,6 +72,19 @@ export function useYoutubeHistory(projectId: number) {
 }
 
 export const useGenImages = (pid: number) => useVideoAction(pid, "images");
+export const usePreparePrompts = (pid: number) => useVideoAction(pid, "prompts/prepare");
+export function usePromptManifest(pid: number) {
+  return useQuery<{ manifest: null | {
+    workflow_version?: number;
+    prompts?: Record<string, string>;
+    motions?: Record<string, string>;
+    continuity?: { character_sheet?: string; scene_sheet?: string };
+    creative_brief?: { music?: string; visual?: string };
+  } }>({
+    queryKey: ["prompt-manifest", pid],
+    queryFn: async () => (await api.get(`${base(pid)}/prompts`)).data,
+  });
+}
 export const useGenClips  = (pid: number) => useVideoAction(pid, "clips");
 export const useAssemble  = (pid: number) => useVideoAction(pid, "assemble");
 export const useRunAll    = (pid: number) => useVideoAction(pid, "run-all");

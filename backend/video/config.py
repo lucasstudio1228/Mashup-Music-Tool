@@ -408,19 +408,26 @@ def wrap_style(prompt: str, style: str | None = None) -> str:
 
 # ── Prompt sinh ảnh (chỉnh theo ý muốn) ─────────────────────────
 # {topic} = tên project / chủ đề nhạc.  Ảnh 0 là thumbnail.
-# 20 ảnh là 20 shot của CÙNG một phim hoạt hình chill. Gemini tạo tuần tự trong
-# một cuộc trò chuyện nên mọi prompt sau đều yêu cầu dùng ảnh trước làm reference.
+# 41 ảnh là 41 biến thể của CÙNG một bố cục phim hoạt hình chill. Mỗi prompt
+# tự chứa danh tính + bố cục, kể cả khi Gemini mở chat mới; không dựa vào trí
+# nhớ hội thoại. Ảnh 0 sạch chữ: tiêu đề thật được chèn ở bước thumbnail/intro.
 _CONTINUITY = (
     "Đây là shot tiếp theo của CÙNG MỘT phim hoạt hình chill chủ đề '{topic}'. "
     "Giữ chính xác CÙNG nhân vật chính: một người trẻ tóc đen ngắn hơi rối, "
     "áo hoodie xanh sage rộng, quần kem, giày trắng và tai nghe màu be; giữ "
     "nguyên khuôn mặt, vóc dáng, trang phục và tỉ lệ nhân vật ở mọi shot. Giữ "
     "CÙNG bối cảnh: căn cabin gỗ cạnh hồ trong thung lũng rừng thông, cửa sổ "
-    "lớn, bàn gỗ, đèn vàng, cây cảnh, cốc trà và chú mèo tam thể. Cùng thiết "
-    "kế kiến trúc, vị trí đồ vật, bảng màu xanh sage–kem–vàng hổ phách, ánh "
-    "sáng hoàng hôn chuyển dần sang đêm. Cinematic 2D/3D animation, nét mềm, "
-    "cozy, lofi, serene, khung hình 16:9. Dùng các ảnh đã tạo trước trong cuộc "
-    "trò chuyện làm tham chiếu continuity nghiêm ngặt. KHÔNG thêm nhân vật mới, "
+    "lớn, bàn gỗ, đèn vàng, cây cảnh, cốc trà và chú mèo tam thể. BỐ CỤC KHÓA: "
+    "wide shot ngang tầm mắt, góc nhìn ba phần tư từ cùng một vị trí trong "
+    "cabin; nhân vật ngồi bên bàn ở một phần ba PHẢI, mèo cuộn tròn trên bệ "
+    "cửa sổ bên phải nhân vật, cốc trà bên trái bàn, đèn phía sau cốc, cây "
+    "cảnh ở mép phải; hồ, rừng thông và núi nhìn qua cửa sổ chiếm nửa TRÁI. "
+    "Không di chuyển camera, nhân vật, đồ vật hoặc kiến trúc. Cùng bảng màu "
+    "xanh sage–kem–vàng hổ phách, cùng hoàng hôn dịu; chỉ biến thiên cực nhỏ "
+    "của ánh sáng và thiên nhiên. Nét mềm, cozy, lofi, serene, relaxing, "
+    "meditation, khung hình 16:9; tư thế nghỉ bình yên và nhịp rất chậm. "
+    "Khi có ảnh tham chiếu, giữ continuity đúng ảnh đó; mọi đặc điểm khóa "
+    "ở trên vẫn bắt buộc kể cả trong chat mới. KHÔNG thêm nhân vật mới, "
     "KHÔNG đổi trang phục, KHÔNG chữ, logo hay watermark. "
 )
 
@@ -430,35 +437,47 @@ def _scene(description: str) -> str:
 
 
 DEFAULT_PROMPTS: dict[str, str] = {
-    "0": (
-        "Tạo thumbnail YouTube 16:9 mở đầu cho phim hoạt hình chill chủ đề "
-        "'{topic}'. Nhân vật chính tóc đen ngắn hơi rối, áo hoodie xanh sage, "
-        "quần kem, giày trắng, tai nghe be đang ngồi bên cửa sổ lớn trong cabin "
-        "gỗ cạnh hồ; mèo tam thể nằm bên cạnh, rừng thông và núi phản chiếu ngoài "
-        "hồ lúc hoàng hôn. Cozy cinematic animation, màu sage–kem–vàng hổ phách. "
-        "BẮT BUỘC có typography tiếng Anh rõ, đúng chính tả: tiêu đề lớn "
-        "\"{topic}\" và dòng phụ \"{keywords}\". Chữ dễ đọc, tương phản tốt, "
-        "không che mặt nhân vật. Không logo, không watermark."
-    ),
-    "1": _scene("Extreme-wide establishing shot từ trên cao: cabin, hồ, rừng thông và dãy núi; nhân vật nhỏ đang đi về cabin, lá và mây gợi chuyển động rất chậm."),
-    "2": _scene("Wide shot ngang mặt hồ: nhân vật đi trên cầu gỗ về cabin, mèo chờ ở hiên; gợn nước và cỏ lay nhẹ, bố cục nối tiếp shot trước."),
-    "3": _scene("Wide interior shot qua cửa cabin: nhân vật đặt ba lô xuống đúng cạnh bàn, mèo bước theo; hồ và rừng vẫn thấy qua cửa sổ lớn."),
-    "4": _scene("Medium shot: nhân vật bật chiếc đèn bàn vàng bên cửa sổ, ánh sáng ấm dần lan trên bàn gỗ; giữ nguyên mọi vật thể và hướng ánh sáng."),
-    "5": _scene("Close-up đôi tay nhân vật pha trà trong cùng chiếc cốc, hơi nước uốn chậm; tai nghe be và tay áo hoodie sage hiện rõ."),
-    "6": _scene("Medium-wide shot: nhân vật ngồi vào bàn, đeo tai nghe và mở sổ; mèo cuộn tròn bên mép cửa sổ, hoàng hôn ngoài hồ đậm hơn."),
-    "7": _scene("Over-the-shoulder shot từ sau vai nhân vật nhìn ra sổ và mặt hồ; bút di chuyển trên trang giấy, rèm cửa lay rất nhẹ."),
-    "8": _scene("Close-up nghiêng gương mặt CÙNG nhân vật, biểu cảm bình yên và tập trung; phản chiếu rừng thông trên kính cửa, bokeh ấm."),
-    "9": _scene("Medium shot bên hông: nhân vật dừng viết, nâng cốc trà và nhìn hồ; mèo vẫn nằm đúng vị trí, ánh hoàng hôn chuyển xanh tím."),
-    "10": _scene("Wide shot ngoài hiên cabin: nhân vật và mèo ngồi nhìn mặt hồ, đom đóm bắt đầu xuất hiện; cabin phía sau giữ đúng thiết kế."),
-    "11": _scene("Low-angle shot gần mặt nước: phản chiếu nhân vật, cabin và rừng; gợn sóng chậm, đom đóm trôi nhẹ, trời vừa lên sao."),
-    "12": _scene("Medium-wide interior night shot: nhân vật trở lại bàn, đèn vàng và bầu trời xanh đêm tạo tương phản dịu; mèo ngủ cạnh sổ."),
-    "13": _scene("Close-up tĩnh vật có liên kết: cốc trà, trang sổ, tai nghe be, bàn tay nhân vật và mèo trong cùng khung; hơi trà và bụi sáng gợi slow motion."),
-    "14": _scene("Wide shot từ ngoài cửa sổ nhìn vào CÙNG cabin: nhân vật thư thái bên bàn, mèo ngủ, hồ và trời sao bao quanh; giữ nhịp phim êm dịu, chưa kết thúc câu chuyện."),
-    "15": _scene("Top-down shot trong cùng cabin: nhân vật nằm thư giãn trên thảm cạnh cửa sổ, tai nghe be vẫn đeo, mèo tam thể nằm sát bên; ánh trăng và đèn vàng tạo mảng sáng mềm."),
-    "16": _scene("Medium shot từ cuối bàn gỗ: CÙNG nhân vật khép sổ, đặt bút xuống và hít thở chậm; cốc trà, cây cảnh, đèn bàn và cửa sổ giữ đúng vị trí continuity."),
-    "17": _scene("Wide shot từ hiên cabin nhìn ra hồ đêm: CÙNG nhân vật quấn chăn kem ngồi cạnh mèo, đom đóm và sương mỏng chuyển động rất chậm; cabin vẫn cùng kiến trúc."),
-    "18": _scene("Close-up cinematic: bàn tay CÙNG nhân vật vuốt nhẹ mèo tam thể, tay áo hoodie sage, tai nghe be và ánh đèn hổ phách hiện rõ; bokeh hồ đêm phía sau."),
-    "19": _scene("Final wide establishing shot lúc đêm sâu: CÙNG cabin gỗ phát ánh vàng bên hồ, CÙNG nhân vật thấy rõ qua cửa sổ cùng mèo; rừng thông, núi và sao giữ nguyên bố cục, cảm giác meditation và healing trọn vẹn."),
+    "0": _scene("Ảnh nền thumbnail mở đầu, HOÀN TOÀN KHÔNG CÓ CHỮ. Nhân vật rõ nhưng không quá lớn ở PHẢI; mặt hồ phẳng với mảng sáng dịu ở nửa TRÁI tạo negative space để phần mềm chèn tiêu đề sau. Ánh viền hổ phách thật nhẹ trên tóc; không thay đổi vị trí đã khóa."),
+    "1": _scene("Biến thể mặt hồ gần như phẳng, vài gợn nước dài thưa phản chiếu màu kem của trời; nhân vật thư thái, đôi tay nghỉ trên bàn."),
+    "2": _scene("Biến thể gợn nước lan rất nhẹ phía bờ xa, các phản chiếu thông mềm và kéo dài; ánh đèn cabin ổn định."),
+    "3": _scene("Biến thể một dải mây mỏng màu kem nằm ngang trên núi xa; hồ phản chiếu dải mây, mọi vật tiền cảnh giữ nguyên."),
+    "4": _scene("Biến thể ánh hoàng hôn xuyên nhẹ qua mép mây, vệt sáng mềm nằm trên mặt bàn cạnh cốc trà; không tia sáng gắt."),
+    "5": _scene("Biến thể lá thông ngoài cửa sổ hơi nghiêng vì gió nhẹ; mèo vẫn cuộn tròn ngủ, nhân vật giữ nguyên tư thế nghỉ."),
+    "6": _scene("Biến thể sương mỏng chỉ ở chân núi xa, không che hồ hoặc nhân vật; độ tương phản toàn cảnh rất dịu."),
+    "7": _scene("Biến thể phản chiếu mây hơi đứt đoạn bởi gợn nước nhỏ; sắc xanh sage của hồ giữ nhất quán."),
+    "8": _scene("Biến thể ánh đèn hổ phách tạo vùng sáng tròn mềm hơn trên bàn; bóng cốc trà mờ, không thêm hay dời đạo cụ."),
+    "9": _scene("Biến thể rèm cửa ở rìa khung hơi cong do gió nhẹ, nhân vật nhìn bình yên về hồ; rèm không che khuôn mặt."),
+    "10": _scene("Biến thể mặt nước trong gần bờ phản chiếu đường cửa sổ thật mờ; núi xa nằm nguyên trên đường chân trời."),
+    "11": _scene("Biến thể vài hạt bụi sáng nhỏ trong tia sáng cạnh cửa sổ, rất thưa và tinh tế; không hiệu ứng kỳ ảo."),
+    "12": _scene("Biến thể mép mây màu hổ phách nhạt, phần giữa mây màu kem; ánh sáng bên trong vẫn ấm dịu và ổn định."),
+    "13": _scene("Biến thể cụm lá cây cảnh tại mép phải bắt sáng mềm; nhân vật và mèo vẫn đúng tỷ lệ, khuôn mặt không đổi."),
+    "14": _scene("Biến thể sương bên bờ hồ xa thành dải ngang mỏng, phản chiếu rừng thông vẫn nhìn thấy rõ; không sương trong cabin."),
+    "15": _scene("Biến thể các gợn hồ tạo đường cong rộng, khoảng nước giữa các gợn phẳng và tĩnh; tổng thể thư giãn, không sóng lớn."),
+    "16": _scene("Biến thể bóng khung cửa mềm rơi trên mép bàn, tai nghe be phản sáng nhẹ; ánh sáng và hướng bóng giữ đúng góc đã khóa."),
+    "17": _scene("Biến thể mây thưa hơn trên đỉnh núi nhưng cùng sắc trời hoàng hôn; nhân vật vẫn ngồi nghỉ cạnh cốc trà."),
+    "18": _scene("Biến thể mép tai mèo có viền sáng hổ phách rất nhẹ, mèo ngủ đúng vị trí trên bệ cửa; không đổi hoa văn tam thể."),
+    "19": _scene("Biến thể hồ phản chiếu vùng trời kem rộng hơn, hàng thông giữ đường viền mềm; không chuyển sang đêm hoặc bình minh."),
+    "20": _scene("Biến thể vài gợn nước nhỏ giao nhau ở giữa hồ, ánh phản chiếu tan mềm; bố cục cabin và nhân vật không đổi sau shot trước."),
+    "21": _scene("Biến thể ánh vàng trên cạnh cốc trà dịu hơn, mặt bàn hiện vân gỗ minh họa mềm; không zoom hoặc cắt thành cận cảnh."),
+    "22": _scene("Biến thể lớp mây mỏng thứ hai xa phía sau đỉnh núi; chiều sâu nhẹ nhàng, không thêm núi hay đổi địa hình."),
+    "23": _scene("Biến thể lá cây cảnh hơi hạ xuống tự nhiên, bóng lá nhòe nhẹ trên cạnh bàn; nhân vật giữ tư thế, trang phục và tai nghe."),
+    "24": _scene("Biến thể phản chiếu hàng thông thành các nét dọc mềm trên mặt hồ, những khoảng nước trống tạo cảm giác tĩnh lặng."),
+    "25": _scene("Biến thể ánh trời kem qua cửa sổ hòa nhẹ với đèn vàng ở tay áo sage; biểu cảm nhân vật bình yên và không thay đổi danh tính."),
+    "26": _scene("Biến thể làn sương mỏng hơi tách thành hai dải ở bờ xa; giữ vùng mặt hồ phía trước sáng và thoáng, không tạo khói từ người hoặc cốc."),
+    "27": _scene("Biến thể rèm cửa gần trở lại thẳng, mép vải mềm trong ánh hổ phách; mọi vật và camera đều đứng yên."),
+    "28": _scene("Biến thể vài chấm đom đóm nhỏ rất thưa bên ngoài cạnh bờ hồ, không vào cabin, không biến thành bokeh che nhân vật."),
+    "29": _scene("Biến thể bề mặt hồ mịn hơn ở vùng trái khung, gợn nước thưa gần bờ phải; không thay đổi khung hình rộng đã khóa."),
+    "30": _scene("Biến thể ánh viền ấm trên đường vai hoodie phản chiếu đèn bàn, gương mặt sáng dịu; nhân vật vẫn ngồi thả lỏng."),
+    "31": _scene("Biến thể phần chân mây mềm hòa với sương núi xa, sắc độ thấp và dễ chịu; không thêm mưa hay bão."),
+    "32": _scene("Biến thể bóng mèo trên bệ cửa mờ hơn vì ánh sáng tán xạ; mèo tam thể ngủ cuộn tròn đúng chỗ cũ."),
+    "33": _scene("Biến thể một vệt phản chiếu vàng nhạt nằm ngang xa trên hồ; không chói, không đổi hướng mặt trời hay thời điểm hoàng hôn."),
+    "34": _scene("Biến thể hạt bụi sáng tập trung rất thưa ở mép cửa trên cao; không có hạt sáng trên mặt hoặc cơ thể nhân vật."),
+    "35": _scene("Biến thể đầu cành thông ngoài cửa sổ nhẹ cong rồi thả tự nhiên, khoảng trời kem vẫn rộng; cảm giác slow tempo."),
+    "36": _scene("Biến thể bóng lá cây cảnh tạo hình mềm nhỏ ở mép bàn phải; cốc, đèn, nhân vật, mèo và hồ giữ nguyên vị trí."),
+    "37": _scene("Biến thể phản chiếu núi hiện rõ hơn một chút giữa các gợn nước thưa; giữ màu sage–kem và độ tương phản thấp."),
+    "38": _scene("Biến thể vài chấm đom đóm xa thưa dần, ánh đèn cabin vẫn đều; không chuyển sang cảnh tối hoặc thêm nguồn sáng mới."),
+    "39": _scene("Biến thể mây mỏng phủ nhẹ vệt nắng, toàn cảnh dịu như một nhịp thở; giữ nguyên tất cả nét nhận dạng và hình học cabin."),
+    "40": _scene("Biến thể mặt hồ trở lại phẳng với gợn dài rất thưa, ánh hoàng hôn ổn định gần shot đầu để nối lặp tự nhiên; nhân vật và mèo vẫn nghỉ trong cùng bố cục."),
 }
 
 # Từ khoá healing ghép vào tiêu đề thumbnail (dòng nhỏ). Mỗi lần chọn ngẫu
@@ -471,8 +490,8 @@ THUMBNAIL_KEYWORDS = [
 
 # Prompt mô tả chuyển động cho Flow (áp cho mọi clip; có thể để rỗng).
 FLOW_MOTION_PROMPT = (
-    "chill meditative animated film, very slow tempo, exactly one ultra-slow "
-    "smooth camera move; gentle natural in-place micro-motion of the character, "
+    "chill meditative animated film, very slow tempo, locked camera; "
+    "no zoom, pan or orbit; gentle natural in-place micro-motion of the character, "
     "soft ambient motion of leaves, drifting mist, water ripples and light only; "
     "preserve the exact same character identity, face, hairstyle, outfit, props, "
     "scenery, color palette and original composition; seamless slow loop, "

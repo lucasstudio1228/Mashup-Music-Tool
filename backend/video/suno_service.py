@@ -109,6 +109,9 @@ def resolve_batch_config(overrides: Optional[dict] = None) -> dict:
         "preset_label": preset["label"],
         "suno_idea": (ov.get("suno_idea") or "").strip(),
         "styles": styles,
+        "styles_supplied": bool((ov.get("styles") or "").strip()) and
+                           (ov.get("styles") or "").strip() not in
+                           {p["styles"].strip() for p in vconfig.SUNO_PRESETS.values()},
         "exclusions": exclusions,
         "target_tracks": int(ov.get("target_tracks", base.target_tracks)),
         "preferred_model": ov.get("preferred_model", base.preferred_model),
@@ -135,6 +138,50 @@ def resolve_batch_config(overrides: Optional[dict] = None) -> dict:
         "auto_continue_workflow": bool(ov.get("auto_continue_workflow",
                                              base.auto_continue_workflow)),
     }
+    return cfg
+
+
+def prepare_batch_prompts(project: Project, cfg: dict, log=None) -> dict:
+    """Freeze a project-specific, per-Create music plan before opening Suno."""
+    from .prompt_catalog import project_brief, claim_prompts, prompt_hash
+    from .prompt_workflow import project_context
+    from .suno_prompt import generate_suno_styles, compose_project_styles, build_suno_prompt_plan
+    context = project_context(project.id, project.name)
+    context["music_idea"] = cfg.get("suno_idea") or context["music_idea"]
+    if not cfg.get("prompt_plan"):
+        # A fresh music brief must not inherit a previous batch's incompatible
+        # instrument/arrangement when the user changed the idea or base Styles.
+        context["music_styles"] = cfg["styles"] if cfg.get("styles_supplied") else ""
+    brief = project_brief(project.id, project.name, json.dumps(context, ensure_ascii=False))
+    if not cfg.get("prompt_plan"):
+        styles = cfg["styles"]
+        if not cfg.get("styles_supplied"):
+            from backend.core_bridge import get_api_config_from_db
+            from backend.database import DB_PATH
+            result = generate_suno_styles(json.dumps(context, ensure_ascii=False),
+                         get_api_config_from_db(str(DB_PATH)), log=log,
+                         project_title=project.name, creative_brief=brief["music"])
+            if not result:
+                raise ValueError("Chưa viết được Styles từ hồ sơ project. Kiểm tra API hoặc "
+                                 "nhập Styles đã duyệt; không chạy preset thay thế ý tưởng.")
+            styles, cfg["exclusions"] = result["styles"], result["exclusions"]
+        cfg["styles"] = compose_project_styles(styles, brief["music"])
+        cfg["prompt_plan"] = build_suno_prompt_plan(cfg["styles"], cfg["exclusions"],
+                                                   int(cfg["max_create_actions"]))
+        cfg["creative_brief"] = brief
+        cfg["creative_context"] = context
+        cfg["prompt_workflow_version"] = 1
+    plan = cfg["prompt_plan"]
+    if len(plan) != int(cfg["max_create_actions"]):
+        raise ValueError("Prompt plan không khớp ngân sách Create đã lưu.")
+    for i, item in enumerate(plan):
+        if (item.get("request") != i + 1 or not isinstance(item.get("styles"), str)
+                or not 1 <= len(item["styles"]) <= 1000 or not item.get("exclusions")):
+            raise ValueError(f"Prompt Suno #{i + 1} không hợp lệ hoặc vượt 1000 ký tự.")
+    if len({prompt_hash(item["styles"]) for item in plan}) != len(plan):
+        raise ValueError("Prompt plan Suno có lượt Create trùng nguyên văn.")
+    cfg["prompt_hashes"] = claim_prompts(project.id, "suno",
+                                         {str(i): p["styles"] for i, p in enumerate(plan)})
     return cfg
 
 
@@ -314,6 +361,7 @@ def run_suno_step0(project_id: int, progress_cb: Callable,
                 raise SunoError("Không có batch Suno nào đang dở để resume.")
         if batch is None:
             cfg = resolve_batch_config(overrides)
+            cfg = prepare_batch_prompts(project, cfg, log)
             staging = vconfig.SUNO_STAGING_ROOT / f"project_{project_id}" / uuid.uuid4().hex[:8]
             staging.mkdir(parents=True, exist_ok=True)
             batch = SunoBatch(
@@ -329,6 +377,14 @@ def run_suno_step0(project_id: int, progress_cb: Callable,
             session.commit()
             session.refresh(batch)
         cfg = json.loads(batch.config_json or "{}")
+
+        if not cfg.get("prompt_plan") and batch.create_actions_used:
+            raise ValueError("Batch cũ đã tạo nhạc nhưng chưa có prompt plan. Không đổi bản sắc "
+                             "giữa batch; hoàn tất/kiểm tra batch cũ trước khi chạy project mới.")
+        cfg = prepare_batch_prompts(project, cfg, log)
+        batch.config_json = json.dumps(cfg, ensure_ascii=False)
+        session.add(batch)
+        session.commit()
 
         token = _acquire_lock(session, batch)
         try:
@@ -465,6 +521,9 @@ def _generate_until_target(session, batch, cfg, driver: SunoDriver, target,
             raise SunoBudgetError("Hết credit giữa chừng — dừng, resume sau khi nạp.")
 
         before = driver.snapshot_song_ids()
+        item = cfg["prompt_plan"][batch.create_actions_used]
+        driver.fill_styles(item["styles"])
+        driver.fill_exclusions(item["exclusions"])
         # LƯU submit-intent TRƯỚC khi Create (chống re-click khi timeout).
         batch.create_actions_used += 1
         _touch(session, batch, GENERATING,

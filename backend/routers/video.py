@@ -88,6 +88,27 @@ def status(project_id: int, db: Session = Depends(get_session)):
     return media
 
 
+@router.get("/prompts")
+def prompt_manifest(project_id: int, db: Session = Depends(get_session)):
+    from backend.video.prompt_workflow import read_manifest
+    project = _project_or_404(db, project_id)
+    try:
+        return {"manifest": read_manifest(project_id, project.name)}
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.post("/prompts/prepare")
+def prepare_prompts(project_id: int, body: RunImagesBody = RunImagesBody(),
+                    db: Session = Depends(get_session)):
+    project = _project_or_404(db, project_id)
+    _guard_busy()
+    idea = body.idea if body.idea is not None else project.video_idea
+    video_job_manager.submit(project_id, "prompts", service.step_prepare_prompts,
+                             project.name, idea, project.video_style)
+    return {"status": "submitted", "kind": "prompts"}
+
+
 @router.post("/images")
 def gen_images(project_id: int, body: RunImagesBody,
                db: Session = Depends(get_session)):
@@ -95,7 +116,7 @@ def gen_images(project_id: int, body: RunImagesBody,
     _guard_busy()
     topic = (body.topic or project.name or "meditation").strip()
     mode = "resume" if body.mode == "resume" else "restart"
-    idea = (body.idea or "").strip() or None
+    idea = (body.idea if body.idea is not None else project.video_idea).strip() or None
     video_job_manager.submit(project_id, "images", service.step_images,
                              topic, mode, project.name, idea, project.video_style)
     return {"status": "submitted", "kind": "images", "topic": topic,
@@ -129,7 +150,7 @@ def run_all(project_id: int, body: RunAllBody,
     project = _project_or_404(db, project_id)
     _guard_busy()
     topic = (body.topic or project.name or "meditation").strip()
-    idea = (body.idea or "").strip() or None
+    idea = (body.idea if body.idea is not None else project.video_idea).strip() or None
     video_job_manager.submit(project_id, "full", service.run_full_video,
                              topic, body.audio_path, body.seed, project.name,
                              idea, project.video_style)

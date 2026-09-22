@@ -386,7 +386,7 @@ export default function SunoPanel({ projectId }: { projectId: number }) {
 
           <label className="mt-3 block">
             <span className="mb-1 block text-[11px] uppercase tracking-wide text-gray-500">
-              Styles (gửi sang Suno — English, có thể sửa)
+              Styles gốc (English, có thể sửa; nên dưới 600 ký tự)
             </span>
             <textarea
               value={styles}
@@ -409,8 +409,10 @@ export default function SunoPanel({ projectId }: { projectId: number }) {
             />
           </label>
           <p className="mt-1.5 text-[10px] text-gray-600">
-            Dù bạn sửa thế nào, backend vẫn tự thêm loại trừ giọng hát để đảm bảo
-            nhạc không lời.
+            Tool bổ sung đặc trưng riêng của project và biến thể giai điệu cho từng lượt Create,
+            lưu kế hoạch để chạy tiếp không đổi prompt. Prompt cuối phải dưới 1.000 ký tự;
+            nếu quá dài Tool dừng, không tự cắt. Exclude luôn có các từ loại trừ giọng hát;
+            vẫn cần nghe kiểm tra đầu ra.
           </p>
         </Section>
 

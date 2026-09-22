@@ -1,8 +1,8 @@
 """
 video/gemini_driver.py — Tự động hoá Gemini web (gemini.google.com) để tạo ảnh.
 
-Chọn model 3.1 Pro (2 bước: '3.1 Pro' rồi 'Tư duy mở rộng'), sinh 20 ảnh:
-  0 = ảnh nền thumbnail (KHÔNG chữ); 1..14 = các shot liên kết,
+Chọn model 3.1 Pro (2 bước: '3.1 Pro' rồi 'Tư duy mở rộng'), sinh N ảnh:
+  0 = ảnh nền thumbnail (KHÔNG chữ); 1..N-1 = các shot liên kết,
   đồng bộ nhân vật, bối cảnh và diễn tiến ánh sáng.
 Lưu vào media/<project>/images/{i}.png.
 
@@ -88,21 +88,26 @@ def _prompt_for(index: int, topic: str, params: config.VideoParams,
                 style: Optional[str] = None) -> str:
     # Ưu tiên prompt do AI sinh từ ý tưởng người dùng (prompts_override),
     # rồi tới overrides file, cuối cùng là DEFAULT_PROMPTS.
-    prompts = (prompts_override
-               or config.load_overrides().get("prompts")
-               or config.DEFAULT_PROMPTS)
-    tmpl = prompts.get(str(index))
+    prompts = prompts_override
+    if prompts is None:
+        prompts = config.load_overrides().get("prompts")
+    if prompts is None:
+        prompts = config.DEFAULT_PROMPTS
+    if not 0 <= index < params.image_count:
+        raise ValueError(f"Chỉ số ảnh {index} ngoài bộ {params.image_count} ảnh.")
+    tmpl = prompts.get(str(index)) if isinstance(prompts, dict) else None
+    if not isinstance(tmpl, str) or not tmpl.strip():
+        raise ValueError(
+            f"Thiếu prompt ảnh {index}/{params.image_count - 1}. "
+            "Hãy tạo lại bộ prompt đầy đủ; không dùng cảnh mặc định rời rạc "
+            "vì sẽ làm mất đồng bộ nhân vật và bối cảnh.")
     fmt = {"topic": topic, "keywords": _thumbnail_keywords()}
-    if tmpl:
-        try:
-            body = tmpl.format(**fmt)
-        except Exception:
-            body = tmpl.replace("{topic}", topic)
-    else:
-        body = (f"Cảnh thiên nhiên/thành phố/mây trời số {index}, "
-                f"chủ đề '{topic}', tỉ lệ {params.aspect_ratio}, không chữ.")
+    try:
+        body = tmpl.format(**fmt)
+    except Exception:
+        body = tmpl.replace("{topic}", topic)
     # ÉP phong cách hoạt hình (2D/3D) vào ĐẦU + phủ định cấm ảnh thật ở CUỐI,
-    # áp dụng cho MỌI prompt (AI-sinh, overrides file, DEFAULT_PROMPTS, fallback).
+    # áp dụng cho MỌI prompt (AI-sinh, overrides file, DEFAULT_PROMPTS).
     wrapped = config.wrap_style(body, style)
     if index == 0:
         # Thumbnail: model sinh ảnh KHÔNG đánh vần được → cấm tuyệt đối vẽ chữ,

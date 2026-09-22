@@ -29,6 +29,13 @@ export default function ProjectsPage() {
         </button>
       }
     >
+      {deleteProject.error && <p role="alert" className="mb-4 text-red-300">
+        {(deleteProject.error as any)?.response?.data?.detail ?? deleteProject.error.message}
+      </p>}
+      {deleteProject.data?.warnings?.length > 0 && <div role="alert" className="mb-4 text-amber-300">
+        Project đã xoá khỏi danh sách nhưng còn file chờ dọn:
+        {deleteProject.data.warnings.map((warning: string) => <p key={warning}>{warning}</p>)}
+      </div>}
       {isLoading ? (
         <p className="text-gray-400">Loading…</p>
       ) : !projects || projects.length === 0 ? (
@@ -56,7 +63,7 @@ export default function ProjectsPage() {
       <ConfirmDialog
         open={toDelete !== null}
         title="Delete project"
-        message={`Delete "${toDelete?.name}" and all its output files? This cannot be undone.`}
+        message={`Xoá "${toDelete?.name}" cùng ảnh, clip, video final, nhạc upload, output, stems và dữ liệu Suno thuộc project? Không thể hoàn tác sau khi dọn xong. File nhạc gốc được import từ thư mục ngoài vẫn được giữ.`}
         confirmLabel="Delete"
         danger
         onConfirm={() => {

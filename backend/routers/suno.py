@@ -106,7 +106,7 @@ def suno_generate_styles(project_id: int, body: GenStylesBody,
                          db: Session = Depends(get_session)):
     """AI viết prompt Styles (+ Exclude styles) từ ý tưởng/nhạc cụ người dùng.
     LUÔN nhạc không lời. KHÔNG mở trình duyệt, KHÔNG tiêu credit Suno (chỉ gọi
-    LLM). Nếu không dùng được AI (thiếu key/lỗi) → fallback về preset.
+    LLM). Nếu không dùng được AI (thiếu key/lỗi) → báo lỗi, không đổi ý tưởng.
 
     Đồng thời PHÂN LOẠI project vào đúng kênh YouTube đã cấu hình (bám sát
     settings), lưu project.instrument/music_style, và BẬT auto_video +
@@ -125,23 +125,25 @@ def suno_generate_styles(project_id: int, body: GenStylesBody,
     from backend.video.suno_prompt import generate_suno_styles
 
     title = (project.name or "").strip()
+    from backend.video.prompt_catalog import project_brief
+    from backend.video.prompt_workflow import project_context
+    import json
+    context = project_context(project_id, title)
+    context["music_idea"] = idea
+    context["music_styles"] = ""
+    brief = project_brief(project_id, title, json.dumps(context, ensure_ascii=False))
     api_config = get_api_config_from_db(str(DB_PATH))
 
     # AI đoán nhạc cụ/không khí từ Project Title + ý tưởng. Chạy khi có ít nhất
     # một trong hai (thường luôn có Project Title).
     result = None
     if idea or title:
-        result = generate_suno_styles(idea, api_config, project_title=title)
+        result = generate_suno_styles(json.dumps(context, ensure_ascii=False), api_config,
+                                      project_title=title, creative_brief=brief["music"])
 
     if result is None:
-        preset_key = body.preset or vconfig.SUNO.preset
-        preset = vconfig.SUNO_PRESETS.get(preset_key) or \
-            next(iter(vconfig.SUNO_PRESETS.values()))
-        styles = preset["styles"]
-        exclusions = preset["exclusions"]
-        source = "fallback"
-        note = ("Chưa cấu hình API key hoặc AI lỗi — dùng preset. "
-                "Cấu hình API ở ⚙️ Settings để AI viết theo ý tưởng.")
+        raise HTTPException(422, "AI chưa viết được Styles đúng hồ sơ project. "
+                            "Kiểm tra API/model hoặc rút gọn ý tưởng; không thay bằng preset khác nội dung.")
     else:
         styles = result["styles"]
         exclusions = result["exclusions"]
