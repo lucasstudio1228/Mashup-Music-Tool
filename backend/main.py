@@ -16,6 +16,8 @@ from backend.migrations import run_all as run_migrations  # noqa: E402
 from backend.routers import mixes, projects, settings, tracks  # noqa: E402
 from backend.routers.stems import router as stems_router        # noqa: E402
 from backend.routers.video import router as video_router        # noqa: E402
+from backend.routers.youtube import router as youtube_router    # noqa: E402
+from backend.routers.suno import router as suno_router          # noqa: E402
 from backend.stem_job_manager import stem_job_manager           # noqa: E402
 from backend.video.job_manager import video_job_manager         # noqa: E402
 
@@ -50,6 +52,8 @@ app.include_router(mixes.router, prefix="/api")
 app.include_router(settings.router)
 app.include_router(stems_router)   # đã có prefix="/api" nội bộ
 app.include_router(video_router)   # đã có prefix nội bộ
+app.include_router(youtube_router) # đã có prefix="/api/youtube" nội bộ
+app.include_router(suno_router)    # STEP 0 — Suno; prefix nội bộ
 
 
 @app.get("/api/health")

@@ -49,11 +49,15 @@ def _install_chromium() -> None:
 class BrowserSession:
     """Bọc 1 persistent browser context. Dùng như context manager."""
 
-    def __init__(self, headless: Optional[bool] = None):
+    def __init__(self, headless: Optional[bool] = None,
+                 profile_dir: Optional[Path] = None):
         self._pw = None
         self.context = None
         self._old_policy = None
         self.headless = BROWSER.headless if headless is None else headless
+        # profile_dir=None → dùng .browser_profile chung (ChatGPT/Flow, hành vi cũ).
+        # Suno truyền SUNO_PROFILE_DIR để có session RIÊNG, không đụng profile khác.
+        self.profile_dir = Path(profile_dir) if profile_dir else PROFILE_DIR
 
     def __enter__(self) -> "BrowserSession":
         try:
@@ -80,7 +84,7 @@ class BrowserSession:
             except Exception:
                 self._old_policy = None
 
-        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
         self._pw = sync_playwright().start()
 
         # Tự tải Chromium riêng nếu chưa có (chỉ 1 lần) → tool luôn chạy
@@ -100,11 +104,12 @@ class BrowserSession:
                 ) from e
 
         base_kwargs = dict(
-            user_data_dir=str(PROFILE_DIR),
+            user_data_dir=str(self.profile_dir),
             headless=self.headless,
             slow_mo=BROWSER.slow_mo_ms,
             args=["--start-maximized", "--disable-blink-features=AutomationControlled"],
             no_viewport=True,
+            accept_downloads=True,   # cần cho Suno WAV download-wait (expect_download)
         )
 
         # Thử lần lượt: kênh cấu hình (nếu có) → Chromium bundled → chrome → msedge

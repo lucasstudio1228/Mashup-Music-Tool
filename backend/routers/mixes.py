@@ -83,7 +83,9 @@ def _maybe_trigger_auto_video(project_id: int, project_name: str,
         pass
 
 
-def _on_success(mix_id: int, result: dict) -> None:
+def _on_success(mix_id: int, result: dict, force_video: bool = False) -> None:
+    """force_video=True: luôn auto-dựng video sau mix (dùng cho chuỗi Suno →
+    Mix → Video), bỏ qua công tắc auto_video của project."""
     auto_ctx: dict | None = None
     with Session(engine) as session:
         mix = session.get(Mix, mix_id)
@@ -104,7 +106,7 @@ def _on_success(mix_id: int, result: dict) -> None:
             # Chuẩn bị context để auto-dựng video (đọc trong session còn mở).
             project = session.get(Project, mix.project_id)
             out_dir = mix.output_dir
-            if project and project.auto_video and out_dir:
+            if project and (project.auto_video or force_video) and out_dir:
                 wav = Path(out_dir) / "mix.wav"
                 if wav.exists():
                     auto_ctx = {
@@ -155,18 +157,11 @@ def list_mixes(project_id: int, session: Session = Depends(get_session)):
     return [to_mix_response(m) for m in mixes]
 
 
-@router.post("/projects/{project_id}/mixes", response_model=MixResponse)
-def create_mix(project_id: int, data: MixCreate,
-               session: Session = Depends(get_session)):
-    project = get_project_or_404(session, project_id)
-
-    tracks = session.exec(
-        select(Track).where(Track.project_id == project_id)).all()
-    if len(tracks) < MIN_TRACKS:
-        raise HTTPException(
-            400, f"Cần tối thiểu {MIN_TRACKS} track, hiện có {len(tracks)}")
-    if job_manager.is_busy():
-        raise HTTPException(409, "Đang có 1 mix render. Vui lòng đợi hoàn tất.")
+def _submit_mix_job(session: Session, project_id: int, data: MixCreate,
+                    tracks: list[Track], *, force_video: bool) -> Mix:
+    """Tạo record Mix + submit job render (dùng chung cho endpoint và auto-continue
+    từ Suno). Giả định caller đã validate (đủ track, manager rảnh)."""
+    from functools import partial
 
     # ── Chốt chất lượng output ──
     # Sample rate: 0/âm → auto = max native của library (sàn 44100), KHÔNG
@@ -201,8 +196,49 @@ def create_mix(project_id: int, data: MixCreate,
         mix.id, core_bridge.run_mix_job,
         track_paths, str(output_dir), data.duration_minutes,
         data.crossfade_seconds, sample_rate, bit_depth, DB_PATH,
-        on_success=_on_success, on_failure=_on_failure, on_cancel=_on_cancel,
+        on_success=partial(_on_success, force_video=force_video),
+        on_failure=_on_failure, on_cancel=_on_cancel,
     )
+    return mix
+
+
+def start_mix_for_project(project_id: int, *, force_video: bool = False,
+                          data: MixCreate | None = None) -> int:
+    """Khởi động 1 mix cho project theo cách lập trình (auto-continue từ Suno).
+    Mở session riêng, validate, submit. Trả mix_id. Raise RuntimeError nếu không
+    đủ điều kiện (để caller log, không làm sập job Suno)."""
+    data = data or MixCreate()
+    with Session(engine) as session:
+        project = session.get(Project, project_id)
+        if project is None:
+            raise RuntimeError(f"Project {project_id} không tồn tại")
+        tracks = session.exec(
+            select(Track).where(Track.project_id == project_id)).all()
+        if len(tracks) < MIN_TRACKS:
+            raise RuntimeError(
+                f"Cần tối thiểu {MIN_TRACKS} track, hiện có {len(tracks)}")
+        if job_manager.is_busy():
+            raise RuntimeError("Đang có 1 mix render khác — bỏ qua auto-continue.")
+        mix = _submit_mix_job(session, project_id, data, tracks,
+                              force_video=force_video)
+        return mix.id
+
+
+@router.post("/projects/{project_id}/mixes", response_model=MixResponse)
+def create_mix(project_id: int, data: MixCreate,
+               session: Session = Depends(get_session)):
+    get_project_or_404(session, project_id)
+
+    tracks = session.exec(
+        select(Track).where(Track.project_id == project_id)).all()
+    if len(tracks) < MIN_TRACKS:
+        raise HTTPException(
+            400, f"Cần tối thiểu {MIN_TRACKS} track, hiện có {len(tracks)}")
+    if job_manager.is_busy():
+        raise HTTPException(409, "Đang có 1 mix render. Vui lòng đợi hoàn tất.")
+
+    # Endpoint thủ công: video sau mix vẫn theo công tắc auto_video của project.
+    mix = _submit_mix_job(session, project_id, data, tracks, force_video=False)
     return to_mix_response(mix)
 
 

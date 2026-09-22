@@ -148,20 +148,28 @@ def generate_ingredient_plan(image_count: int, rest_clips: int,
 # lời hướng dẫn cho AI viết prompt, và gợi ý phong cách cho clip (Flow/Veo).
 # Đổi khi thay đổi định nghĩa phong cách. Cache prompts.json có style_version
 # KHÁC giá trị này (hoặc khác style_key) sẽ bị coi là cũ → sinh lại prompt.
-STYLE_VERSION = "styles-v5"
+STYLE_VERSION = "styles-v7"
 DEFAULT_STYLE = "2d"
 
+# Mỗi phong cách gồm:
+#   icon/label/desc → hiển thị ở UI (bộ chọn cuộn được)
+#   prefix   → chèn vào ĐẦU mọi prompt ảnh
+#   negative → chèn vào CUỐI mọi prompt ảnh (ép đúng phong cách, cấm phong cách khác)
+#   brief    → đưa vào lời nhắc AI viết prompt (prompt_gen). Với phong cách TẢ THỰC,
+#              brief PHẢI chứa "tả thực" hoặc "photoreal" để prompt_gen bật nhánh
+#              photoreal (xem prompt_gen._is_photoreal).
+#   motion   → gợi ý phong cách gắn vào prompt chuyển động của clip (Flow/Veo)
 STYLES: dict[str, dict[str, str]] = {
     "2d": {
+        "icon": "🎨",
         "label": "2D (tranh vẽ / anime / cartoon)",
-        # Chèn vào ĐẦU mọi prompt ảnh.
+        "desc": "Tranh vẽ tay 2D, tô màu phẳng, anime/cartoon",
         "prefix": (
             "TRANH HOẠT HÌNH 2D (2D animation / cartoon / anime-style "
             "illustration), vẽ tay nét mềm, tô màu phẳng kiểu cel-shading, màu "
             "pastel dịu, ánh sáng điện ảnh. ĐÂY LÀ TRANH HOẠT HÌNH 2D, KHÔNG "
             "PHẢI ẢNH CHỤP THẬT. "
         ),
-        # Chèn vào CUỐI mọi prompt ảnh.
         "negative": (
             " || Phong cách BẮT BUỘC: hoạt hình 2D vẽ tay / cartoon / anime "
             "(flat cel-shading). TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh chụp "
@@ -169,16 +177,16 @@ STYLES: dict[str, dict[str, str]] = {
             "chân thực như đời thật, KHÔNG 3D render thực, KHÔNG hyperrealism. "
             "Nếu phân vân, luôn nghiêng về nét vẽ tay 2D phẳng."
         ),
-        # Đưa vào lời nhắc AI viết prompt (prompt_gen).
         "brief": (
             "tranh hoạt hình 2D vẽ tay / cartoon / anime-style illustration, "
             "tô màu phẳng cel-shading, nét viền mềm, màu pastel dịu"
         ),
-        # Gợi ý phong cách gắn vào prompt chuyển động của clip (Flow/Veo).
         "motion": "2D hand-drawn animated cartoon look",
     },
     "3d": {
+        "icon": "🧊",
         "label": "3D (Pixar / Disney CGI)",
+        "desc": "Khối 3D mềm mại kiểu Pixar / Disney",
         "prefix": (
             "PHIM HOẠT HÌNH 3D (3D animated movie / Pixar-Disney style / "
             "stylized 3D CGI render), nhân vật & cảnh vật tạo khối 3D mềm mại "
@@ -198,11 +206,192 @@ STYLES: dict[str, dict[str, str]] = {
         ),
         "motion": "stylized 3D Pixar-style animated film look",
     },
+    "ghibli": {
+        "icon": "🌿",
+        "label": "Ghibli (anime vẽ tay)",
+        "desc": "Studio Ghibli, nền màu nước mộng mơ",
+        "prefix": (
+            "TRANH ANIME VẼ TAY KIỂU STUDIO GHIBLI (hand-painted Ghibli-style "
+            "anime), nền vẽ tay như tranh màu nước, mây khối mềm, ánh sáng ấm "
+            "hoài niệm, chi tiết thiên nhiên tỉ mỉ, màu trong trẻo. ĐÂY LÀ "
+            "TRANH ANIME VẼ TAY, KHÔNG PHẢI ẢNH CHỤP THẬT. "
+        ),
+        "negative": (
+            " || Phong cách BẮT BUỘC: anime vẽ tay kiểu Ghibli (painterly, "
+            "watercolor backgrounds). TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh "
+            "chụp thật, KHÔNG 3D CGI, KHÔNG hyperrealism. Nếu phân vân, nghiêng "
+            "về nét vẽ tay màu nước mộng mơ."
+        ),
+        "brief": (
+            "tranh anime vẽ tay kiểu Studio Ghibli, nền màu nước vẽ tay, mây "
+            "mềm, ánh sáng ấm hoài niệm, chi tiết thiên nhiên tỉ mỉ"
+        ),
+        "motion": "hand-painted Ghibli-style anime look, gentle painterly motion",
+    },
+    "anime": {
+        "icon": "✨",
+        "label": "Anime điện ảnh (Makoto Shinkai)",
+        "desc": "Bầu trời rực rỡ, ánh sáng lung linh",
+        "prefix": (
+            "ANIME ĐIỆN ẢNH HIỆN ĐẠI (modern cinematic anime, Makoto Shinkai "
+            "style), bầu trời rực rỡ chi tiết, ánh sáng lens-flare lung linh, "
+            "màu bão hoà đẹp, hiệu ứng ánh sáng điện ảnh, nét vẽ sắc. ĐÂY LÀ "
+            "TRANH ANIME, KHÔNG PHẢI ẢNH CHỤP THẬT. "
+        ),
+        "negative": (
+            " || Phong cách BẮT BUỘC: anime điện ảnh hiện đại (Makoto Shinkai). "
+            "TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh chụp thật, KHÔNG 3D CGI "
+            "kiểu Pixar, KHÔNG hyperrealism. Nếu phân vân, nghiêng về nét anime "
+            "bầu trời rực rỡ."
+        ),
+        "brief": (
+            "anime điện ảnh hiện đại kiểu Makoto Shinkai, bầu trời rực rỡ chi "
+            "tiết, ánh sáng lens-flare, màu bão hoà, nét vẽ sắc điện ảnh"
+        ),
+        "motion": "cinematic modern anime look (Makoto Shinkai), luminous skies",
+    },
+    "watercolor": {
+        "icon": "🖌️",
+        "label": "Màu nước (watercolor)",
+        "desc": "Màu loang mềm trên giấy, trong trẻo",
+        "prefix": (
+            "TRANH MÀU NƯỚC (watercolor painting illustration), màu loang mềm "
+            "trên giấy, viền ướt, mảng màu trong suốt chồng lớp, khoảng trắng "
+            "thở, nét bút lỏng. ĐÂY LÀ TRANH MÀU NƯỚC VẼ TAY, KHÔNG PHẢI ẢNH "
+            "CHỤP THẬT. "
+        ),
+        "negative": (
+            " || Phong cách BẮT BUỘC: tranh màu nước vẽ tay (watercolor). "
+            "TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh chụp thật, KHÔNG 3D CGI, "
+            "KHÔNG nét vector phẳng cứng. Nếu phân vân, nghiêng về màu loang "
+            "mềm trên giấy."
+        ),
+        "brief": (
+            "tranh màu nước vẽ tay, màu loang mềm trên giấy, viền ướt, mảng màu "
+            "trong suốt chồng lớp, khoảng trắng thở"
+        ),
+        "motion": "hand-painted watercolor illustration look, soft bleeding pigments",
+    },
+    "oil": {
+        "icon": "🖼️",
+        "label": "Sơn dầu (oil painting)",
+        "desc": "Nét cọ impasto dày, màu giàu chiều sâu",
+        "prefix": (
+            "TRANH SƠN DẦU (oil painting), nét cọ dày impasto nhìn thấy rõ, màu "
+            "giàu chiều sâu, ánh sáng ấm kiểu hội hoạ cổ điển, chất sơn dày. "
+            "ĐÂY LÀ TRANH SƠN DẦU VẼ TAY, KHÔNG PHẢI ẢNH CHỤP THẬT. "
+        ),
+        "negative": (
+            " || Phong cách BẮT BUỘC: tranh sơn dầu vẽ tay (oil painting, "
+            "impasto). TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh chụp thật, "
+            "KHÔNG 3D CGI, KHÔNG nét số phẳng. Nếu phân vân, nghiêng về nét cọ "
+            "dày sơn dầu."
+        ),
+        "brief": (
+            "tranh sơn dầu vẽ tay, nét cọ impasto dày rõ, màu giàu chiều sâu, "
+            "ánh sáng ấm kiểu hội hoạ cổ điển"
+        ),
+        "motion": "oil painting look, visible brushstroke texture",
+    },
+    "ink": {
+        "icon": "🖋️",
+        "label": "Thuỷ mặc (ink wash Á Đông)",
+        "desc": "Mực loang tối giản, nhiều khoảng trống",
+        "prefix": (
+            "TRANH THUỶ MẶC Á ĐÔNG (East-Asian ink wash painting, sumi-e), mực "
+            "đen loang trên giấy xuyến, nhiều khoảng trống, nét bút tối giản "
+            "thanh thoát, điểm nhấn màu nhạt. ĐÂY LÀ TRANH MỰC VẼ TAY, KHÔNG "
+            "PHẢI ẢNH CHỤP THẬT. "
+        ),
+        "negative": (
+            " || Phong cách BẮT BUỘC: tranh thuỷ mặc Á Đông (ink wash / "
+            "sumi-e). TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh chụp thật, "
+            "KHÔNG 3D CGI, KHÔNG màu bão hoà rực. Nếu phân vân, nghiêng về mực "
+            "loang tối giản nhiều khoảng trống."
+        ),
+        "brief": (
+            "tranh thuỷ mặc Á Đông (ink wash / sumi-e), mực loang trên giấy, "
+            "nhiều khoảng trống, nét bút tối giản thanh thoát"
+        ),
+        "motion": "East-Asian ink wash painting look, flowing ink, minimalist",
+    },
+    "lofi": {
+        "icon": "🎧",
+        "label": "Lofi aesthetic",
+        "desc": "Cozy hoài niệm, hạt film ấm",
+        "prefix": (
+            "TRANH MINH HOẠ LOFI (lo-fi anime aesthetic illustration), tông "
+            "màu ấm hoài niệm, hạt nhiễu film nhẹ, ánh đèn dịu cozy, chi tiết "
+            "đời thường ấm cúng, nét vẽ 2D mềm. ĐÂY LÀ TRANH MINH HOẠ, KHÔNG "
+            "PHẢI ẢNH CHỤP THẬT. "
+        ),
+        "negative": (
+            " || Phong cách BẮT BUỘC: tranh minh hoạ lofi aesthetic (2D). "
+            "TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh chụp thật, KHÔNG 3D CGI "
+            "thực. Nếu phân vân, nghiêng về nét minh hoạ 2D ấm hoài niệm."
+        ),
+        "brief": (
+            "tranh minh hoạ lofi aesthetic 2D, tông ấm hoài niệm, hạt nhiễu "
+            "film nhẹ, ánh đèn dịu cozy, chi tiết đời thường ấm cúng"
+        ),
+        "motion": "lo-fi aesthetic 2D illustration look, cozy warm ambience",
+    },
+    "real": {
+        "icon": "📷",
+        "label": "Tả thực điện ảnh (cinematic photoreal)",
+        "desc": "Như ảnh chụp / phim điện ảnh thật",
+        "prefix": (
+            "ẢNH TẢ THỰC ĐIỆN ẢNH (cinematic photorealistic, hyperrealistic "
+            "photo-real render), ánh sáng điện ảnh, chiều sâu trường ảnh "
+            "(shallow depth of field / bokeh), chất liệu, da, vải, tóc, lông "
+            "chi tiết chân thực như đời thật, độ phân giải cao, tông màu phim. "
+            "ĐÂY LÀ ẢNH TẢ THỰC NHƯ CHỤP THẬT, KHÔNG PHẢI TRANH HOẠT HÌNH. "
+        ),
+        "negative": (
+            " || Phong cách BẮT BUỘC: tả thực điện ảnh / photorealistic (như "
+            "ảnh chụp/phim điện ảnh thật). TUYỆT ĐỐI KHÔNG hoạt hình, KHÔNG "
+            "cartoon/anime, KHÔNG tranh vẽ 2D phẳng (cel-shading), KHÔNG 3D "
+            "kiểu Pixar/Disney cách điệu, KHÔNG nét vẽ tay hay tô màu phẳng. "
+            "Nếu phân vân, luôn nghiêng về ảnh chụp thật với chi tiết chân "
+            "thực và ánh sáng điện ảnh."
+        ),
+        "brief": (
+            "ảnh tả thực điện ảnh (cinematic photorealistic), ánh sáng điện "
+            "ảnh, chiều sâu trường ảnh/bokeh, chất liệu và da/vải/tóc chi tiết "
+            "chân thực như thật, tông màu phim, độ chi tiết cao"
+        ),
+        "motion": (
+            "cinematic photorealistic live-action look, realistic natural "
+            "lighting, shallow depth of field"
+        ),
+    },
+    "vintage": {
+        "icon": "📽️",
+        "label": "Phim nhựa cổ điển (vintage film)",
+        "desc": "Ảnh chụp phim analog cổ, hạt film hoài niệm",
+        "prefix": (
+            "ẢNH CHỤP PHIM NHỰA CỔ ĐIỂN (vintage analog film photograph, "
+            "35mm), tả thực như ảnh chụp thật, hạt film rõ, màu ngả hoài niệm "
+            "(faded warm tones), vignette nhẹ, ánh sáng tự nhiên mềm. ĐÂY LÀ "
+            "ẢNH CHỤP THẬT KIỂU PHIM CỔ, KHÔNG PHẢI TRANH HOẠT HÌNH. "
+        ),
+        "negative": (
+            " || Phong cách BẮT BUỘC: ảnh chụp phim nhựa analog cổ điển, tả "
+            "thực (photorealistic). TUYỆT ĐỐI KHÔNG hoạt hình, KHÔNG "
+            "cartoon/anime, KHÔNG 3D CGI cách điệu, KHÔNG tranh vẽ. Nếu phân "
+            "vân, nghiêng về ảnh chụp phim thật với hạt film và màu hoài niệm."
+        ),
+        "brief": (
+            "ảnh chụp phim nhựa analog cổ điển 35mm, tả thực như ảnh chụp thật "
+            "(photorealistic), hạt film, màu ngả hoài niệm, vignette nhẹ"
+        ),
+        "motion": "vintage analog film photograph look, realistic 35mm film grain",
+    },
 }
 
 
 def normalize_style(style: str | None) -> str:
-    """Chuẩn hoá key phong cách về '2d'/'3d'; giá trị lạ → DEFAULT_STYLE."""
+    """Chuẩn hoá key phong cách; giá trị lạ → DEFAULT_STYLE."""
     s = (style or "").strip().lower()
     return s if s in STYLES else DEFAULT_STYLE
 
@@ -336,6 +525,7 @@ class BrowserConfig:
 CHATGPT_URL = "https://chatgpt.com/"
 GEMINI_URL  = "https://gemini.google.com/app"
 FLOW_URL    = "https://flow.google.com/"
+YOUTUBE_STUDIO_URL = "https://studio.youtube.com/"
 
 # Model dùng để tạo ảnh trên Gemini web (chọn trong dropdown model).
 # "tư duy mở rộng" = bản thinking/Pro.
@@ -578,6 +768,380 @@ FLOW_SELECTORS: dict[str, list[str]] = {
 }
 
 
+# Selector YouTube Studio (upload → điền metadata → lưu Draft). RẤT dễ đổi và
+# phụ thuộc ngôn ngữ tài khoản (EN/VN) → để cả hai. SỬA Ở ĐÂY khi automation lỗi;
+# có thể override qua video_overrides.json ("selectors.youtube.<key>").
+YOUTUBE_SELECTORS: dict[str, list[str]] = {
+    # Nút "Tạo" (Create) góc trên phải Studio.
+    "create_button": [
+        "ytcp-button#create-icon",
+        "button[aria-label='Create']",
+        "button[aria-label='Tạo']",
+        "ytcp-button[aria-label='Create']",
+        "#create-icon",
+    ],
+    # Mục "Tải video lên" trong menu Create.
+    "upload_menu_item": [
+        "tp-yt-paper-item#text-item-0",
+        "tp-yt-paper-item:has-text('Upload videos')",
+        "tp-yt-paper-item:has-text('Tải video lên')",
+        "[role='menuitem']:has-text('Upload video')",
+        "[role='menuitem']:has-text('Tải video lên')",
+    ],
+    # Input file (ẩn) để set video. Dialog upload dùng input[type=file].
+    "file_input": [
+        "input[type='file']",
+    ],
+    # Ô tiêu đề (contenteditable) trong dialog Details.
+    "title_box": [
+        "ytcp-social-suggestions-textbox[label*='title'] #textbox",
+        "ytcp-mention-textbox[label*='title'] #textbox",
+        "#title-textarea #textbox",
+        "div#textbox[aria-label*='title']",
+        "div#textbox[aria-label*='tiêu đề']",
+        "#textbox[contenteditable='true']",
+    ],
+    # Ô mô tả (contenteditable).
+    "description_box": [
+        "ytcp-social-suggestions-textbox[label*='description'] #textbox",
+        "ytcp-mention-textbox[label*='description'] #textbox",
+        "#description-textarea #textbox",
+        "div#textbox[aria-label*='description']",
+        "div#textbox[aria-label*='mô tả']",
+    ],
+    # Nút "Hiện thêm" (Show more) mở phần cấu hình mở rộng.
+    "show_more": [
+        "ytcp-button#toggle-button",
+        "#toggle-button",
+        "button:has-text('Show more')",
+        "button:has-text('Hiện thêm')",
+        "ytcp-button:has-text('Show more')",
+        "ytcp-button:has-text('Hiện thêm')",
+    ],
+    # "Không, đây không phải nội dung dành cho trẻ em" (Made for kids = No).
+    "mfk_no": [
+        "tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']",
+        "#audience #radioContainer tp-yt-paper-radio-button:nth-of-type(2)",
+        "tp-yt-paper-radio-button:has-text(\"not Made for Kids\")",
+        "tp-yt-paper-radio-button:has-text('không dành cho trẻ em')",
+        "[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']",
+    ],
+    # Ô nhập Tags (thẻ) — trong phần Show more.
+    "tags_box": [
+        "ytcp-form-input-container#tags-container #text-input",
+        "input[aria-label*='tags']",
+        "input[aria-label*='thẻ']",
+        "#tags-container input",
+    ],
+    # Nội dung có yếu tố AI / Altered content: chọn "Có" (Yes).
+    # Nút mở phần Altered content (nếu là 1 dòng bấm để mở radios).
+    "altered_content_section": [
+        "#altered-content",
+        "ytcp-button:has-text('Altered content')",
+        "*:has-text('Altered content')",
+        "*:has-text('Nội dung đã bị thay đổi')",
+    ],
+    "altered_content_yes": [
+        "tp-yt-paper-radio-button[name='VIDEO_ALTERED_CONTENT_YES']",
+        "#altered-content tp-yt-paper-radio-button:has-text('Yes')",
+        "tp-yt-paper-radio-button:has-text('Yes')",
+        "tp-yt-paper-radio-button:has-text('Có')",
+        "[name='VIDEO_ALTERED_CONTENT_YES']",
+    ],
+    # Ngôn ngữ video → dropdown → English (United States).
+    "video_language_dropdown": [
+        "#video-language ytcp-dropdown-trigger",
+        "ytcp-form-select#video-language",
+        "#video-language",
+    ],
+    "video_language_en_us": [
+        "tp-yt-paper-item:has-text('English (United States)')",
+        "[role='option']:has-text('English (United States)')",
+        "tp-yt-paper-item:has-text('English (US)')",
+        "*:has-text('English (United States)')",
+    ],
+    # Đóng dialog upload → YouTube TỰ LƯU thành Draft (bản nháp). Đây là bước
+    # "lưu nháp": KHÔNG bao giờ bấm Next tới Publish/Xuất bản.
+    "close_dialog": [
+        "ytcp-button#close-button",
+        "#close-button",
+        "button[aria-label='Close']",
+        "button[aria-label='Đóng']",
+        "ytcp-icon-button[aria-label='Close']",
+    ],
+    # Hộp thoại xác nhận sau khi đóng: nút "Lưu bản nháp / Đã lưu dưới dạng nháp"
+    # hoặc chỉ cần đóng. Xác nhận đã lưu draft (nếu hiện).
+    "saved_draft_confirm": [
+        "*:has-text('saved as a draft')",
+        "*:has-text('lưu dưới dạng bản nháp')",
+        "*:has-text('Draft saved')",
+    ],
+    # Xác nhận đã đăng nhập Studio (avatar / nút Create hiện ra).
+    "studio_ready": [
+        "ytcp-button#create-icon",
+        "#create-icon",
+        "button[aria-label='Create']",
+        "button[aria-label='Tạo']",
+    ],
+    # Trạng thái xử lý upload (chờ upload xong mới điền/đóng an toàn).
+    "upload_progress": [
+        ".progress-label",
+        "ytcp-video-upload-progress",
+        "span.ytcp-video-upload-progress",
+    ],
+}
+
+
+# ════════════════════════════════════════════════════════════════
+# SUNO — Tạo nhạc nền (STEP 0 của pipeline). Nguồn nhạc: Suno.com.
+# Người dùng có gói Premier, làm nhạc instrumental relaxing/Lofi, mỗi
+# project cần ĐÚNG 15 file WAV tải trực tiếp từ Suno (không MP3, không
+# đổi đuôi, không tự convert). Tất cả selector/tham số gom ở đây.
+# Cơ sở: docs/suno-ui-observation.md (quan sát UI thật 2026-09-20).
+# ════════════════════════════════════════════════════════════════
+
+SUNO_URL = "https://suno.com/create"
+# Profile Playwright RIÊNG cho Suno — KHÔNG dùng chung .browser_profile của
+# ChatGPT/Flow, KHÔNG dùng chung session với extension Chrome cá nhân.
+SUNO_PROFILE_DIR = _ROOT / ".browser_profile_suno"
+# State/manifest bền vững cho batch Suno (chống trùng, resume). Ngoài thư mục
+# media auto-watch để input chỉ publish khi cả batch sẵn sàng.
+SUNO_STAGING_ROOT = _ROOT / "data" / "suno_batches"
+
+
+@dataclass
+class SunoConfig:
+    """Tham số STEP 0 (mục E của spec). Đây là DEFAULT; có thể override per-batch
+    khi người dùng bấm Start (preset, target, model, limits...)."""
+    source:              str  = "suno"          # 'local' (import tay) | 'suno'
+    target_tracks:       int  = 15              # ĐÚNG 15 output cho mỗi project
+    preset:              str  = "ambient"       # key trong SUNO_PRESETS
+    preferred_model:     str  = "v6"            # map tới mục 'v6' (Pro) ở ALL MODELS
+    allow_model_fallback: bool = False          # False = không chấp nhận model khác
+    instrumental:        bool = True            # True ⇒ để Lyrics TRỐNG (không có toggle)
+    allow_bass:          bool = False           # không có UI switch → đưa vào Exclude styles
+    allow_drums:         bool = False           # không có UI switch → đưa vào Exclude styles
+    generation_strategy: str  = "paired_outputs"  # 2 bài/request nhưng CHỈ chọn 1 (2 bài na ná) → cần 15 request cho 15
+    variety:             int  = 0               # chỉ set nếu UI có control (Suno KHÔNG có)
+    max_mode:            bool = False           # Max Mode = Off theo mặc định
+    concurrency_per_account: int = 1            # 1 worker/profile — lock chống 2 worker
+    auto_continue_workflow: bool = True         # sau import → chạy tiếp pipeline hiện có
+    preferred_duration_seconds_min: int = 180   # 3:00 (soft — Duration Custom)
+    preferred_duration_seconds_max: int = 300   # 5:00 (soft)
+    minimum_duration_seconds: int = 120         # WAV ngắn hơn 2:00 bị loại
+    # ── Ngân sách / chốt chặn an toàn (không tự mua thêm credit) ──
+    max_create_actions:      int = 15           # mỗi Create chọn 1 bài → cần 15 lần Create cho 15 bài
+    max_generation_credits:  int = 100          # trần credit tiêu cho 1 batch
+    max_new_song_downloads:  int = 15           # trần số WAV tải về/batch
+
+
+# Preset lưu NGUYÊN VĂN Styles + Exclusions tiếng Anh đã gửi (mục E). KHÔNG
+# sửa chữ. Lyrics luôn để trống ở chế độ instrumental. allow_bass/allow_drums
+# đưa vào Exclude styles vì Suno không có switch bật/tắt stem lúc tạo.
+SUNO_PRESETS: dict[str, dict] = {
+    "ambient": {
+        "label": "Ambient (beatless, no drum — slow tempo)",
+        "styles": (
+            "Instrumental ambient music, beatless and drumless, very slow tempo "
+            "around 55-65 BPM, soft evolving pads and gentle textures, warm and "
+            "spacious atmosphere, long sustained tones, subtle melodic movement, "
+            "deep reverb and wide stereo field, calm meditative mood, smooth "
+            "gradual build, soft natural ending. "
+            "Purely instrumental, no vocals, no accompaniment."
+        ),
+        "exclusions": (
+            "vocals, singing, spoken word, humming, chanting, choir, vocal samples, "
+            "drums, percussion, kick, snare, hi-hats, 808, beat, "
+            "harsh distortion, aggressive drops"
+        ),
+    },
+    "lofi": {
+        "label": "Lofi (beat nhẹ — slow tempo)",
+        "styles": (
+            "Instrumental lo-fi music with a gentle, laid-back beat, slow tempo "
+            "around 70-80 BPM, soft mellow chords, warm tape and vinyl texture, "
+            "relaxed swing groove, subtle rounded bassline, dusty drums kept light "
+            "and soft, cozy late-night mood, smooth transitions, soft natural "
+            "ending. Purely instrumental, no vocals."
+        ),
+        "exclusions": (
+            "vocals, singing, spoken word, humming, chanting, choir, vocal samples, "
+            "harsh distortion, aggressive drops, loud percussion, heavy 808"
+        ),
+    },
+}
+
+
+# Selector Suno — best-effort từ 1 lần quan sát DOM thật (docs/suno-ui-observation.md
+# §4). Suno đổi UI thường xuyên → mọi step driver phải BÁO UI_CHANGED khi thiếu
+# selector, KHÔNG im lặng bỏ qua. Override qua suno_overrides.json / video_overrides.
+SUNO_SELECTORS: dict[str, list[str]] = {
+    # Tab chế độ tạo (role=tab). Spec gọi "Custom/Advanced" = tab "Advanced".
+    "mode_advanced_tab": [
+        "[role=tab][aria-selected]:has-text('Advanced')",
+        "button[role=tab]:has-text('Advanced')",
+        "[role=tab]:has-text('Advanced')",
+    ],
+    "mode_simple_tab": [
+        "button[role=tab]:has-text('Simple')",
+        "[role=tab]:has-text('Simple')",
+    ],
+    # Nút hiển thị model hiện tại (góc trên-phải panel, text = version vd 'v6').
+    "model_button": [
+        "button:has-text('v6-mini')",
+        "button:has-text('v6-wild')",
+        "button:has-text('v6')",
+    ],
+    # Mục chọn model 'v6' trong popover ALL MODELS.
+    "model_option_v6": [
+        "[role=menuitem]:has-text('v6'):not(:has-text('mini')):not(:has-text('wild'))",
+        "[role=option]:has-text('v6'):not(:has-text('mini')):not(:has-text('wild'))",
+        "*:has-text('Powerful. Versatile. Refined.')",
+    ],
+    # Ô tiêu đề bài (tùy chọn) — KHÔNG bắt buộc.
+    "song_title": [
+        "input[placeholder='Song Title (Optional)']",
+        "input[placeholder*='Song Title']",
+    ],
+    # Lyrics editor — ĐỂ TRỐNG = instrumental. Chỉ dùng để KIỂM TRA đã trống.
+    # Suno hiện gọi ô này là "Cowriter prompt" (textarea data-cowrite-input);
+    # giữ selector cũ 'Lyrics editor' làm dự phòng cho UI phiên bản khác.
+    "lyrics_editor": [
+        "textarea[data-cowrite-input='true']",
+        "textarea[aria-label='Cowriter prompt']",
+        "[role=textbox][aria-label='Lyrics editor']",
+        "div[aria-label='Lyrics editor']",
+    ],
+    # Ô Styles (textarea, 1000 ký tự). Placeholder là VÍ DỤ XOAY VÒNG (đổi liên
+    # tục) → KHÔNG match theo placeholder. Neo theo data-testid ổn định của
+    # wrapper (verified LIVE 2026-09-21), rồi maxlength=1000 làm dự phòng.
+    "styles_box": [
+        "[data-testid='create-form-styles-wrapper'] textarea",
+        "textarea[maxlength='1000']",
+        "textarea[placeholder*='city pop']",
+        "textarea[placeholder*='epic build-up']",
+        "textarea[data-testid='tag-input-textarea']",
+    ],
+    # Nút mở "More Options".
+    "more_options": [
+        "[role=button]:has-text('More Options')",
+        "button:has-text('More Options')",
+        "*:has-text('More Options')",
+    ],
+    # Exclude styles — nơi ghi 'no drums, no bass...' khi allow_*=False.
+    "exclude_styles": [
+        "input[placeholder='Exclude styles']",
+        "input[placeholder*='Exclude']",
+    ],
+    # Duration: nút Custom/Auto + ô số giây.
+    "duration_custom": ["button:has-text('Custom')", "[role=button]:has-text('Custom')"],
+    "duration_auto":   ["button:has-text('Auto')", "[role=button]:has-text('Auto')"],
+    "duration_seconds_input": [
+        "input[type=number][placeholder='Auto']",
+        "input[type=number]",
+    ],
+    # Max Mode Off/On.
+    "max_mode_off": ["button:has-text('Off')"],
+    "max_mode_on":  ["button:has-text('On')"],
+    # Nút Create.
+    "create_button": [
+        "button[aria-label='Create song']",
+        "button:has-text('Create')",
+    ],
+    "clear_form": ["button[aria-label='Clear all form inputs']"],
+    # Credits còn lại (đọc để tiền-kiểm ngân sách).
+    "credits": ["button[aria-label^='Credits remaining']"],
+    # Workspace (gom 15 bài của project vào 1 workspace nếu UI hỗ trợ).
+    "new_workspace": ["*:has-text('Create new workspace')"],
+    # Danh sách bài + hành động per-song.
+    "song_row_play": ["div[role=button][aria-label^='Play ']"],
+    "song_more_options": ["button[aria-label='More options']"],
+    # Menu ⋯ → Download → dialog format WAV.
+    "download_entry": [
+        "div.context-menu-item:has-text('Download')",
+        "button[aria-label='Download']",
+        "[role=menuitem]:has-text('Download')",
+        "*:has-text('Download')",
+    ],
+    # Hộp thoại Download là DANH SÁCH TOGGLE (không phải bấm-là-tải): mỗi định
+    # dạng là 1 <button>, được chọn khi bên trong có 1 <svg> dấu tích. Mặc định
+    # MP3 đang bật. Quy trình chuẩn: BẬT WAV, TẮT MP3, rồi bấm nút 'Download'
+    # cuối. Các nút này CHỈ nhận chuột thật (JS/locator.click không đăng ký).
+    "download_dialog": [
+        "[role=dialog]:has-text('Download')",
+    ],
+    "download_format_wav": [
+        "[role=dialog] button:has-text('WAV')",
+        "button:has-text('WAV')",
+    ],
+    "download_format_mp3": [
+        "[role=dialog] button:has-text('MP3')",
+        "button:has-text('MP3')",
+    ],
+    "download_confirm": [
+        "[role=dialog] button:has-text('Download')",
+        "button:has-text('Download')",
+    ],
+    # Giữ selector cũ để tương thích ngược (không còn dùng trực tiếp).
+    "download_wav": [
+        "[role=dialog] button:has-text('WAV')",
+        "button:has-text('WAV')",
+        "*:has-text('WAV')",
+    ],
+
+    # ── Luồng tải WAV MỚI qua Suno Studio (verified LIVE 2026-09-21) ─────
+    # Quy trình: ⋯ → Edit → Open in Studio → Single-track → (chờ load) →
+    # Export → Full Song → (chờ 'Song Saved') → Go to Song → (chờ hết
+    # 'Preparing song for playback...') → ⋯ → Download → WAV.
+    # Menu ⋯ dùng cấu trúc `div.context-menu-item > button.hxc-btn-base`
+    # (KHÔNG phải role=menuitem). Submenu 'Edit' mở khi HOVER.
+    "studio_edit_menu": [
+        "div.context-menu-item:has-text('Edit')",
+        "button.hxc-btn-base:has-text('Edit')",
+    ],
+    # 'Open in Studio' nằm trong submenu Edit (kèm badge 'New' → text là
+    # 'Open in StudioNew', :has-text khớp chuỗi con nên vẫn trúng).
+    "open_in_studio": [
+        "div.context-menu-item:has-text('Open in Studio')",
+        "button.hxc-btn-base:has-text('Open in Studio')",
+    ],
+    # Hộp thoại chọn kiểu mở trong Studio: Single-track (Use the full mix,
+    # MIỄN PHÍ) vs Multi-track (Separate stems, 50 credits → KHÔNG dùng).
+    # Dialog có aria-label 'Edit <title> in Studio'.
+    "studio_single_track": [
+        "[role=dialog] button:has-text('Single-track')",
+        "button:has-text('Single-track')",
+    ],
+    # Nút Export (góc trên-phải editor Studio). Là tín hiệu 'đã load xong'.
+    "studio_export_menu": [
+        "button[aria-label='Export menu']",
+        "button:has-text('Export')",
+    ],
+    # Menu Export → 'Full Song' (còn có 'Selected Time Range', 'Multitrack').
+    "studio_full_song": [
+        "div.context-menu-item:has-text('Full Song')",
+        "button.hxc-btn-base:has-text('Full Song')",
+    ],
+    # Thông báo 'Song Saved' sau khi render xong (best-effort, để chờ/log).
+    "studio_song_saved": [
+        "text=Song Saved",
+        "*:has-text('Song Saved')",
+    ],
+    # Nút 'Go to Song' xuất hiện cùng/ sau 'Song Saved'.
+    "studio_go_to_song": [
+        "button:has-text('Go to Song')",
+        "a:has-text('Go to Song')",
+        "[role=button]:has-text('Go to Song')",
+        "div.context-menu-item:has-text('Go to Song')",
+    ],
+    # Trạng thái 'Preparing song for playback...' — CHỜ tới khi biến mất mới tải.
+    "studio_preparing": [
+        "text=Preparing song for playback",
+        "*:has-text('Preparing song for playback')",
+    ],
+}
+
+
 def load_overrides() -> dict:
     """Đọc video_overrides.json nếu có để override selector/tham số."""
     try:
@@ -588,12 +1152,31 @@ def load_overrides() -> dict:
     return {}
 
 
+def save_selector_overrides(site: str, discovered: dict[str, list[str]]) -> None:
+    """Ghi/gộp các selector đã dò được vào video_overrides.json dưới
+    selectors.<site>.<key>. KHÔNG xoá các key khác (giữ nguyên override sẵn có
+    của site khác/tham số khác). Dùng cho tính năng tự cập nhật selector khi
+    giao diện Suno đổi."""
+    if not discovered:
+        return
+    data = load_overrides()
+    selectors = data.setdefault("selectors", {})
+    site_sel = selectors.setdefault(site, {})
+    for key, value in discovered.items():
+        site_sel[key] = value if isinstance(value, list) else [value]
+    OVERRIDES.parent.mkdir(parents=True, exist_ok=True)
+    OVERRIDES.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def get_selectors(site: str) -> dict[str, list[str]]:
     """site = 'chatgpt' | 'gemini' | 'flow'. Merge override (nếu có) lên default."""
     table = {
         "chatgpt": CHATGPT_SELECTORS,
         "gemini":  GEMINI_SELECTORS,
         "flow":    FLOW_SELECTORS,
+        "youtube": YOUTUBE_SELECTORS,
+        "suno":    SUNO_SELECTORS,
     }
     base = dict(table.get(site, FLOW_SELECTORS))
     ov = load_overrides().get("selectors", {}).get(site, {})
@@ -605,3 +1188,4 @@ def get_selectors(site: str) -> dict[str, list[str]]:
 # Instance mặc định dùng chung
 PARAMS  = VideoParams()
 BROWSER = BrowserConfig()
+SUNO    = SunoConfig()

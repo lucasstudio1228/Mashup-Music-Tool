@@ -8,6 +8,11 @@ export interface Project {
   video_idea?: string;
   auto_video?: boolean;
   video_style?: string;
+  instrument?: string;
+  music_style?: string;
+  auto_upload?: boolean;
+  music_source?: string;   // "local" | "suno"
+  suno_idea?: string;      // ý tưởng/nhạc cụ cho STEP 0 (Suno)
 }
 
 export interface AppSettings {
@@ -101,6 +106,11 @@ export interface ProjectUpdate {
   video_idea?: string;
   auto_video?: boolean;
   video_style?: string;
+  instrument?: string;
+  music_style?: string;
+  auto_upload?: boolean;
+  music_source?: string;
+  suno_idea?: string;
 }
 
 export interface MixCreate {
@@ -196,4 +206,142 @@ export interface VideoStatus {
   audio_duration?: number | null;
   job?:           VideoJobInfo | null;
   params:         VideoParamsInfo;
+}
+
+// ── Suno (STEP 0 — tạo nhạc nền) ───────────────────────────────
+export interface SunoPreset {
+  key:        string;
+  label:      string;
+  styles:     string;      // gửi sang Suno (English)
+  exclusions: string;
+}
+
+export interface SunoDefaults {
+  source:                          string;   // "suno" | "local"
+  preset:                          string;
+  target_tracks:                   number;
+  preferred_model:                 string;
+  allow_model_fallback:            boolean;
+  instrumental:                    boolean;
+  max_mode:                        boolean;
+  preferred_duration_seconds_min:  number;
+  preferred_duration_seconds_max:  number;
+  minimum_duration_seconds:        number;
+  max_create_actions:              number;
+  max_generation_credits:          number;
+  max_new_song_downloads:          number;
+  auto_continue_workflow:          boolean;
+}
+
+export interface SunoConfigResponse {
+  defaults: SunoDefaults;
+  presets:  SunoPreset[];
+}
+
+// Phase khớp backend.video.suno_service (PREFLIGHT..COMPLETED + blocking states).
+export type SunoPhase =
+  | 'PREFLIGHT' | 'GENERATING' | 'DOWNLOADING' | 'VALIDATING'
+  | 'READY_FOR_IMPORT' | 'IMPORTED' | 'DOWNSTREAM_RUNNING' | 'COMPLETED'
+  | 'WAITING_FOR_LOGIN' | 'WAITING_FOR_HUMAN' | 'SUBMISSION_UNCERTAIN'
+  | 'INSUFFICIENT_GENERATION_CREDITS' | 'INSUFFICIENT_DOWNLOAD_ALLOWANCE'
+  | 'UI_CHANGED' | 'FAILED' | 'PAUSED' | 'CANCELLED';
+
+export interface SunoBatchStatus {
+  batch_id:             number;
+  project_id:           number;
+  phase:                SunoPhase;
+  message?:             string | null;
+  dry_run:              boolean;
+  credits_remaining?:   number | null;
+  preset?:              string | null;
+  model?:               string | null;
+  target_tracks:        number;
+  generated_candidates: number;
+  selected_tracks:      number;
+  downloaded_tracks:    number;
+  validated_tracks:     number;
+  imported_tracks:      number;
+  create_actions_used:  number;
+  staging_dir?:         string | null;
+}
+
+export interface SunoJobInfo {
+  kind:    string;   // "suno"
+  status:  VideoJobStatus;
+  percent: number;
+  message: string;
+  error?:  string | null;
+}
+
+// Kết quả tự kiểm tra selector khi mở UI Suno (open-browser + self-check).
+export interface SunoSelectorGroup {
+  name:    string;
+  status:  'ok' | 'healed' | 'missing' | 'skipped' | 'conditional';
+  matched: string | null;
+  kind:    'page' | 'conditional' | 'interactive';
+}
+
+export interface SunoSelectorCheck {
+  groups:           SunoSelectorGroup[];
+  discovered:       Record<string, string[]>;
+  summary: {
+    page_ok:    number;
+    page_total: number;
+    healed:     string[];
+    missing:    string[];
+  };
+  checked_at:        string;
+  logged_in?:        boolean;
+  saved_overrides?:  string[];
+  save_error?:       string;
+}
+
+export interface SunoStatusResponse {
+  batch:           SunoBatchStatus | null;
+  job:             SunoJobInfo | null;
+  selector_check?: SunoSelectorCheck | null;
+}
+
+// Body override khi bấm Start/Dry-run — mọi trường tuỳ chọn (bỏ trống = mặc định).
+export interface SunoStartBody {
+  preset?:                         string;
+  // Styles/Exclusions (AI viết từ ý tưởng hoặc người dùng tự sửa). Bỏ trống = preset.
+  styles?:                         string;
+  exclusions?:                     string;
+  suno_idea?:                      string;
+  target_tracks?:                  number;
+  preferred_model?:                string;
+  allow_model_fallback?:           boolean;
+  max_mode?:                       boolean;
+  preferred_duration_seconds_min?: number;
+  preferred_duration_seconds_max?: number;
+  minimum_duration_seconds?:       number;
+  max_create_actions?:             number;
+  max_generation_credits?:         number;
+  max_new_song_downloads?:         number;
+  auto_continue_workflow?:         boolean;
+}
+
+// Kết quả AI viết Styles từ ý tưởng (POST /suno/generate-styles).
+export interface SunoGenerateStylesBody {
+  idea:    string;
+  preset?: string;
+  save?:   boolean;
+}
+
+export interface SunoChannelMatch {
+  matched:      boolean;
+  instrument:   string;
+  music_style:  string;
+  channel_name: string;
+  confidence:   string;
+  warning:      string | null;
+}
+
+export interface SunoGenerateStylesResponse {
+  source:     'ai' | 'fallback';
+  styles:     string;
+  exclusions: string;
+  note:       string | null;
+  channel:    SunoChannelMatch;
 }

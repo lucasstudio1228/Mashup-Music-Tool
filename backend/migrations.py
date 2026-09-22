@@ -163,11 +163,113 @@ def migrate_add_project_video_style():
         conn.close()
 
 
+def migrate_add_youtube_upload_columns():
+    """
+    M006: Chuẩn bị cho tính năng auto-upload YouTube qua GPMLogin.
+    - project: thêm instrument / music_style / auto_upload (project cũ: auto TẮT).
+    - appsettings: thêm gpm_api_base_url / gpm_exe_path (cấu hình Local API).
+    Hai bảng mới (channelmapping, youtubeupload) do create_db_and_tables() tạo.
+    """
+    if not DB_PATH.exists():
+        return
+
+    conn = _get_conn()
+    try:
+        added = []
+        if _table_exists(conn, "project"):
+            if not _column_exists(conn, "project", "instrument"):
+                conn.execute(
+                    "ALTER TABLE project ADD COLUMN instrument TEXT DEFAULT ''")
+                added.append("project.instrument")
+            if not _column_exists(conn, "project", "music_style"):
+                conn.execute(
+                    "ALTER TABLE project ADD COLUMN music_style TEXT DEFAULT ''")
+                added.append("project.music_style")
+            if not _column_exists(conn, "project", "auto_upload"):
+                conn.execute(
+                    "ALTER TABLE project ADD COLUMN auto_upload BOOLEAN DEFAULT 0")
+                added.append("project.auto_upload")
+        if _table_exists(conn, "appsettings"):
+            if not _column_exists(conn, "appsettings", "gpm_api_base_url"):
+                conn.execute(
+                    "ALTER TABLE appsettings ADD COLUMN gpm_api_base_url "
+                    "TEXT DEFAULT 'http://localhost:9495'")
+                added.append("appsettings.gpm_api_base_url")
+            if not _column_exists(conn, "appsettings", "gpm_exe_path"):
+                conn.execute(
+                    "ALTER TABLE appsettings ADD COLUMN gpm_exe_path TEXT")
+                added.append("appsettings.gpm_exe_path")
+        if not added:
+            return  # Đã migrate rồi
+        print(f"  [Migration M006] Adding YouTube upload columns: {added}")
+        conn.commit()
+        print("  [Migration M006] Done.")
+    except Exception as e:
+        raise RuntimeError(f"Migration M006 failed: {e}") from e
+    finally:
+        conn.close()
+
+
+def migrate_add_suno_columns():
+    """
+    M007: Chuẩn bị STEP 0 (tạo nhạc nền Suno).
+    - project: thêm music_source (mặc định 'local' → giữ nguyên import thủ công;
+      'suno' = tạo 15 bài WAV từ Suno). Project cũ mặc định 'local'.
+    Hai bảng mới (sunobatch, sunocandidate) do create_db_and_tables() tạo.
+    """
+    if not DB_PATH.exists():
+        return
+
+    conn = _get_conn()
+    try:
+        if not _table_exists(conn, "project"):
+            return  # create_db_and_tables sẽ tạo đủ cột
+        if _column_exists(conn, "project", "music_source"):
+            return  # Đã migrate rồi
+        print("  [Migration M007] Adding project column: music_source")
+        conn.execute(
+            "ALTER TABLE project ADD COLUMN music_source TEXT DEFAULT 'local'")
+        conn.commit()
+        print("  [Migration M007] Done.")
+    except Exception as e:
+        raise RuntimeError(f"Migration M007 failed: {e}") from e
+    finally:
+        conn.close()
+
+
+def migrate_add_suno_idea_column():
+    """
+    M008: thêm project.suno_idea (ý tưởng/nhạc cụ cho STEP 0 — AI viết Styles từ
+    đây, luôn nhạc không lời). Project cũ mặc định '' (rỗng).
+    """
+    if not DB_PATH.exists():
+        return
+
+    conn = _get_conn()
+    try:
+        if not _table_exists(conn, "project"):
+            return  # create_db_and_tables sẽ tạo đủ cột
+        if _column_exists(conn, "project", "suno_idea"):
+            return  # Đã migrate rồi
+        print("  [Migration M008] Adding project column: suno_idea")
+        conn.execute(
+            "ALTER TABLE project ADD COLUMN suno_idea TEXT DEFAULT ''")
+        conn.commit()
+        print("  [Migration M008] Done.")
+    except Exception as e:
+        raise RuntimeError(f"Migration M008 failed: {e}") from e
+    finally:
+        conn.close()
+
+
 def run_all():
     """Gọi hàm này ở startup, trước create_db_and_tables()."""
     migrate_remove_project_api_fields()   # M001
     migrate_create_stem_directories()      # M002
     migrate_add_denoise_columns()          # M003
     migrate_add_project_video_columns()    # M004
-    migrate_add_project_video_style()      # M005 — mới
+    migrate_add_project_video_style()      # M005
+    migrate_add_youtube_upload_columns()   # M006
+    migrate_add_suno_columns()             # M007
+    migrate_add_suno_idea_column()         # M008 — mới
     # Thêm migration mới vào đây theo thứ tự

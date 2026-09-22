@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 venv/
 .browser_profile/
+.browser_profile_suno/
 .runtime_packages/
 .runtime_packages311/
 

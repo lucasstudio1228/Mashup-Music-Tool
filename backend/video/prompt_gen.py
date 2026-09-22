@@ -19,19 +19,40 @@ import json
 import re
 from typing import Optional
 
+
+def _is_photoreal(style: str | None) -> bool:
+    """Phong cách tả thực (photoreal) hay hoạt hình? Nhận diện từ chuỗi brief."""
+    s = (style or "").lower()
+    return "photoreal" in s or "tả thực" in s
+
+
 def _system_for(style_brief: str) -> str:
+    if _is_photoreal(style_brief):
+        medium = "PHIM ĐIỆN ẢNH TẢ THỰC"
+        rule1 = (
+            f"'{style_brief}' — BẮT BUỘC tả thực điện ảnh / photorealistic như "
+            "ẢNH CHỤP / PHIM THẬT (da/vải/tóc/lông/chất liệu chi tiết chân thực, "
+            "ánh sáng điện ảnh, chiều sâu trường ảnh). TUYỆT ĐỐI KHÔNG hoạt "
+            "hình, KHÔNG cartoon/anime, KHÔNG tranh vẽ 2D phẳng, KHÔNG 3D cách "
+            "điệu kiểu Pixar/Disney. Khi tả nhân vật/vật liệu, luôn tả CHÂN "
+            "THỰC như đời thật. "
+        )
+    else:
+        medium = "PHIM HOẠT HÌNH"
+        rule1 = (
+            f"'{style_brief}' — TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh chụp "
+            "thật, KHÔNG người/da/vải/tóc chân thực như đời thật, KHÔNG "
+            "hyperrealism. Khi tả nhân vật/vật liệu, luôn tả theo NGÔN NGỮ của "
+            "phong cách hoạt hình đã chọn, không tả như người/vật thật. "
+        )
     return (
-        "Bạn là đạo diễn hình ảnh cấp cao (senior visual director) chuyên PHIM "
-        f"HOẠT HÌNH ({style_brief}) chill/relaxing/meditation/lofi. Bạn có tư "
+        "Bạn là đạo diễn hình ảnh cấp cao (senior visual director) chuyên "
+        f"{medium} ({style_brief}) chill/relaxing/meditation/lofi. Bạn có tư "
         "duy điện ảnh (cinematic thinking): mỗi shot là một KHUNG HÌNH PHIM có "
         "MỤC ĐÍCH kể chuyện — không phải miêu tả khô khan. Bạn đồng thời là đạo "
         "diễn CHUYỂN ĐỘNG: với mỗi ảnh, hình dung nó sẽ được làm động thành clip "
         "8s và viết prompt chuyển động hợp logic vật lý, tinh tế, thiền. "
-        "NGUYÊN TẮC TỐI THƯỢNG 1: mọi shot BẮT BUỘC đúng phong cách "
-        f"'{style_brief}' — TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh chụp "
-        "thật, KHÔNG người/da/vải/tóc chân thực như đời thật, KHÔNG "
-        "hyperrealism. Khi tả nhân vật/vật liệu, luôn tả theo NGÔN NGỮ của "
-        "phong cách hoạt hình đã chọn, không tả như người/vật thật. "
+        f"NGUYÊN TẮC TỐI THƯỢNG 1: mọi shot BẮT BUỘC đúng phong cách {rule1}"
         "NGUYÊN TẮC TỐI THƯỢNG 2: phải BÁM SÁT ý tưởng người dùng (đúng nhân "
         "vật, đạo cụ, bối cảnh, hành động); TUYỆT ĐỐI không thay bằng nhân "
         "vật/bối cảnh mặc định nào khác. Bạn CHỈ trả về JSON hợp lệ, không kèm "
@@ -67,13 +88,59 @@ def _build_user_prompt(idea: str, title: str, keywords: str,
                        image_count: int, aspect_ratio: str,
                        style: str) -> str:
     n = image_count
+    photoreal = _is_photoreal(style)
+
+    if photoreal:
+        film_kind = "phim ngắn điện ảnh TẢ THỰC (cinematic photorealistic)"
+        texture_layer = (
+            'd) TEXTURE TẢ THỰC ĐIỆN ẢNH: tả chất liệu CHÂN THỰC như ảnh chụp / '
+            'phim thật theo phong cách "{style}" — bề mặt/vải/đá/nước/lá/da/tóc/'
+            'lông với chi tiết thật (grain, sợi vải, vân gỗ, lỗ chân lông, phản '
+            'xạ, đổ bóng vật lý), độ phân giải cao, ánh sáng điện ảnh, chiều sâu '
+            'trường ảnh (bokeh). TRÁNH mọi từ gợi hoạt hình (cel-shading, tô màu '
+            'phẳng, nét vẽ tay, Pixar/Disney stylized).'
+        ).format(style=style)
+        style_rules = (
+            "   - PHONG CÁCH BẮT BUỘC (nhắc lại trong TỪNG prompt, đặt ở ĐẦU mỗi "
+            f"prompt):\n     {style}. Đây là ẢNH TẢ THỰC như CHỤP/PHIM ĐIỆN ẢNH "
+            "THẬT, KHÔNG phải\n     hoạt hình. TUYỆT ĐỐI KHÔNG cartoon/anime/2D "
+            "phẳng/3D cách điệu Pixar.\n"
+            "   - Bảng màu ghi hex là tông màu chủ đạo của khung hình điện ảnh — "
+            "chi tiết\n     và ánh sáng CHÂN THỰC như đời thật."
+        )
+        motion_style_note = (
+            f'GẮN đúng phong cách "{style}" (giữ nét tả thực điện ảnh, chân thực '
+            "như phim thật)."
+        )
+    else:
+        film_kind = "phim hoạt hình ngắn"
+        texture_layer = (
+            'd) TEXTURE KIỂU HOẠT HÌNH: tả chất liệu theo ĐÚNG phong cách '
+            '"{style}", KHÔNG\n      phải ảnh thật — mô tả bề mặt/vải/đá/nước/lá '
+            'bằng ngôn ngữ tranh hoạt hình\n      của phong cách đó (nét vẽ/tô '
+            'màu phẳng nếu 2D; khối cách điệu đổ bóng dịu\n      nếu 3D). TRÁNH '
+            'mọi từ gợi ảnh thật (photoreal texture, lỗ chân lông, sợi\n      '
+            'vải thật, 4K photograph...)'
+        ).format(style=style)
+        style_rules = (
+            "   - PHONG CÁCH BẮT BUỘC (nhắc lại trong TỪNG prompt, đặt ở ĐẦU mỗi "
+            f"prompt):\n     {style}. Đây là ẢNH HOẠT HÌNH, KHÔNG phải ảnh chụp. "
+            "TUYỆT ĐỐI KHÔNG\n     photorealistic / photo thật.\n"
+            "   - Bảng màu ghi hex là màu chủ đạo tô theo phong cách hoạt hình "
+            "đã chọn —\n     KHÔNG phải chi tiết chân thực như đời thật."
+        )
+        motion_style_note = (
+            f'GẮN đúng phong cách "{style}" (giữ nét hoạt hình, không làm thật '
+            "hoá)."
+        )
+
     return f"""Ý TƯỞNG NGƯỜI DÙNG: "{idea}"
 
 Tiêu đề dự án (dùng cho thumbnail): "{title}"
 Từ khoá healing gợi ý cho thumbnail: {keywords}
 
 ═══ NHIỆM VỤ ═══
-Thiết kế một "phim hoạt hình ngắn" chill/relaxing gồm ĐÚNG {n} shot (0..{n - 1}).
+Thiết kế một "{film_kind}" chill/relaxing gồm ĐÚNG {n} shot (0..{n - 1}).
 Mỗi shot = 1 prompt tạo ảnh CỰC KÌ CHI TIẾT.
 
 ═══ NGUYÊN TẮC BẮT BUỘC ═══
@@ -127,11 +194,7 @@ Mỗi shot = 1 prompt tạo ảnh CỰC KÌ CHI TIẾT.
       (trước/sau/bên), nhiệt độ màu (ấm/lạnh), shadow (mềm/sắc/dài), highlight
    c) ATMOSPHERE & PARTICLES: sương mù (độ dày, vị trí), bụi phấn, tia nắng,
       hạt mưa, đom đóm, phấn hoa, tuyết... — tuỳ bối cảnh
-   d) TEXTURE KIỂU HOẠT HÌNH: tả chất liệu theo ĐÚNG phong cách "{style}", KHÔNG
-      phải ảnh thật — mô tả bề mặt/vải/đá/nước/lá bằng ngôn ngữ tranh hoạt hình
-      của phong cách đó (nét vẽ/tô màu phẳng nếu 2D; khối cách điệu đổ bóng dịu
-      nếu 3D). TRÁNH mọi từ gợi ảnh thật (photoreal texture, lỗ chân lông, sợi
-      vải thật, 4K photograph...)
+   {texture_layer}
    e) FOREGROUND / MIDGROUND / BACKGROUND: 3 lớp riêng biệt (VD: foreground =
       cành hoa mờ bokeh, midground = nhân vật, background = núi xa mây cuộn)
    f) CẢM XÚC & HÀNH ĐỘNG: biểu cảm cụ thể của nhân vật (mắt lim dim, miệng hé
@@ -151,11 +214,7 @@ Mỗi shot = 1 prompt tạo ảnh CỰC KÌ CHI TIẾT.
      mượt — VD shot 6 kết ở bìa rừng → shot 7 mở ở sâu trong rừng)
 
 5. PHONG CÁCH & QUY TẮC HÌNH ẢNH
-   - PHONG CÁCH BẮT BUỘC (nhắc lại trong TỪNG prompt, đặt ở ĐẦU mỗi prompt):
-     {style}. Đây là ẢNH HOẠT HÌNH, KHÔNG phải ảnh chụp. TUYỆT ĐỐI KHÔNG
-     photorealistic / photo thật.
-   - Bảng màu ghi hex là màu chủ đạo tô theo phong cách hoạt hình đã chọn —
-     KHÔNG phải chi tiết chân thực như đời thật.
+{style_rules}
    - Tỉ lệ: {aspect_ratio}
    - Shot 0 = THUMBNAIL: cùng nhân vật, bố cục hút mắt, giàu cảm xúc. TUYỆT ĐỐI KHÔNG vẽ chữ/tiêu đề/typography/logo/watermark trong ảnh (tiêu đề "{title}"
      sẽ được chèn bằng phần mềm sau — model sinh ảnh không đánh vần được nên
@@ -199,7 +258,7 @@ Mỗi shot = 1 prompt tạo ảnh CỰC KÌ CHI TIẾT.
       ngày & cảm xúc của ảnh (VD hoàng hôn → chuyển động lắng, gió nhẹ hơn).
    f) TÔNG: mô tả bằng tiếng Việt, thêm vài từ khoá tiếng Anh cho Veo khi cần
       (slow motion, subtle, cinematic, seamless loop, anatomically correct).
-      GẮN đúng phong cách "{style}" (giữ nét hoạt hình, không làm thật hoá).
+      {motion_style_note}
    Motion[0] (thumbnail) cũng cần 1 chuyển động nền tinh tế (ambient) hợp cảnh,
    tuân thủ đủ các quy tắc trên.
 
@@ -228,8 +287,10 @@ có cụm phủ định."""
 
 
 def _motion_system(style_brief: str) -> str:
+    medium = ("phim điện ảnh tả thực" if _is_photoreal(style_brief)
+              else "phim hoạt hình")
     return (
-        "Bạn là ĐẠO DIỄN CHUYỂN ĐỘNG cấp cao cho phim hoạt hình "
+        f"Bạn là ĐẠO DIỄN CHUYỂN ĐỘNG cấp cao cho {medium} "
         f"({style_brief}) chill/thiền. Nhiệm vụ: với MỖI ảnh tĩnh cho sẵn, viết "
         "một prompt chuyển động (image-to-video, clip 8 giây) để model video "
         "(Veo) làm động ảnh đó. Đây là khâu DỄ LỖI NHẤT: model video hay 'ảo "
@@ -247,6 +308,11 @@ def _build_motions_user_prompt(idea: str, style: str,
         p = (prompts.get(str(i)) or "").strip()
         lines.append(f'ẢNH {i}: "{p}"')
     joined = "\n\n".join(lines)
+    motion_style_note = (
+        f'Giữ đúng nét tả thực điện ảnh "{style}", CHÂN THỰC như phim thật.'
+        if _is_photoreal(style)
+        else f'Giữ đúng nét hoạt hình "{style}", KHÔNG làm thật hoá.'
+    )
     return f"""Ý TƯỞNG TỔNG THỂ: "{idea}"
 Phong cách: {style}
 
@@ -275,8 +341,7 @@ QUY TẮC BẮT BUỘC cho mỗi motion:
    breath vapor, no smoke from flute or mouth, no head spinning, no reversed
    head, no distorted or extra fingers, no morphing, no scene cut."
 6. Viết tiếng Việt, thêm vài từ khoá tiếng Anh cho Veo (slow motion, subtle,
-   cinematic, seamless loop, anatomically correct). Giữ đúng nét hoạt hình
-   "{style}", KHÔNG làm thật hoá.
+   cinematic, seamless loop, anatomically correct). {motion_style_note}
 
 CÁC ẢNH:
 {joined}

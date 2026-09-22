@@ -52,6 +52,11 @@ class ProjectUpdate(BaseModel):
     video_idea: Optional[str] = None
     auto_video: Optional[bool] = None
     video_style: Optional[str] = None
+    instrument: Optional[str] = None
+    music_style: Optional[str] = None
+    auto_upload: Optional[bool] = None
+    music_source: Optional[str] = None       # "local" | "suno"
+    suno_idea: Optional[str] = None          # ý tưởng/nhạc cụ cho STEP 0 (Suno)
 
 
 class ProjectResponse(BaseModel):
@@ -64,6 +69,11 @@ class ProjectResponse(BaseModel):
     video_idea: str = ""
     auto_video: bool = False
     video_style: str = "2d"
+    instrument: str = ""
+    music_style: str = ""
+    auto_upload: bool = False
+    music_source: str = "local"
+    suno_idea: str = ""
 
 
 # ---------- Tracks ----------

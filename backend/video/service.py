@@ -462,6 +462,7 @@ def run_full_video(project_id: int,
                            audio_path=audio_path, seed=seed,
                            project_name=project_name)
     progress_cb("Hoàn thành", 100.0)
+    _maybe_auto_upload(project_id, progress_cb, project_name)
     return result
 
 
@@ -489,4 +490,214 @@ def run_video_from_images(project_id: int,
                            audio_path=audio_path, seed=seed,
                            project_name=project_name)
     progress_cb("Hoàn thành", 100.0)
+    _maybe_auto_upload(project_id, progress_cb, project_name)
     return result
+
+
+# ── Đăng nháp YouTube qua GPMLogin ──────────────────────────────
+
+def _db():
+    """Kết nối SQLite app.db (worker thread) — trả sqlite3.Connection."""
+    import sqlite3
+    from backend.database import DB_PATH
+    con = sqlite3.connect(str(DB_PATH))
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def _lookup_channel_mapping(instrument: str, music_style: str) -> dict | None:
+    """Tra ChannelMapping theo (instrument, music_style), so khớp không phân biệt
+    hoa/thường & khoảng trắng thừa. Trả dict hoặc None."""
+    ins = (instrument or "").strip().lower()
+    sty = (music_style or "").strip().lower()
+    con = _db()
+    try:
+        row = con.execute(
+            "SELECT * FROM channelmapping "
+            "WHERE lower(trim(instrument))=? AND lower(trim(music_style))=? "
+            "ORDER BY id DESC LIMIT 1",
+            (ins, sty),
+        ).fetchone()
+    except Exception:
+        return None
+    finally:
+        con.close()
+    return dict(row) if row else None
+
+
+def _read_gpm_settings_db() -> tuple[str, str | None]:
+    """Đọc gpm_api_base_url + gpm_exe_path từ appsettings (id=1)."""
+    con = _db()
+    try:
+        row = con.execute(
+            "SELECT gpm_api_base_url, gpm_exe_path FROM appsettings WHERE id=1"
+        ).fetchone()
+    except Exception:
+        return ("", None)
+    finally:
+        con.close()
+    if not row:
+        return ("", None)
+    return (row["gpm_api_base_url"] or "", row["gpm_exe_path"])
+
+
+def _read_project_fields(project_id: int) -> dict:
+    con = _db()
+    try:
+        row = con.execute(
+            "SELECT name, instrument, music_style, auto_upload "
+            "FROM project WHERE id=?", (project_id,)
+        ).fetchone()
+    finally:
+        con.close()
+    return dict(row) if row else {}
+
+
+def _past_titles(profile_id: str, limit: int = 20) -> list[str]:
+    con = _db()
+    try:
+        rows = con.execute(
+            "SELECT title FROM youtubeupload WHERE profile_id=? "
+            "ORDER BY id DESC LIMIT ?", (profile_id, limit)
+        ).fetchall()
+    except Exception:
+        return []
+    finally:
+        con.close()
+    return [r["title"] for r in rows if r["title"]]
+
+
+def _record_upload(project_id: int, mapping: dict, meta: dict,
+                   video_path: str, status: str,
+                   error: str | None = None) -> None:
+    from datetime import datetime, timezone
+    con = _db()
+    try:
+        con.execute(
+            "INSERT INTO youtubeupload "
+            "(project_id, profile_id, channel_name, title, description, "
+            " hashtags, video_path, status, error_message, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (project_id, mapping.get("gpm_profile_id", ""),
+             mapping.get("channel_name", ""), meta.get("title", ""),
+             meta.get("description", ""), meta.get("hashtags", ""),
+             video_path, status, error,
+             datetime.now(timezone.utc).isoformat()),
+        )
+        con.commit()
+    except Exception:
+        pass
+    finally:
+        con.close()
+
+
+def step_upload_youtube(project_id: int,
+                        progress_cb: Callable[[str, float], None],
+                        project_name: str | None = None,
+                        instrument: str | None = None,
+                        music_style: str | None = None) -> dict:
+    """Đăng NHÁP video final.mp4 lên YouTube qua profile GPMLogin khớp
+    (instrument, music_style). AI viết title/description từ thumbnail. KHÔNG
+    publish — chỉ lưu bản nháp."""
+    from backend.core_bridge import get_api_config_from_db
+    from backend.database import DB_PATH
+    from . import gpm_client as gpmc
+    from . import youtube_meta, youtube_driver
+
+    # Lấy instrument/music_style: ưu tiên tham số, fallback đọc từ project.
+    fields = _read_project_fields(project_id)
+    instrument = (instrument if instrument is not None else fields.get("instrument")) or ""
+    music_style = (music_style if music_style is not None else fields.get("music_style")) or ""
+    project_name = project_name or fields.get("name")
+
+    progress_cb("Chuẩn bị đăng nháp YouTube…", 2.0)
+    if not instrument.strip() or not music_style.strip():
+        raise RuntimeError(
+            "Chưa nhập 'nhạc cụ' và 'phong cách nhạc' cho project — cần để chọn "
+            "đúng kênh (profile GPMLogin).")
+
+    mapping = _lookup_channel_mapping(instrument, music_style)
+    if not mapping:
+        raise RuntimeError(
+            f"Chưa cấu hình kênh cho nhạc cụ '{instrument}' + phong cách "
+            f"'{music_style}'. Vào phần Cài đặt → YouTube/GPMLogin để thêm dòng "
+            f"ánh xạ (instrument + music_style → profile).")
+
+    profile_id = mapping.get("gpm_profile_id", "")
+    if not profile_id:
+        raise RuntimeError("Dòng ánh xạ thiếu profile GPMLogin.")
+
+    # File final + thumbnail
+    final = final_dir(project_id, project_name) / "final.mp4"
+    thumb = final_dir(project_id, project_name) / "thumbnail.png"
+    if not final.exists():
+        raise RuntimeError("Chưa có final.mp4 — hãy render video trước khi đăng.")
+
+    # Metadata (AI vision + bộ nhớ chống trùng)
+    progress_cb("AI viết tiêu đề & mô tả từ thumbnail…", 10.0)
+    api_config = get_api_config_from_db(str(DB_PATH))
+    meta = youtube_meta.generate_metadata(
+        thumbnail_path=str(thumb),
+        channel_name=mapping.get("channel_name", ""),
+        instrument=instrument, music_style=music_style,
+        default_hashtags=mapping.get("default_hashtags", ""),
+        past_titles=_past_titles(profile_id),
+        api_config=api_config,
+        log=lambda m: progress_cb(m, 12.0),
+    )
+
+    # Bật GPMLogin profile → CDP
+    progress_cb("Bật GPMLogin & mở kênh YouTube…", 22.0)
+    base_url, exe_path = _read_gpm_settings_db()
+    client = gpmc.GPMClient(base_url or None)
+    try:
+        client.ensure_app_running(exe_path)   # best-effort (không raise nếu thiếu exe)
+    except gpmc.GPMError as e:
+        progress_cb(f"(Bỏ qua tự mở app: {e})", 22.0)
+    cdp = client.start_profile(profile_id)
+
+    try:
+        progress_cb("Điều khiển YouTube Studio (lưu nháp)…", 26.0)
+        result = youtube_driver.upload_draft(
+            cdp_endpoint=cdp,
+            video_path=str(final),
+            title=meta["title"],
+            description=meta["description"],
+            hashtags=meta["hashtags"],
+            language=mapping.get("language", "en-US"),
+            progress_cb=lambda m, p: progress_cb(m, 26.0 + (p / 100.0) * 70.0),
+            log=lambda m: progress_cb(m, 30.0),
+        )
+    except Exception as e:
+        _record_upload(project_id, mapping, meta, str(final),
+                       status="failed", error=f"{type(e).__name__}: {e}")
+        raise
+    finally:
+        client.close_profile(profile_id)
+
+    _record_upload(project_id, mapping, meta, str(final), status="draft")
+    warns = result.get("warnings") or []
+    msg = "Đã lưu bản nháp trên YouTube."
+    if warns:
+        msg += " Lưu ý: " + " | ".join(warns)
+    progress_cb(msg, 100.0)
+    return {"status": "draft", "title": meta["title"],
+            "channel_name": mapping.get("channel_name", ""),
+            "warnings": warns}
+
+
+def _maybe_auto_upload(project_id: int,
+                       progress_cb: Callable[[str, float], None],
+                       project_name: str | None) -> None:
+    """Nếu project bật auto_upload → tự đăng nháp sau khi render xong. KHÔNG làm
+    hỏng job render nếu upload lỗi (chỉ báo qua progress)."""
+    fields = _read_project_fields(project_id)
+    if not fields.get("auto_upload"):
+        return
+    try:
+        progress_cb("Tự động đăng nháp lên YouTube…", 100.0)
+        step_upload_youtube(project_id, progress_cb, project_name,
+                            fields.get("instrument"), fields.get("music_style"))
+    except Exception as e:
+        progress_cb(f"Auto-upload YouTube lỗi (video ĐÃ render xong, bỏ qua "
+                    f"đăng nháp): {type(e).__name__}: {e}", 100.0)

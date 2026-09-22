@@ -13,6 +13,7 @@ import { StemSectionHeader } from '../components/stems/StemSectionHeader';
 import { ApplyAllPanel } from '../components/stems/ApplyAllPanel';
 import { StemPlayerBar } from '../components/stems/StemPlayerBar';
 import VideoPanel from '../components/video/VideoPanel';
+import SunoPanel from '../components/suno/SunoPanel';
 import WorkflowStatusBar from '../components/shared/WorkflowStatusBar';
 import { useStemPlayer } from '../hooks/useStemPlayer';
 import { useProject, useUpdateProject } from '../api/projects';
@@ -20,7 +21,7 @@ import { useTracks, useDeleteTrack } from '../api/tracks';
 import { useMixes, useCreateMix, useDeleteMix } from '../api/mixes';
 import type { Mix, MixCreate } from '../types';
 
-type Tab = 'audio' | 'video';
+type Tab = 'audio' | 'suno' | 'video';
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -45,7 +46,7 @@ export default function ProjectDetailPage() {
   const createMix = useCreateMix(projectId);
   const deleteMix = useDeleteMix(projectId);
 
-  const [tab, setTab] = useState<Tab>('audio');
+  const [tab, setTab] = useState<Tab>('suno');
   const [editing, setEditing] = useState(false);
   const [activeMixId, setActiveMixId] = useState<number | null>(null);
   const [mixToDelete, setMixToDelete] = useState<Mix | null>(null);
@@ -110,8 +111,11 @@ export default function ProjectDetailPage() {
         </>
       }
     >
-      {/* Tabs: Audio / Video */}
+      {/* Tabs: Suno (STEP 0) → Audio → Video — đúng thứ tự pipeline */}
       <div className="mb-5 flex gap-2">
+        <button className={tabBtn('suno')} onClick={() => setTab('suno')}>
+          🎼 Suno
+        </button>
         <button className={tabBtn('audio')} onClick={() => setTab('audio')}>
           🎵 Audio
         </button>
@@ -185,6 +189,8 @@ export default function ProjectDetailPage() {
           </div>
         </div>
       )}
+
+      {tab === 'suno' && <SunoPanel projectId={projectId} />}
 
       {tab === 'video' && <VideoPanel projectId={projectId} />}
 

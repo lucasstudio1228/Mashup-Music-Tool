@@ -32,6 +32,10 @@ def to_response(session: Session, project: Project) -> ProjectResponse:
         track_count=track_count, mix_count=mix_count,
         video_idea=project.video_idea, auto_video=project.auto_video,
         video_style=project.video_style,
+        instrument=project.instrument, music_style=project.music_style,
+        auto_upload=project.auto_upload,
+        music_source=getattr(project, "music_source", "local"),
+        suno_idea=getattr(project, "suno_idea", ""),
     )
 
 

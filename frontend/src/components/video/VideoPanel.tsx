@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import {
   useVideoStatus, useGenImages, useGenClips, useAssemble, useRunAll, useRebuild,
-  useRegenImage, useRegenClip, useRegenMotions,
+  useRegenImage, useRegenClip, useRegenMotions, useVideoStyles,
+  useUploadYoutube, useYoutubeHistory,
   videoDownloadUrl, videoThumbnailUrl, videoImageUrl, videoClipUrl,
 } from "../../api/video";
 import { useProject, useUpdateProject } from "../../api/projects";
@@ -42,6 +43,7 @@ function Stat({ label, value, ok }: { label: string; value: string; ok?: boolean
 export default function VideoPanel({ projectId }: { projectId: number }) {
   const { data: st, isLoading } = useVideoStatus(projectId);
   const { data: project } = useProject(projectId);
+  const { data: styleData } = useVideoStyles(projectId);
   const updateProject = useUpdateProject(projectId);
   const genImages = useGenImages(projectId);
   const genClips  = useGenClips(projectId);
@@ -51,6 +53,8 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
   const regenImage   = useRegenImage(projectId);
   const regenClip    = useRegenClip(projectId);
   const regenMotions = useRegenMotions(projectId);
+  const uploadYoutube = useUploadYoutube(projectId);
+  const { data: ytHistory, refetch: refetchYtHistory } = useYoutubeHistory(projectId);
   const [idea, setIdea] = useState("");
   // Nạp ý tưởng đã lưu của project vào ô nhập (khi tải xong / đổi project).
   const savedIdea = project?.video_idea ?? "";
@@ -60,10 +64,27 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
   const [bust, setBust] = useState(() => Date.now());
   const jobStatus = st?.job?.status;
   useEffect(() => {
-    if (jobStatus === "completed") setBust(Date.now());
-  }, [jobStatus]);
+    if (jobStatus === "completed") {
+      setBust(Date.now());
+      refetchYtHistory();   // cập nhật lịch sử đăng nháp sau khi job xong
+    }
+  }, [jobStatus, refetchYtHistory]);
+  // Nhạc cụ + phong cách nhạc (dùng để tra kênh YouTube khi đăng nháp).
+  const [instrument, setInstrument] = useState("");
+  const [musicStyle, setMusicStyle] = useState("");
+  const savedInstrument = project?.instrument ?? "";
+  const savedMusicStyle = project?.music_style ?? "";
+  useEffect(() => { setInstrument(savedInstrument); }, [savedInstrument, projectId]);
+  useEffect(() => { setMusicStyle(savedMusicStyle); }, [savedMusicStyle, projectId]);
+  const autoUpload = project?.auto_upload ?? false;
+  const ytFieldsDirty =
+    instrument.trim() !== savedInstrument.trim() ||
+    musicStyle.trim() !== savedMusicStyle.trim();
+  const ytFieldsSet = !!savedInstrument.trim() && !!savedMusicStyle.trim();
   const autoVideo = project?.auto_video ?? false;
   const videoStyle = project?.video_style ?? "2d";
+  const styleList = styleData?.styles ?? [];
+  const currentStyle = styleList.find((s) => s.key === videoStyle);
   const ideaDirty = idea.trim() !== savedIdea.trim();
 
   if (isLoading || !st) {
@@ -87,6 +108,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
     assemble: "Đang ghép video", full: "Đang chạy toàn bộ",
     rebuild: "Đang tạo lại video từ ảnh",
     motions: "Đang sinh lại prompt chuyển động",
+    upload: "Đang đăng nháp lên YouTube",
   };
 
   const imageIndices = st.image_indices ?? [];
@@ -200,35 +222,39 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
         </Section>
 
         <Section title="Phong cách hình ảnh & video">
-          <div className="grid grid-cols-2 gap-2">
-            {([
-              { key: "2d", title: "2D", desc: "Tranh vẽ / anime / cartoon" },
-              { key: "3d", title: "3D", desc: "Pixar / Disney CGI" },
-            ] as const).map((s) => {
+          <div className="max-h-64 space-y-1.5 overflow-y-auto pr-1">
+            {styleList.length === 0 && (
+              <p className="text-xs text-gray-500">Đang tải danh sách phong cách…</p>
+            )}
+            {styleList.map((s) => {
               const active = videoStyle === s.key;
               return (
                 <button
                   key={s.key}
                   disabled={busy || updateProject.isPending}
                   onClick={() => updateProject.mutate({ video_style: s.key })}
-                  className={`rounded-lg border px-3 py-2.5 text-left transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                  className={`flex w-full items-start gap-2.5 rounded-lg border px-3 py-2.5 text-left transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
                     active
                       ? "border-accent bg-accent/15 text-white"
                       : "border-white/10 bg-background text-gray-300 hover:bg-white/5"
                   }`}
                 >
-                  <div className="flex items-center gap-1.5 text-sm font-semibold">
-                    <span>{active ? "●" : "○"}</span>
-                    {s.title === "2D" ? "🎨 2D" : "🧊 3D"}
-                  </div>
-                  <div className="mt-0.5 text-[11px] text-gray-400">{s.desc}</div>
+                  <span className="mt-0.5 text-lg leading-none">{s.icon}</span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center gap-1.5 text-sm font-semibold">
+                      <span>{active ? "●" : "○"}</span>
+                      {s.label}
+                    </span>
+                    <span className="mt-0.5 block text-[11px] text-gray-400">{s.desc}</span>
+                  </span>
                 </button>
               );
             })}
           </div>
           <p className="mt-2 text-xs text-gray-500">
-            Lựa chọn này ép thẳng vào prompt tạo <b>ảnh</b> (Gemini) và <b>video</b> (Flow/Veo).
-            Đổi phong cách rồi bấm <b>Tạo lại từ đầu</b> để áp dụng cho toàn bộ.
+            Cuộn để chọn phong cách. Lựa chọn này ép thẳng vào prompt tạo <b>ảnh</b> (Gemini)
+            và <b>video</b> (Flow/Veo). Đổi phong cách rồi bấm <b>Tạo lại từ đầu</b> để áp dụng
+            cho toàn bộ.
           </p>
         </Section>
 
@@ -243,7 +269,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
           />
           <p className="mt-2 text-xs text-gray-500">
             AI sẽ bám theo ý tưởng để viết prompt cho từng cảnh — mặc định tỉ lệ
-            <b> 16:9</b>, phong cách <b>{videoStyle === "3d" ? "hoạt hình 3D (Pixar/Disney)" : "hoạt hình 2D (tranh vẽ/anime)"}</b>,
+            <b> 16:9</b>, phong cách <b>{currentStyle?.label ?? videoStyle}</b>,
             nhân vật <b>đồng bộ xuyên suốt</b> như một bộ phim ngắn chill/relaxing.
             Các ảnh không chứa chữ; tiêu đề được ghép vào đầu video và xuất thumbnail riêng khi ghép.
           </p>
@@ -387,11 +413,168 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
           </div>
         </Section>
 
+        <Section title="Đăng nháp lên YouTube (qua GPMLogin)">
+          <p className="mb-3 text-xs text-gray-500">
+            Sau khi có <code className="text-gray-400">final.mp4</code>, tool mở đúng
+            profile GPMLogin (theo <b>nhạc cụ</b> + <b>phong cách nhạc</b> bên dưới),
+            AI đọc thumbnail để viết title/description (nhắc tên kênh, tránh trùng),
+            đặt cấu hình chuẩn (không dành cho trẻ em · không quảng cáo · có yếu tố AI ·
+            ngôn ngữ Anh–Mỹ) rồi <b>lưu bản nháp</b>. <b>KHÔNG bao giờ publish</b> —
+            bạn tự đăng khi muốn.
+          </p>
+
+          <div className="grid grid-cols-2 gap-2">
+            <label className="block">
+              <span className="mb-1 block text-[11px] uppercase tracking-wide text-gray-500">
+                Nhạc cụ
+              </span>
+              <input
+                type="text"
+                value={instrument}
+                onChange={(e) => setInstrument(e.target.value)}
+                disabled={busy}
+                placeholder="vd: flute, piano, guitar"
+                className="w-full rounded-lg border border-white/10 bg-background px-3 py-2 text-sm text-gray-200 placeholder:text-gray-600 focus:border-accent focus:outline-none disabled:opacity-50"
+              />
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-[11px] uppercase tracking-wide text-gray-500">
+                Phong cách nhạc
+              </span>
+              <input
+                type="text"
+                value={musicStyle}
+                onChange={(e) => setMusicStyle(e.target.value)}
+                disabled={busy}
+                placeholder="vd: ambient, lofi, healing"
+                className="w-full rounded-lg border border-white/10 bg-background px-3 py-2 text-sm text-gray-200 placeholder:text-gray-600 focus:border-accent focus:outline-none disabled:opacity-50"
+              />
+            </label>
+          </div>
+
+          <div className="mt-3 flex items-center gap-2">
+            <button
+              className={`${btn} bg-surface-2 text-gray-200 hover:bg-white/10`}
+              disabled={updateProject.isPending || !ytFieldsDirty}
+              onClick={() =>
+                updateProject.mutate({
+                  instrument: instrument.trim(),
+                  music_style: musicStyle.trim(),
+                })
+              }
+            >
+              💾 Lưu nhạc cụ / phong cách
+            </button>
+            {ytFieldsDirty && (
+              <span className="text-xs text-yellow-300">Có thay đổi chưa lưu</span>
+            )}
+          </div>
+          <p className="mt-1 text-xs text-gray-600">
+            Cặp (nhạc cụ · phong cách) được dùng để tra <b>bảng ánh xạ kênh</b> trong
+            ⚙️ Settings → chọn đúng profile GPMLogin + hashtag + ngôn ngữ.
+          </p>
+
+          <button
+            className={`${primary} mt-3 w-full`}
+            disabled={busy || !st.final_exists || !ytFieldsSet || ytFieldsDirty}
+            onClick={() => {
+              if (confirm("Mở GPMLogin, đăng NHÁP video lên YouTube (không publish)?")) {
+                uploadYoutube.mutate(undefined);
+              }
+            }}
+          >
+            📤 Đăng nháp lên YouTube
+          </button>
+          {!st.final_exists && (
+            <p className="mt-1 text-xs text-yellow-300">
+              ⚠️ Chưa có final.mp4 — hãy render video trước.
+            </p>
+          )}
+          {st.final_exists && !ytFieldsSet && (
+            <p className="mt-1 text-xs text-yellow-300">
+              ⚠️ Hãy nhập &amp; lưu <b>nhạc cụ</b> và <b>phong cách nhạc</b> trước.
+            </p>
+          )}
+          {st.final_exists && ytFieldsSet && ytFieldsDirty && (
+            <p className="mt-1 text-xs text-yellow-300">
+              ⚠️ Lưu thay đổi nhạc cụ/phong cách trước khi đăng.
+            </p>
+          )}
+
+          <label className="mt-3 flex cursor-pointer items-start gap-2 rounded-lg border border-white/5 bg-background px-3 py-2">
+            <input
+              type="checkbox"
+              className="mt-0.5 h-4 w-4 accent-accent"
+              checked={autoUpload}
+              disabled={updateProject.isPending}
+              onChange={(e) => updateProject.mutate({ auto_upload: e.target.checked })}
+            />
+            <span className="text-xs text-gray-300">
+              <b>Tự động đăng nháp sau khi render video xong</b>
+              <br />
+              <span className="text-gray-500">
+                Khi <code className="text-gray-400">final.mp4</code> được tạo, hệ thống
+                tự đăng nháp (chỉ chạy nếu đã có nhạc cụ/phong cách + ánh xạ kênh).
+              </span>
+            </span>
+          </label>
+
+          {ytHistory && ytHistory.length > 0 && (
+            <div className="mt-4">
+              <div className="mb-1.5 text-xs font-semibold text-gray-300">
+                Lịch sử đăng nháp
+              </div>
+              <div className="max-h-56 space-y-1.5 overflow-y-auto pr-1">
+                {ytHistory.map((h) => (
+                  <div
+                    key={h.id}
+                    className="rounded-lg border border-white/10 bg-background px-3 py-2"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="truncate text-xs font-semibold text-gray-200">
+                        {h.title || "(chưa có title)"}
+                      </span>
+                      <span
+                        className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+                          h.status === "draft"
+                            ? "bg-green-950/40 text-green-400"
+                            : h.status === "error"
+                            ? "bg-red-950/40 text-red-400"
+                            : "bg-white/10 text-gray-300"
+                        }`}
+                      >
+                        {h.status}
+                      </span>
+                    </div>
+                    <div className="mt-0.5 text-[11px] text-gray-500">
+                      {h.channel_name && <span>📺 {h.channel_name} · </span>}
+                      {h.created_at
+                        ? new Date(h.created_at).toLocaleString()
+                        : ""}
+                    </div>
+                    {h.hashtags && (
+                      <div className="mt-0.5 truncate text-[11px] text-gray-600">
+                        {h.hashtags}
+                      </div>
+                    )}
+                    {h.error_message && (
+                      <div className="mt-0.5 text-[11px] text-red-400 break-words">
+                        {h.error_message.slice(0, 200)}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </Section>
+
         <Section title="Lưu ý">
           <ul className="list-disc space-y-1 pl-4 text-xs text-gray-500">
             <li>Lần đầu, cửa sổ trình duyệt sẽ mở ra để bạn <b>tự đăng nhập Gemini & Flow</b> (session được lưu lại).</li>
             <li>Automation Gemini/Flow là best-effort — nếu báo lỗi "không tìm thấy selector", cập nhật trong <code className="text-gray-400">backend/video/config.py</code>.</li>
             <li>Chỉ chạy 1 tác vụ video tại một thời điểm.</li>
+            <li>Đăng YouTube cần bật <b>Local API</b> trong GPMLogin và mỗi profile đã đăng nhập sẵn kênh. Cấu hình ánh xạ kênh ở ⚙️ Settings.</li>
           </ul>
         </Section>
       </div>

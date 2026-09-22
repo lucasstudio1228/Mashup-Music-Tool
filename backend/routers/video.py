@@ -51,6 +51,23 @@ def _guard_busy():
         raise HTTPException(409, "Đang có 1 tác vụ video chạy. Vui lòng đợi.")
 
 
+@router.get("/styles")
+def list_styles(project_id: int):
+    """Danh sách phong cách hình ảnh/video cho bộ chọn ở UI (cuộn được)."""
+    return {
+        "default": config.DEFAULT_STYLE,
+        "styles": [
+            {
+                "key": key,
+                "icon": s.get("icon", ""),
+                "label": s.get("label", key),
+                "desc": s.get("desc", ""),
+            }
+            for key, s in config.STYLES.items()
+        ],
+    }
+
+
 @router.get("/status")
 def status(project_id: int, db: Session = Depends(get_session)):
     project = _project_or_404(db, project_id)
@@ -176,6 +193,41 @@ def regen_motions(project_id: int, db: Session = Depends(get_session)):
     video_job_manager.submit(project_id, "motions", service.regen_motions,
                              project.name, project.video_style)
     return {"status": "submitted", "kind": "motions"}
+
+
+@router.post("/upload-youtube")
+def upload_youtube(project_id: int, db: Session = Depends(get_session)):
+    """Đăng NHÁP video final.mp4 lên YouTube qua GPMLogin (thủ công). Chọn kênh
+    theo (instrument, music_style) của project. KHÔNG publish — chỉ lưu nháp."""
+    project = _project_or_404(db, project_id)
+    _guard_busy()
+    final = config.final_dir(project_id, project.name) / "final.mp4"
+    if not final.exists():
+        raise HTTPException(400, "Chưa có final.mp4 — hãy render video trước.")
+    if not (project.instrument or "").strip() or not (project.music_style or "").strip():
+        raise HTTPException(
+            400, "Chưa nhập 'nhạc cụ' và 'phong cách nhạc' cho project.")
+    video_job_manager.submit(project_id, "upload", service.step_upload_youtube,
+                             project.name, project.instrument, project.music_style)
+    return {"status": "submitted", "kind": "upload"}
+
+
+@router.get("/youtube-history")
+def youtube_history(project_id: int, db: Session = Depends(get_session)):
+    """Lịch sử các lần đăng nháp của project (title/description/hashtag/thời gian)."""
+    from backend.models import YoutubeUpload
+    from sqlmodel import select
+    _project_or_404(db, project_id)
+    rows = db.exec(
+        select(YoutubeUpload).where(YoutubeUpload.project_id == project_id)
+        .order_by(YoutubeUpload.id.desc())
+    ).all()
+    return [{
+        "id": r.id, "channel_name": r.channel_name, "title": r.title,
+        "hashtags": r.hashtags, "status": r.status,
+        "error_message": r.error_message,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    } for r in rows]
 
 
 @router.post("/cancel")

@@ -16,6 +16,21 @@ export function useVideoStatus(projectId: number) {
   });
 }
 
+export type VideoStyleOption = {
+  key: string;
+  icon: string;
+  label: string;
+  desc: string;
+};
+
+export function useVideoStyles(projectId: number) {
+  return useQuery<{ default: string; styles: VideoStyleOption[] }>({
+    queryKey: ["video-styles"],
+    queryFn: async () => (await api.get(`${base(projectId)}/styles`)).data,
+    staleTime: Infinity,        // danh sách phong cách gần như tĩnh
+  });
+}
+
 function useVideoAction(projectId: number, path: string) {
   const qc = useQueryClient();
   return useMutation({
@@ -31,6 +46,28 @@ export function useCancelVideo(projectId: number) {
   return useMutation({
     mutationFn: () => api.post(`${base(projectId)}/cancel`),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["video", projectId] }),
+  });
+}
+
+export const useUploadYoutube = (pid: number) => useVideoAction(pid, "upload-youtube");
+
+export type YoutubeHistoryItem = {
+  id: number;
+  channel_name: string;
+  title: string;
+  hashtags: string;
+  status: string;
+  error_message: string | null;
+  created_at: string | null;
+};
+
+export function useYoutubeHistory(projectId: number) {
+  return useQuery<YoutubeHistoryItem[]>({
+    queryKey: ["youtube-history", projectId],
+    queryFn: async () =>
+      (await api.get(`${base(projectId)}/youtube-history`)).data,
+    // Cập nhật lịch sử khi có job upload đang chạy.
+    refetchInterval: (q) => (q.state.data ? false : false),
   });
 }
 
