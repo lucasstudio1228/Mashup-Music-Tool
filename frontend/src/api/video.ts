@@ -31,6 +31,40 @@ export function useVideoStyles(projectId: number) {
   });
 }
 
+export type ThumbnailFontOption = { key: string; label: string; note: string };
+
+// Font tiêu đề thumbnail + intro — lựa chọn CHUNG cho mọi project.
+export function useThumbnailFonts(projectId: number) {
+  return useQuery<{ selected: string; default: string; fonts: ThumbnailFontOption[] }>({
+    queryKey: ["thumbnail-fonts"],
+    queryFn: async () => (await api.get(`${base(projectId)}/thumbnail-fonts`)).data,
+  });
+}
+
+export function useSetThumbnailFont(projectId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (key: string) => api.put(`${base(projectId)}/thumbnail-fonts`, { key }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["thumbnail-fonts"] }),
+  });
+}
+
+// Máy tạo clip (chung mọi project): flow | gemini | muse.
+export function useSetClipEngine(projectId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (engine: string) => api.put(`${base(projectId)}/clip-engine`, { engine }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["video"] }),
+  });
+}
+
+// Ảnh mẫu: tên project viết bằng font `key` trên ảnh bìa của chính project.
+export function thumbnailFontPreviewUrl(projectId: number, key: string,
+                                        bust?: string | number): string {
+  const q = bust != null ? `?t=${encodeURIComponent(String(bust))}` : "";
+  return `${API_BASE}${base(projectId)}/thumbnail-fonts/${encodeURIComponent(key)}/preview${q}`;
+}
+
 function useVideoAction(projectId: number, path: string) {
   const qc = useQueryClient();
   return useMutation({
@@ -67,6 +101,17 @@ export function useResumeVideo(projectId: number) {
 
 export const useUploadYoutube = (pid: number) => useVideoAction(pid, "upload-youtube");
 
+// Mở cửa sổ Flow/Gemini bằng profile của tool (theo dõi/đăng nhập/kiểm tra).
+export function useOpenVideoBrowser(projectId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (site: "flow" | "gemini") =>
+      api.post(`${base(projectId)}/open-browser`, null, { params: { site } }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["video", projectId] }),
+  });
+}
+export const useCloseVideoBrowser = (pid: number) => useVideoAction(pid, "close-browser");
+
 export type YoutubeHistoryItem = {
   id: number;
   channel_name: string;
@@ -92,9 +137,15 @@ export const usePreparePrompts = (pid: number) => useVideoAction(pid, "prompts/p
 export function usePromptManifest(pid: number) {
   return useQuery<{ manifest: null | {
     workflow_version?: number;
+    scene_count?: number;
+    // prompts: 3 ảnh (0 bìa, 1 nhân vật chính, 2 linh thú).
     prompts?: Record<string, string>;
+    // motions: prompt cảnh, khoá theo CHỈ SỐ CLIP (0..total_clips-1).
     motions?: Record<string, string>;
-    continuity?: { character_sheet?: string; scene_sheet?: string };
+    continuity?: {
+      character_sheet?: string; pet_sheet?: string; pet_name?: string;
+      scene_sheet?: string;
+    };
     creative_brief?: { music?: string; visual?: string };
   } }>({
     queryKey: ["prompt-manifest", pid],
@@ -146,4 +197,67 @@ export function videoDownloadUrl(projectId: number): string {
 export function videoThumbnailUrl(projectId: number, bust?: string | number): string {
   const q = bust != null ? `?t=${encodeURIComponent(String(bust))}` : "";
   return `${API_BASE}${base(projectId)}/thumbnail${q}`;
+}
+
+// ── "Tạo video thủ công" (bán tự động) ───────────────────────────
+// Tool mở Flow + đưa 2 bảng nhân vật vào ô soạn; người dùng dán prompt + bấm
+// Tạo; tool tải về + đặt tên clip_NN.mp4.
+export type ManualClipItem = {
+  index: number;
+  name: string;
+  ingredients: number[];
+  prompt: string;        // đúng chữ tool sẽ gửi Flow (đã bọc phong cách + phủ định)
+  done: boolean;
+};
+
+export type ManualState = {
+  active: boolean;
+  phase: "opening" | "preparing" | "waiting_user" | "downloading" | "done" | "error" | "stopped" | string;
+  current: number | null;
+  prompt: string;
+  ingredients: number[];
+  blocked: string | null;
+  total: number;
+  done: number[];
+  todo: number[];
+  message: string;
+  updated_at?: number;
+};
+
+export function useManualClips(projectId: number, poll: boolean) {
+  return useQuery<{ total: number; clips: ManualClipItem[]; state: ManualState | null }>({
+    queryKey: ["manual-clips", projectId],
+    queryFn: async () => (await api.get(`${base(projectId)}/clips/manual`)).data,
+    refetchInterval: poll ? 2000 : false,
+    retry: false,
+  });
+}
+
+export function useStartManualClips(projectId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body?: { only?: number[]; assemble?: boolean }) =>
+      api.post(`${base(projectId)}/clips/manual`, body ?? {}),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["video", projectId] });
+      qc.invalidateQueries({ queryKey: ["manual-clips", projectId] });
+    },
+  });
+}
+
+export function useImportClip(projectId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ index, file }: { index: number; file: File }) => {
+      const fd = new FormData();
+      fd.append("file", file);
+      return api.post(`${base(projectId)}/clips/${index}/import`, fd, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["video", projectId] });
+      qc.invalidateQueries({ queryKey: ["manual-clips", projectId] });
+    },
+  });
 }

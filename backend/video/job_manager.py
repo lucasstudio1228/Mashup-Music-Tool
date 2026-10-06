@@ -26,6 +26,8 @@ class VideoJob:
     message: str = ""
     error: Optional[str] = None
     result: Optional[dict] = None
+    started_at: float = field(default_factory=time.time)
+    finished_at: Optional[float] = None
 
 
 class VideoJobManager:
@@ -46,13 +48,22 @@ class VideoJobManager:
             return any(j.status in ("pending", "running", "paused")
                        for j in self._jobs.values())
 
+    def active_jobs(self) -> list[VideoJob]:
+        """Các job chưa kết thúc (running/paused trước, pending = đang xếp hàng)."""
+        with self._lock:
+            jobs = [j for j in self._jobs.values()
+                    if j.status in ("pending", "running", "paused")]
+        return sorted(jobs, key=lambda j: j.status == "pending")
+
     def get(self, project_id: int) -> Optional[VideoJob]:
         with self._lock:
             return self._jobs.get(project_id)
 
-    def submit(self, project_id: int, kind: str, fn, *args, **kwargs) -> None:
+    def submit(self, project_id: int, kind: str, fn, *args,
+               queued_message: str = "", **kwargs) -> None:
         with self._lock:
-            self._jobs[project_id] = VideoJob(project_id=project_id, kind=kind)
+            self._jobs[project_id] = VideoJob(project_id=project_id, kind=kind,
+                                              message=queued_message)
             self._queues.setdefault(project_id, asyncio.Queue())
             self._cancels[project_id] = threading.Event()
             self._pauses[project_id] = threading.Event()
@@ -144,6 +155,9 @@ class VideoJobManager:
             self._push(project_id, {"type": "progress",
                                     "message": message,
                                     "percent": round(percent, 1)})
+        # Cho job kiểm cờ huỷ/tạm dừng GIỮA các thao tác chặn lâu (không đổi
+        # message/percent) — xem browser_base.set_cancel_check.
+        cb.is_cancelled = lambda: ev is not None and ev.is_set()
         return cb
 
     def _update(self, project_id, **kw):
@@ -152,6 +166,13 @@ class VideoJobManager:
             if job:
                 for k, v in kw.items():
                     setattr(job, k, v)
+                if kw.get("status") in ("completed", "failed", "cancelled"):
+                    job.finished_at = time.time()
+
+    def all_jobs(self) -> list[VideoJob]:
+        """Mọi job (kể cả đã xong) — cho thanh tác vụ toàn cục."""
+        with self._lock:
+            return list(self._jobs.values())
 
     def _queue(self, project_id) -> asyncio.Queue:
         with self._lock:

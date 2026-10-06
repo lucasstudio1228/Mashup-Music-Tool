@@ -18,6 +18,7 @@ class StemJobManager:
         self._queues:  dict[int, asyncio.Queue] = {}
         self._futures: dict[int, object]         = {}
         self._statuses: dict[int, str]           = {}
+        self._messages: dict[int, str]           = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._lock = threading.Lock()
 
@@ -32,6 +33,7 @@ class StemJobManager:
 
         def _progress(msg: str):
             self._statuses[stem_id] = "running"
+            self._messages[stem_id] = msg
             self._push(stem_id, {"type": "progress", "message": msg})
 
         def _on_done(future):
@@ -51,6 +53,13 @@ class StemJobManager:
         future.add_done_callback(_on_done)
         with self._lock:
             self._futures[stem_id] = future
+
+    def active(self) -> list[tuple[int, str, str]]:
+        """(stem_id, status, message cuối) của các job pending/running."""
+        with self._lock:
+            return [(sid, st, self._messages.get(sid, ""))
+                    for sid, st in self._statuses.items()
+                    if st in ("pending", "running")]
 
     def _push(self, stem_id: int, event: dict):
         if not self._loop:

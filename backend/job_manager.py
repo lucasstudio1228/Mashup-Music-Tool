@@ -29,6 +29,7 @@ class JobProgress:
     message: str = ""
     error: Optional[str] = None
     result: Optional[dict] = None
+    finished_at: Optional[float] = None
 
 
 class JobManager:
@@ -156,6 +157,13 @@ class JobManager:
             if job:
                 for key, value in kwargs.items():
                     setattr(job, key, value)
+                if kwargs.get("status") in ("completed", "failed", "cancelled"):
+                    job.finished_at = time.time()
+
+    def all_jobs(self) -> list[JobProgress]:
+        """Mọi job mix (kể cả đã xong) — cho thanh tác vụ toàn cục."""
+        with self._lock:
+            return list(self._jobs.values())
 
     def get_status(self, mix_id: int) -> Optional[JobProgress]:
         with self._lock:

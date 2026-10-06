@@ -262,6 +262,57 @@ def migrate_add_suno_idea_column():
         conn.close()
 
 
+def migrate_add_project_batch_id():
+    """
+    M009: thêm project.batch_id (nhóm project cùng 1 lô sản xuất hàng loạt).
+    Project cũ mặc định NULL (tạo lẻ). Bảng mới `batchrun` do
+    create_db_and_tables() tạo.
+    """
+    if not DB_PATH.exists():
+        return
+
+    conn = _get_conn()
+    try:
+        if not _table_exists(conn, "project"):
+            return  # create_db_and_tables sẽ tạo đủ cột
+        if _column_exists(conn, "project", "batch_id"):
+            return  # Đã migrate rồi
+        print("  [Migration M009] Adding project column: batch_id")
+        conn.execute("ALTER TABLE project ADD COLUMN batch_id TEXT")
+        conn.commit()
+        print("  [Migration M009] Done.")
+    except Exception as e:
+        raise RuntimeError(f"Migration M009 failed: {e}") from e
+    finally:
+        conn.close()
+
+
+def migrate_add_project_mix_settings():
+    """
+    M010: thêm project.mix_duration_minutes + mix_crossfade_seconds — thời lượng
+    mix mà chuỗi tự động (Suno→Mix→Video) dùng; trước đây cứng 60'/15s.
+    """
+    if not DB_PATH.exists():
+        return
+
+    conn = _get_conn()
+    try:
+        if not _table_exists(conn, "project"):
+            return
+        for col, default in (("mix_duration_minutes", 120.0),
+                             ("mix_crossfade_seconds", 5.0)):
+            if _column_exists(conn, "project", col):
+                continue
+            print(f"  [Migration M010] Adding project column: {col}")
+            conn.execute(
+                f"ALTER TABLE project ADD COLUMN {col} FLOAT DEFAULT {default}")
+        conn.commit()
+    except Exception as e:
+        raise RuntimeError(f"Migration M010 failed: {e}") from e
+    finally:
+        conn.close()
+
+
 def run_all():
     """Gọi hàm này ở startup, trước create_db_and_tables()."""
     migrate_remove_project_api_fields()   # M001
@@ -271,5 +322,7 @@ def run_all():
     migrate_add_project_video_style()      # M005
     migrate_add_youtube_upload_columns()   # M006
     migrate_add_suno_columns()             # M007
-    migrate_add_suno_idea_column()         # M008 — mới
+    migrate_add_suno_idea_column()         # M008
+    migrate_add_project_batch_id()         # M009
+    migrate_add_project_mix_settings()     # M010 — mới
     # Thêm migration mới vào đây theo thứ tự

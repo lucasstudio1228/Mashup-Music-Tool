@@ -58,9 +58,36 @@ def _project_or_404(db: Session, project_id: int) -> Project:
     return p
 
 
-def _guard_busy():
-    if video_job_manager.is_busy():
-        raise HTTPException(409, "Đang có 1 tác vụ (video/suno) chạy. Vui lòng đợi.")
+_KIND_VI = {"upload": "đăng nháp YouTube", "suno": "Suno", "suno-fix": "tạo lại bài Suno",
+            "suno-login": "đăng nhập Suno", "remux": "thay nhạc final.mp4",
+            "full": "dựng video", "images": "tạo ảnh", "clips": "tạo clip",
+            "assemble": "ghép video"}
+
+
+def _describe_job(db: Session, job) -> str:
+    p = db.get(Project, job.project_id)
+    name = f" «{p.name}»" if p else ""
+    pct = f" {job.percent:.0f}%" if job.status == "running" else ""
+    state = {"paused": " (đang TẠM DỪNG)", "pending": " (đang xếp hàng)"}.get(job.status, "")
+    return (f"project #{job.project_id}{name} — "
+            f"{_KIND_VI.get(job.kind, job.kind)}{pct}{state}")
+
+
+def _guard_busy(db: Session, project_id: int, allow_queue: bool = False) -> str:
+    """Worker video/Suno chỉ có 1 luồng. Trả "" nếu rảnh; nếu đang có job của
+    project KHÁC chạy (không tạm dừng) và chưa ai xếp hàng → cho xếp hàng
+    (allow_queue) và trả lời nhắn "đang chờ"; ngược lại 409 nói rõ ai đang bận."""
+    jobs = video_job_manager.active_jobs()
+    if not jobs:
+        return ""
+    head = jobs[0]
+    who = _describe_job(db, head)
+    if (allow_queue and len(jobs) == 1 and head.status == "running"
+            and head.project_id != project_id):
+        return (f"⏳ Đang xếp hàng — chờ {who} xong rồi TỰ chạy "
+                "(không cần bấm lại, đừng đóng tool).")
+    extra = (f"; đã có {_describe_job(db, jobs[1])} chờ sau" if len(jobs) > 1 else "")
+    raise HTTPException(409, f"Worker đang bận: {who}{extra}. Đợi xong rồi bấm lại.")
 
 
 @router.get("/config")
@@ -113,6 +140,11 @@ def suno_generate_styles(project_id: int, body: GenStylesBody,
     auto_upload để luồng chạy tự động tới bước lưu nháp YouTube."""
     project = _project_or_404(db, project_id)
     idea = (body.idea or "").strip()
+    # Prompt 100% tiếng Anh ⇒ ý tưởng được dịch trước khi lưu/dùng
+    # (dịch lỗi → giữ bản gốc; generate_suno_styles vẫn tự dịch lại).
+    from backend.video.translate import needs_translation, to_english_or_none
+    if needs_translation(idea):
+        idea = to_english_or_none(idea) or idea
 
     # Lưu ý tưởng vào project (textbox nhớ giữa các phiên) — giống video_idea.
     if body.save:
@@ -164,6 +196,7 @@ def _classify_and_prepare(db: Session, project: Project, title: str, idea: str,
     nếu chưa cấu hình / không khớp)."""
     from backend.models import ChannelMapping
     from backend.video.channel_match import classify_channel
+    from backend.video.music_spec import same_instrument
 
     mappings = [
         {"instrument": m.instrument, "music_style": m.music_style,
@@ -182,10 +215,25 @@ def _classify_and_prepare(db: Session, project: Project, title: str, idea: str,
                    "YouTube/GPMLogin thêm dòng (nhạc cụ + phong cách → profile) "
                    "thì tool mới đăng nháp đúng kênh. Suno/Mix/Video vẫn chạy.")
     else:
-        matched = classify_channel(title, idea, styles, mappings, api_config)
+        user_inst = (project.instrument or "").strip()
+        pool = mappings
+        if user_inst:
+            # Người dùng đã chọn nhạc cụ → chỉ xét kênh CÙNG nhạc cụ; không bao
+            # giờ đổi sang nhạc cụ khác (piano không bị đổi thành guitar).
+            pool = [m for m in mappings if same_instrument(m["instrument"], user_inst)]
+            style = (project.music_style or "").strip().lower()
+            exact = [m for m in pool if style and m["music_style"].strip().lower() == style]
+            if len(exact) == 1:
+                pool = exact
+        matched = classify_channel(title, idea, styles, pool, api_config) if pool else None
         if matched:
+            # Cùng nhạc cụ → lấy đúng chuỗi trong ánh xạ để bước đăng nháp tra khớp.
             project.instrument = matched.get("instrument", "")
             project.music_style = matched.get("music_style", "")
+        elif user_inst and not pool:
+            warning = (f"Chưa có kênh YouTube nào cho nhạc cụ «{user_inst}». Thêm dòng "
+                       "ánh xạ ở ⚙️ Settings → YouTube/GPMLogin. Suno/Mix/Video vẫn chạy "
+                       "đúng nhạc cụ; tool dừng ở bước đăng nháp để không đăng nhầm kênh.")
         else:
             warning = ("Không xác định chắc chắn kênh YouTube cho project này. "
                        "Kiểm tra nhạc cụ trong Tên project, hoặc thêm dòng ánh xạ "
@@ -227,10 +275,12 @@ def suno_dry_run(project_id: int, body: StartBody = StartBody(),
                  db: Session = Depends(get_session)):
     """Điền form + đọc credits/plan, KHÔNG Create/tải. An toàn, không tốn credit."""
     _project_or_404(db, project_id)
-    _guard_busy()
+    queued = _guard_busy(db, project_id, allow_queue=True)
     video_job_manager.submit(project_id, "suno", suno_service.run_suno_step0,
-                             dry_run=True, overrides=body.overrides())
-    return {"status": "submitted", "kind": "suno", "mode": "dry-run"}
+                             dry_run=True, overrides=body.overrides(),
+                             queued_message=queued)
+    return {"status": "queued" if queued else "submitted", "kind": "suno",
+            "mode": "dry-run", "message": queued}
 
 
 @router.post("/start")
@@ -238,10 +288,12 @@ def suno_start(project_id: int, body: StartBody = StartBody(),
                db: Session = Depends(get_session)):
     """LIVE — tạo đủ 15 bài, tải WAV, xác thực, import. Người dùng chủ động bấm."""
     _project_or_404(db, project_id)
-    _guard_busy()
+    queued = _guard_busy(db, project_id, allow_queue=True)
     video_job_manager.submit(project_id, "suno", suno_service.run_suno_step0,
-                             dry_run=False, overrides=body.overrides())
-    return {"status": "submitted", "kind": "suno", "mode": "live"}
+                             dry_run=False, overrides=body.overrides(),
+                             queued_message=queued)
+    return {"status": "queued" if queued else "submitted", "kind": "suno",
+            "mode": "live", "message": queued}
 
 
 @router.post("/resume")
@@ -249,10 +301,11 @@ def suno_resume(project_id: int, db: Session = Depends(get_session)):
     """Tiếp tục batch đang dở (PAUSED/blocking). KHÔNG tạo lại/tải lại/import lại
     những gì đã xong — resume dựa trên manifest bền vững."""
     _project_or_404(db, project_id)
-    _guard_busy()
+    queued = _guard_busy(db, project_id, allow_queue=True)
     video_job_manager.submit(project_id, "suno", suno_service.run_suno_step0,
-                             dry_run=False, resume=True)
-    return {"status": "submitted", "kind": "suno", "mode": "resume"}
+                             dry_run=False, resume=True, queued_message=queued)
+    return {"status": "queued" if queued else "submitted", "kind": "suno",
+            "mode": "resume", "message": queued}
 
 
 @router.post("/pause")
@@ -282,7 +335,7 @@ def suno_open_browser(project_id: int, db: Session = Depends(get_session)):
     TRA + tự sửa/lưu selector khi giao diện Suno đổi. KHÔNG tạo/tải gì → không
     tốn credit. Giữ cửa sổ mở tới khi bấm 'Đóng trình duyệt'."""
     _project_or_404(db, project_id)
-    _guard_busy()
+    _guard_busy(db, project_id)
     video_job_manager.submit(project_id, "suno-login",
                              suno_selfcheck.run_login_and_check)
     return {"status": "submitted", "kind": "suno-login"}

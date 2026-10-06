@@ -44,6 +44,17 @@ class ApiTestResult(BaseModel):
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1)
     description: str = ""
+    # Nhạc cụ chủ đạo (khoá cho bảng nhân vật, cảnh clip và Styles Suno) +
+    # thể loại nhạc. Rỗng = AI tự suy từ tên/mô tả như trước.
+    instrument: str = ""
+    music_style: str = ""
+
+
+class ProjectRename(BaseModel):
+    name: str
+    # none = chỉ đổi tên · text = vẽ lại chữ thumbnail + ghép lại video ·
+    # regen = tạo lại ảnh bìa Gemini + clip 00 Flow rồi như text
+    refresh: Optional[str] = "none"
 
 
 class ProjectUpdate(BaseModel):
@@ -57,6 +68,9 @@ class ProjectUpdate(BaseModel):
     auto_upload: Optional[bool] = None
     music_source: Optional[str] = None       # "local" | "suno"
     suno_idea: Optional[str] = None          # ý tưởng/nhạc cụ cho STEP 0 (Suno)
+    # Tổng thời lượng mix/video (phút) + crossfade (giây) — dùng cả cho auto.
+    mix_duration_minutes: Optional[float] = Field(default=None, ge=1, le=720)
+    mix_crossfade_seconds: Optional[float] = Field(default=None, ge=1, le=60)
 
 
 class ProjectResponse(BaseModel):
@@ -74,6 +88,50 @@ class ProjectResponse(BaseModel):
     auto_upload: bool = False
     music_source: str = "local"
     suno_idea: str = ""
+    batch_id: Optional[str] = None
+    mix_duration_minutes: float = 120.0
+    mix_crossfade_seconds: float = 5.0
+
+
+# ---------- Batch (sản xuất hàng loạt) ----------
+class BatchCreate(BaseModel):
+    count: int = Field(ge=1, le=50)
+    # Nhạc cụ + thể loại nhạc: giữ nguyên cả lô, là đầu vào của mọi prompt
+    # (Suno/Gemini/Flow) VÀ là khoá tra ChannelMapping khi đăng nháp YouTube.
+    instrument: str = Field(min_length=1)
+    music_style: str = Field(min_length=1)
+    channel_name: str = ""
+    # Style ảnh giữ nguyên cả lô — key trong video/config.STYLES (2d/3d/…/real).
+    video_style: str = "2d"
+    # Chủ đề tuỳ chọn (giữ mạch); rỗng = AI tự chọn 1 mạch chung.
+    theme: str = ""
+    # Ngân sách Suno mỗi project (mặc định theo SunoConfig nếu bỏ trống).
+    target_tracks: Optional[int] = None
+    max_create_actions: Optional[int] = None
+    # Tổng thời lượng mix/video (phút) cho MỖI project trong lô.
+    mix_duration_minutes: float = Field(default=120.0, ge=1, le=720)
+
+
+class BatchProjectItem(BaseModel):
+    project_id: int
+    name: str
+    suno_phase: Optional[str] = None
+    suno_message: Optional[str] = None
+
+
+class BatchRunResponse(BaseModel):
+    batch_key: str
+    total: int
+    completed: int
+    failed: int
+    status: str
+    current_index: int
+    current_project_id: Optional[int] = None
+    message: str = ""
+    params: dict = {}
+    created_at: datetime
+    updated_at: datetime
+    projects: list[BatchProjectItem] = []
 
 
 # ---------- Tracks ----------
@@ -111,8 +169,8 @@ class ScanResult(BaseModel):
 
 # ---------- Mixes ----------
 class MixCreate(BaseModel):
-    duration_minutes: float = 60.0
-    crossfade_seconds: float = 15.0
+    duration_minutes: float = 120.0
+    crossfade_seconds: float = 5.0
     # sample_rate = 0 → auto (max native của library, không upsample giả).
     sample_rate: int = 0
     # bit_depth mặc định 32 (float, không nén) — chất lượng tối đa.

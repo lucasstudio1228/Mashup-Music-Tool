@@ -1,10 +1,15 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { MixCreate } from '../../types';
 
 interface Props {
   trackCount: number;
   disabled?: boolean;
   onStart: (settings: MixCreate) => void;
+  // Duration/crossfade đã lưu theo project — chuỗi tự động Suno→Mix→Video
+  // cũng dùng đúng 2 số này.
+  savedDuration?: number;
+  savedCrossfade?: number;
+  onSave?: (durationMinutes: number, crossfadeSeconds: number) => void;
 }
 
 // 0 = Auto (lấy sample rate gốc cao nhất của library, không upsample giả).
@@ -19,9 +24,23 @@ const SR_LABEL: Record<number, string> = {
 };
 const MIN_TRACKS = 15;
 
-export default function MixSettingsPanel({ trackCount, disabled, onStart }: Props) {
-  const [duration, setDuration] = useState(120);
-  const [crossfade, setCrossfade] = useState(5);
+export default function MixSettingsPanel({
+  trackCount, disabled, onStart, savedDuration, savedCrossfade, onSave,
+}: Props) {
+  const [duration, setDuration] = useState(savedDuration ?? 120);
+  const [crossfade, setCrossfade] = useState(savedCrossfade ?? 5);
+
+  // Đồng bộ khi dữ liệu project tải xong / đổi project.
+  useEffect(() => { if (savedDuration != null) setDuration(savedDuration); }, [savedDuration]);
+  useEffect(() => { if (savedCrossfade != null) setCrossfade(savedCrossfade); }, [savedCrossfade]);
+
+  // Lưu khi rời ô nhập (chỉ khi hợp lệ và thực sự đổi).
+  const persist = () => {
+    if (!onSave) return;
+    if (!(duration >= 1 && duration <= 720 && crossfade >= 1 && crossfade <= 60)) return;
+    if (duration === savedDuration && crossfade === savedCrossfade) return;
+    onSave(duration, crossfade);
+  };
   const [sampleRate, setSampleRate] = useState(0);        // mặc định Auto
   const [bitDepth, setBitDepth] = useState<24 | 32>(32);  // mặc định 32-bit float
 
@@ -36,9 +55,11 @@ export default function MixSettingsPanel({ trackCount, disabled, onStart }: Prop
         <input
           type="number"
           min={1}
+          max={720}
           className={inputCls}
           value={duration}
           onChange={(e) => setDuration(Number(e.target.value))}
+          onBlur={persist}
         />
         <span className="text-xs text-gray-400">min</span>
       </Row>
@@ -47,12 +68,22 @@ export default function MixSettingsPanel({ trackCount, disabled, onStart }: Prop
         <input
           type="number"
           min={1}
+          max={60}
           className={inputCls}
           value={crossfade}
           onChange={(e) => setCrossfade(Number(e.target.value))}
+          onBlur={persist}
         />
         <span className="text-xs text-gray-400">sec</span>
       </Row>
+
+      <p className="text-xs text-gray-500">
+        Duration = tổng thời lượng mix = độ dài video. Tự lưu theo project và
+        dùng cả khi chạy tự động (Suno → Mix → Video). Bài được xếp shuffle theo
+        vòng (mỗi vòng đủ {Math.max(trackCount, 0)} bài), 1 bài không lặp lại trong{' '}
+        {Math.max(5, Math.floor(trackCount / 2))} bài kế tiếp (T+
+        {Math.max(5, Math.floor(trackCount / 2))}).
+      </p>
 
       <Row label="Sample Rate">
         <select

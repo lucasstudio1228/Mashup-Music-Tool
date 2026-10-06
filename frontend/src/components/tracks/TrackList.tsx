@@ -6,8 +6,9 @@ interface Props {
 }
 
 function fmtDuration(sec: number): string {
-  const m = Math.floor(sec / 60);
-  const s = Math.round(sec % 60);
+  const total = Math.round(sec);   // làm tròn TRƯỚC để 179.6s → 3:00, không ra 2:60
+  const m = Math.floor(total / 60);
+  const s = total % 60;
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 

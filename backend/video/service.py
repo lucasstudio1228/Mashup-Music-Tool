@@ -1,8 +1,10 @@
 """
 video/service.py — Điều phối pipeline Video:
   0) Chuẩn bị hồ sơ chung + prompt đầy đủ và kiểm tra chống trùng.
-  1) Tạo N ảnh liên kết (Gemini), N = config.PARAMS.image_count.
-  2) Tạo N clip 1:1 (Flow); clip 0 mở đầu duy nhất.
+  1) Tạo 3 ảnh (Gemini): 0 = thumbnail, 1 = bảng phân tích nhân vật chính,
+     2 = bảng phân tích linh thú.
+  2) Tạo config.PARAMS.total_clips clip (Flow): MỌI clip nạp ảnh 1 + ảnh 2 làm
+     nguyên liệu, chỉ khác prompt bối cảnh.
   3) Shuffle theo t_window + fade + gắn nhạc → final/final.mp4.
 
 Chạy trong worker thread (Playwright sync API + ffmpeg).
@@ -56,8 +58,9 @@ def step_prepare_prompts(project_id: int, progress_cb, project_name=None,
 
 
 def _validate_saved_workflow(project_id: int, project_name: str | None) -> dict:
-    from .prompt_workflow import read_manifest, validate_manifest
-    saved = read_manifest(project_id, project_name)
+    from .prompt_workflow import ensure_english_manifest, validate_manifest
+    # Hồ sơ cũ còn tiếng Việt → tự dịch sang tiếng Anh trước khi dùng.
+    saved = ensure_english_manifest(project_id, project_name)
     if saved is None:
         raise RuntimeError("Chưa có bộ prompt đã lưu. Hãy chuẩn bị prompt trước khi tạo media.")
     validate_manifest(project_id, saved)
@@ -160,6 +163,23 @@ def step_images(project_id: int,
                            prompts_override=prompts_override, style=style_key)
 
 
+def _clip_generator():
+    """Hàm tạo clip theo máy đang chọn — cùng chữ ký generate_clips."""
+    engine = config.clip_engine()
+    if engine == "flow":
+        from .flow_driver import generate_clips
+        return generate_clips
+    if engine == "muse":
+        from .muse_video import generate_clips_muse
+        return generate_clips_muse
+    from .gemini_video import generate_clips_gemini
+    return generate_clips_gemini
+
+
+def clip_engine_label() -> str:
+    return config.CLIP_ENGINE_LABELS[config.clip_engine()]
+
+
 def step_clips(project_id: int,
                progress_cb: Callable[[str, float], None],
                mode: str = "restart",
@@ -167,11 +187,49 @@ def step_clips(project_id: int,
                style_key: str | None = None) -> list[str]:
     # mode="resume": giữ clip đã tạo, chỉ tạo tiếp clip còn thiếu.
     # style_key: "2d"/"3d" → gợi ý phong cách gắn vào prompt chuyển động.
-    from .flow_driver import generate_clips
+    # Máy tạo clip: Muse.ai (mặc định) / Flow / Gemini Video (config.clip_engine()).
+    generate_clips = _clip_generator()
     _validate_saved_workflow(project_id, project_name)
     return generate_clips(project_id, config.PARAMS, progress_cb,
                           resume=(mode == "resume"), project_name=project_name,
                           style=config.normalize_style(style_key))
+
+
+def run_manual_clips(project_id: int,
+                     progress_cb: Callable[[str, float], None],
+                     project_name: str | None = None,
+                     style_key: str | None = None,
+                     only: Optional[list[int]] = None,
+                     assemble: bool = True) -> dict:
+    """"Tạo video thủ công" (bán tự động): tool mở Flow + đưa nguyên liệu, người
+    dùng dán prompt + bấm Tạo, tool tải + đặt tên clip_NN.mp4. Đủ clip và có
+    nhạc → ghép video (+ đăng nháp nếu project bật auto_upload)."""
+    from .flow_manual import manual_clips
+    _validate_saved_workflow(project_id, project_name)
+    manual_clips(project_id, progress_cb, project_name=project_name,
+                 style=config.normalize_style(style_key), only=only)
+    total = config.PARAMS.total_clips
+    clip_dir = config.clips_dir(project_id, project_name)
+    missing = [k for k in range(total)
+               if not (clip_dir / f"clip_{k:02d}.mp4").exists()]
+    if missing:
+        progress_cb(f"Còn thiếu {len(missing)} clip ({', '.join(f'{k:02d}' for k in missing)}) "
+                    f"— chưa ghép video.", 100.0)
+        return {"clips_missing": missing}
+    if not assemble or only:
+        progress_cb(f"Đã đủ {total} clip — bấm 'Ghép video' khi sẵn sàng.", 100.0)
+        return {"clips_missing": []}
+    if not find_latest_audio(project_id, project_name):
+        progress_cb(f"Đã đủ {total} clip nhưng chưa có nhạc nền — mix audio rồi "
+                    f"bấm 'Ghép video'.", 100.0)
+        return {"clips_missing": [], "assembled": False}
+    progress_cb("Đủ clip — ghép video + gắn nhạc…", 96.0)
+    result = step_assemble(project_id,
+                           lambda m, p: progress_cb(m, 96.0 + p * 0.04),
+                           project_name=project_name)
+    progress_cb("Hoàn thành", 100.0)
+    _maybe_auto_upload(project_id, progress_cb, project_name)
+    return result if isinstance(result, dict) else {"assembled": True}
 
 
 def _load_saved_prompts(project_id: int,
@@ -213,9 +271,9 @@ def regen_clip(project_id: int,
                index: int,
                project_name: str | None = None,
                style_key: str | None = None) -> list[str]:
-    """Tạo lại ĐÚNG 1 clip (ghi đè), GIỮ NGUYÊN mọi clip khác. Cần _plan.json
-    hợp lệ (flow_driver sẽ báo lỗi rõ nếu thiếu) để giữ ánh xạ ảnh↔clip 1:1."""
-    from .flow_driver import generate_clips
+    """Tạo lại ĐÚNG 1 clip (ghi đè), GIỮ NGUYÊN mọi clip khác. Nguyên liệu mỗi
+    clip là cố định (ảnh 1 + ảnh 2) nên không cần kế hoạch cũ."""
+    generate_clips = _clip_generator()
     _validate_saved_workflow(project_id, project_name)
     return generate_clips(
         project_id, config.PARAMS, progress_cb, project_name=project_name,
@@ -226,12 +284,12 @@ def regen_motions(project_id: int,
                   progress_cb: Callable[[str, float], None],
                   project_name: str | None = None,
                   style_key: str | None = None) -> dict:
-    """Sinh LẠI CHỈ bộ prompt chuyển động (motions) từ prompt ảnh đã lưu và ghi
+    """Sinh LẠI CHỈ bộ prompt cảnh (motions) từ HAI bảng nhân vật đã khoá và ghi
     đè 'motions' trong images/prompts.json. KHÔNG tạo lại ảnh/clip — lần tạo clip
-    sau sẽ dùng motion mới. Trả {"count": N} khi thành công."""
+    sau sẽ dùng bộ cảnh mới. Trả {"count": N} khi thành công."""
     from backend.core_bridge import get_api_config_from_db
     from backend.database import DB_PATH
-    from .prompt_gen import generate_motions_for_prompts
+    from .prompt_gen import generate_scene_prompts
 
     def _log(m: str):
         if progress_cb:
@@ -241,37 +299,54 @@ def regen_motions(project_id: int,
     if not prompts_path.exists():
         raise RuntimeError(
             "Chưa có bộ prompt (images/prompts.json). Hãy tạo ảnh từ 'Ý tưởng' "
-            "một lần để sinh prompt, rồi mới sinh lại motion.")
+            "một lần để sinh prompt, rồi mới sinh lại bộ cảnh.")
+    from .prompt_workflow import ensure_english_manifest
     try:
-        saved = json.loads(prompts_path.read_text(encoding="utf-8"))
+        # tự cắt 40 → N cảnh + dịch hồ sơ cũ sang tiếng Anh
+        saved = ensure_english_manifest(project_id, project_name, extend=False)
     except Exception as e:
         raise RuntimeError(f"Không đọc được prompts.json ({e}).")
     prompts = saved.get("prompts")
     if not isinstance(prompts, dict) or not prompts:
         raise RuntimeError("prompts.json không có 'prompts' hợp lệ.")
+    locks = saved.get("continuity") or {}
+    character_sheet = (locks.get("character_sheet") or "").strip()
+    pet_sheet = (locks.get("pet_sheet") or "").strip()
+    if len(character_sheet) < 20 or len(pet_sheet) < 20:
+        raise RuntimeError(
+            "prompts.json thiếu khoá continuity (character_sheet / pet_sheet). "
+            "Hãy chuẩn bị lại bộ prompt bằng 'Làm lại từ đầu'.")
     idea = (saved.get("idea") or "").strip()
     style_key = config.normalize_style(style_key or saved.get("style_key"))
+    scenes = config.PARAMS.total_clips   # sinh lại ĐỦ số cảnh theo cấu hình hiện tại
 
-    _log(f"Sinh lại motion cho {len(prompts)} prompt…")
-    motions = generate_motions_for_prompts(
-        prompts={str(k): v for k, v in prompts.items()},
-        idea=idea,
+    _log(f"Sinh lại {scenes} prompt cảnh từ hai bảng nhân vật đã khoá…")
+    motions = generate_scene_prompts(
+        character_sheet=character_sheet, pet_sheet=pet_sheet, idea=idea,
         style=config.style_info(style_key)["brief"],
         api_config=get_api_config_from_db(str(DB_PATH)),
-        log=_log)
-    if not motions or len(motions) != len(prompts):
+        scene_count=scenes, log=_log,
+        instrument=(saved.get("context") or {}).get("instrument", "")
+        or _project_instrument(project_id))
+    if not motions or len(motions) != scenes:
         raise RuntimeError(
-            "AI chưa sinh lại đủ bộ motion (kiểm tra API key/model ở ⚙️ "
+            "AI chưa sinh lại đủ bộ prompt cảnh (kiểm tra API key/model ở ⚙️ "
             "Settings rồi thử lại).")
 
-    saved["motions"] = motions
-    from .prompt_workflow import validate_manifest, save_manifest
-    saved["prompt_hashes"] = validate_manifest(project_id, saved, len(prompts))
+    from .prompt_workflow import (validate_manifest, save_manifest,
+                                  SCENE_SUFFIX)
+    saved["motions"] = {k: v + SCENE_SUFFIX for k, v in motions.items()}
+    if "scene_count" in saved and saved["scene_count"] != scenes:
+        from .prompt_workflow import _resign
+        _resign(dict(saved), saved, scenes)
+        saved["scene_count"] = scenes
+    saved["prompt_hashes"] = validate_manifest(project_id, saved,
+                                               len(prompts), scenes)
     try:
         save_manifest(prompts_path, saved)
     except Exception as e:
-        raise RuntimeError(f"Không lưu được motion mới ({e}).")
-    _log(f"Đã cập nhật {len(motions)} prompt chuyển động — tạo clip lần sau sẽ dùng.")
+        raise RuntimeError(f"Không lưu được bộ cảnh mới ({e}).")
+    _log(f"Đã cập nhật {len(motions)} prompt cảnh — tạo clip lần sau sẽ dùng.")
     return {"count": len(motions)}
 
 
@@ -292,22 +367,22 @@ def step_assemble(project_id: int,
     missing = [p.name for p in expected if not p.exists()]
     if missing:
         raise RuntimeError(
-            f"Chưa đủ {P.total_clips} clip 1:1 để ghép; còn thiếu: "
+            f"Chưa đủ {P.total_clips} clip để ghép; còn thiếu: "
             f"{', '.join(missing)}.")
     clips = [str(p) for p in expected]
 
     dur = probe_duration(audio)
 
     # clip_00 là intro và chỉ xuất hiện đúng MỘT lần trong toàn video. Các clip
-    # 01..40 (40 cảnh) được trộn ngẫu nhiên thành cycle riêng rồi loop; mỗi clip
-    # xuất hiện đúng một lần/cycle. Vì cycle có 40 clip phân biệt nên cả trong
-    # cycle lẫn qua ranh giới loop đều thỏa T+10 (không lặp trong 10 clip kế).
+    # còn lại (mỗi clip một bối cảnh riêng) được trộn ngẫu nhiên thành cycle rồi
+    # loop; mỗi clip xuất hiện đúng một lần/cycle. Cycle đủ nhiều clip phân biệt
+    # nên cả trong cycle lẫn qua ranh giới loop đều thỏa T+10.
     import random
     rest = clips[1:]
     random.Random(seed).shuffle(rest)
 
-    # Intro = clip_00. Veo tạo lại cảnh từ ảnh 0 nên MẤT tiêu đề đã nướng trong
-    # ảnh 0 → chồng lại tiêu đề (khớp thumbnail) lên clip intro bằng font thật.
+    # Intro = clip_00 (dựng lại cảnh ảnh bìa từ ảnh 0 + hai bảng nhân vật) → chồng
+    # tiêu đề lên bằng font thật, khớp chữ với final/thumbnail.png.
     intro = clips[0]
     title = (project_name or "Healing").strip()
     subtitle = _thumbnail_keywords()
@@ -320,13 +395,7 @@ def step_assemble(project_id: int,
     # Thumbnail riêng: overlay tiêu đề (CÙNG title/subtitle với intro) lên ảnh 0
     # SẠCH → final/thumbnail.png. Dùng chung 1 subtitle nên chữ khớp intro video.
     try:
-        import shutil
-        from .thumbnail import render_title
-        src0 = config.images_dir(project_id, project_name) / "0.png"
-        if title and src0.exists():
-            thumb = config.final_dir(project_id, project_name) / "thumbnail.png"
-            shutil.copyfile(src0, thumb)
-            render_title(thumb, title, subtitle,
+        render_thumbnail(project_id, project_name, subtitle,
                          log=lambda m: progress_cb(m, 4.5))
     except Exception as e:
         progress_cb(f"Bỏ qua tạo thumbnail.png ({e})", 4.5)
@@ -343,6 +412,65 @@ def step_assemble(project_id: int,
     )
 
 
+def render_thumbnail(project_id: int, project_name: str | None,
+                     subtitle: str | None = None, log=None) -> Optional[str]:
+    """Ảnh 0 SẠCH (không chữ) + tiêu đề = tên project (font thật) →
+    final/thumbnail.png. Trả đường dẫn, hoặc None nếu chưa có ảnh 0."""
+    import shutil
+    from .thumbnail import render_title
+    title = (project_name or "Healing").strip()
+    src0 = config.images_dir(project_id, project_name) / "0.png"
+    if not title or not src0.exists():
+        return None
+    thumb = config.final_dir(project_id, project_name) / "thumbnail.png"
+    thumb.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src0, thumb)
+    render_title(thumb, title,
+                 _thumbnail_keywords() if subtitle is None else subtitle,
+                 log=log)
+    return str(thumb)
+
+
+def retitle_video(project_id: int,
+                  progress_cb: Callable[[str, float], None],
+                  project_name: str | None = None,
+                  style_key: str | None = None,
+                  regen_cover: bool = False) -> dict:
+    """Sau khi ĐỔI TÊN project: cập nhật chữ tiêu đề trên thumbnail + intro.
+    regen_cover=True: tạo lại ảnh bìa (ảnh 0, Gemini) + clip intro 00 (Flow)
+    trước — prompt đã khoá giữ nguyên nên nhân vật/bối cảnh vẫn khớp cả bộ.
+    Rồi vẽ lại final/thumbnail.png và (nếu đủ clip + nhạc) ghép lại final.mp4
+    để chữ ở intro là tên mới. KHÔNG tự đăng YouTube (bấm «Đăng nháp» sau)."""
+    def scaled(lo, hi):
+        return lambda m, p: progress_cb(m, lo + (p / 100.0) * (hi - lo))
+
+    out: dict = {"regen_cover": bool(regen_cover)}
+    lo = 1.0
+    if regen_cover:
+        progress_cb("Tạo lại ảnh bìa (ảnh 0) bằng Gemini…", 1.0)
+        regen_image(project_id, scaled(1.0, 35.0), 0, project_name, style_key)
+        progress_cb(f"Tạo lại clip intro 00 ({clip_engine_label()})…", 35.0)
+        regen_clip(project_id, scaled(35.0, 70.0), 0, project_name, style_key)
+        lo = 70.0
+    progress_cb("Vẽ lại chữ tiêu đề lên thumbnail…", lo)
+    out["thumbnail"] = render_thumbnail(
+        project_id, project_name, log=lambda m: progress_cb(m, lo))
+    clip_dir = config.clips_dir(project_id, project_name)
+    have_clips = all((clip_dir / f"clip_{i:02d}.mp4").exists()
+                     for i in range(config.PARAMS.total_clips))
+    audio = find_latest_audio(project_id, project_name)
+    if have_clips and audio:
+        progress_cb("Ghép lại video để intro mang tên mới…", lo + 2)
+        out["final"] = step_assemble(project_id, scaled(lo + 2, 100.0),
+                                     audio_path=audio, project_name=project_name)
+        progress_cb("Xong — thumbnail + intro đã mang tên mới. Bấm «Đăng nháp "
+                    "YouTube» nếu muốn cập nhật bản nháp.", 100.0)
+    else:
+        progress_cb("Xong — đã cập nhật thumbnail. Chưa đủ clip/nhạc nên chưa "
+                    "ghép video (chữ intro sẽ đúng tên mới khi ghép).", 100.0)
+    return out
+
+
 # ── Pipeline đầy đủ ─────────────────────────────────────────────
 
 def run_full_video(project_id: int,
@@ -352,19 +480,22 @@ def run_full_video(project_id: int,
                    seed: Optional[int] = None,
                    project_name: str | None = None,
                    idea: str | None = None,
-                   style_key: str | None = None) -> dict:
-    """Chạy trọn: ảnh → clip → ghép. progress_cb(msg, percent 0..100)."""
+                   style_key: str | None = None,
+                   mode: str = "restart") -> dict:
+    """Chạy trọn: ảnh → clip → ghép. progress_cb(msg, percent 0..100).
+    mode="resume": giữ ảnh/clip đã có, chỉ tạo phần còn thiếu (dùng khi chạy lại)."""
     def scaled(lo, hi):
         return lambda m, p: progress_cb(m, lo + (p / 100.0) * (hi - lo))
 
     style_key = config.normalize_style(style_key)
+    mode = "resume" if mode == "resume" else "restart"
     progress_cb("Bắt đầu — tạo ảnh", 1.0)
-    step_images(project_id, scaled(1.0, 30.0), topic,
+    step_images(project_id, scaled(1.0, 30.0), topic, mode=mode,
                 project_name=project_name, idea=idea, style_key=style_key)
 
-    progress_cb("Tạo clip video (Flow/Veo)", 30.0)
-    step_clips(project_id, scaled(30.0, 80.0), project_name=project_name,
-               style_key=style_key)
+    progress_cb(f"Tạo clip video ({clip_engine_label()})", 30.0)
+    step_clips(project_id, scaled(30.0, 80.0), mode=mode,
+               project_name=project_name, style_key=style_key)
 
     progress_cb("Ghép video + gắn nhạc", 80.0)
     result = step_assemble(project_id, scaled(80.0, 100.0),
@@ -390,7 +521,7 @@ def run_video_from_images(project_id: int,
 
     style_key = config.normalize_style(style_key)
     mode = "resume" if clips_mode == "resume" else "restart"
-    progress_cb("Tạo clip video từ ảnh đã có (Flow/Veo)", 1.0)
+    progress_cb(f"Tạo clip video từ ảnh đã có ({clip_engine_label()})", 1.0)
     step_clips(project_id, scaled(1.0, 80.0), mode=mode,
                project_name=project_name, style_key=style_key)
 
@@ -414,6 +545,19 @@ def _db():
     return con
 
 
+def _project_instrument(project_id: int) -> str:
+    """Nhạc cụ người dùng chọn cho project ('' nếu chưa chọn / lỗi đọc DB)."""
+    con = _db()
+    try:
+        row = con.execute("SELECT instrument FROM project WHERE id=?",
+                          (project_id,)).fetchone()
+    except Exception:
+        return ""
+    finally:
+        con.close()
+    return (row["instrument"] or "") if row else ""
+
+
 def _lookup_channel_mapping(instrument: str, music_style: str) -> dict | None:
     """Tra ChannelMapping theo (instrument, music_style), so khớp không phân biệt
     hoa/thường & khoảng trắng thừa. Trả dict hoặc None."""
@@ -427,6 +571,13 @@ def _lookup_channel_mapping(instrument: str, music_style: str) -> dict | None:
             "ORDER BY id DESC LIMIT 1",
             (ins, sty),
         ).fetchone()
+        if not row:
+            # 'Piano' (danh mục) ↔ 'Lofi Piano' (ánh xạ): cùng nhạc cụ + cùng thể loại.
+            from .music_spec import same_instrument
+            row = next((r for r in con.execute(
+                "SELECT * FROM channelmapping ORDER BY id DESC").fetchall()
+                if (r["music_style"] or "").strip().lower() == sty
+                and same_instrument(r["instrument"] or "", ins)), None)
     except Exception:
         return None
     finally:
@@ -537,15 +688,41 @@ def step_upload_youtube(project_id: int,
         raise RuntimeError("Dòng ánh xạ thiếu profile GPMLogin.")
 
     # File final + thumbnail
-    final = final_dir(project_id, project_name) / "final.mp4"
-    thumb = final_dir(project_id, project_name) / "thumbnail.png"
+    out_dir = config.final_dir(project_id, project_name)
+    final = out_dir / "final.mp4"
+    thumb = out_dir / "thumbnail.png"
     if not final.exists():
         raise RuntimeError("Chưa có final.mp4 — hãy render video trước khi đăng.")
+
+    # Track lẻ + khung thời gian của bản mix dùng làm nhạc nền → đưa vào mô tả
+    # dưới dạng chapters (tên track do bước Mix tự đặt).
+    meta_warnings: list[str] = []
+    audio = find_latest_audio(project_id, project_name)
+    tracklist = youtube_meta.load_tracklist(audio)
+    if not tracklist:
+        meta_warnings.append(
+            "Không có dữ liệu track lẻ cho nhạc nền "
+            f"({Path(audio).name if audio else 'không rõ file'}) — mô tả thiếu "
+            "tracklist. Chỉ bản mix render từ tab Audio mới có mốc thời gian.")
+    else:
+        # Bản mix mới hơn video đã render ⇒ mốc thời gian sẽ LỆCH. Thà thiếu
+        # tracklist còn hơn ghi sai giờ.
+        try:
+            gap = abs(probe_duration(str(final)) - probe_duration(audio))
+        except Exception:
+            gap = 0.0
+        if gap > 5.0:
+            tracklist = []
+            meta_warnings.append(
+                f"Bỏ tracklist: nhạc nền mới nhất ({Path(audio).name}) lệch "
+                f"{gap:.0f} giây so với final.mp4 — mốc thời gian sẽ sai. "
+                "Hãy render lại video từ đúng bản mix.")
 
     # Metadata (AI vision + bộ nhớ chống trùng)
     progress_cb("AI viết tiêu đề & mô tả từ thumbnail…", 10.0)
     api_config = get_api_config_from_db(str(DB_PATH))
     meta = youtube_meta.generate_metadata(
+        tracklist=tracklist,
         thumbnail_path=str(thumb),
         channel_name=mapping.get("channel_name", ""),
         instrument=instrument, music_style=music_style,
@@ -563,29 +740,34 @@ def step_upload_youtube(project_id: int,
         client.ensure_app_running(exe_path)   # best-effort (không raise nếu thiếu exe)
     except gpmc.GPMError as e:
         progress_cb(f"(Bỏ qua tự mở app: {e})", 22.0)
-    cdp = client.start_profile(profile_id)
 
-    try:
+    def _do_upload(cdp: str) -> dict:
         progress_cb("Điều khiển YouTube Studio (lưu nháp)…", 26.0)
-        result = youtube_driver.upload_draft(
+        return youtube_driver.upload_draft(
             cdp_endpoint=cdp,
             video_path=str(final),
             title=meta["title"],
             description=meta["description"],
             hashtags=meta["hashtags"],
             language=mapping.get("language", "en-US"),
+            # Có file thumbnail → driver BẤM chọn hình thu nhỏ và nạp ảnh này.
+            thumbnail_path=str(thumb) if thumb.exists() else None,
             progress_cb=lambda m, p: progress_cb(m, 26.0 + (p / 100.0) * 70.0),
             log=lambda m: progress_cb(m, 30.0),
+            # Tài khoản có nhiều kênh → dừng nếu Studio đang mở kênh khác.
+            expected_channel=mapping.get("channel_name", ""),
         )
+
+    try:
+        result = _upload_with_gpm_retry(client, profile_id, _do_upload,
+                                        progress_cb)
     except Exception as e:
         _record_upload(project_id, mapping, meta, str(final),
                        status="failed", error=f"{type(e).__name__}: {e}")
         raise
-    finally:
-        client.close_profile(profile_id)
 
     _record_upload(project_id, mapping, meta, str(final), status="draft")
-    warns = result.get("warnings") or []
+    warns = meta_warnings + (result.get("warnings") or [])
     msg = "Đã lưu bản nháp trên YouTube."
     if warns:
         msg += " Lưu ý: " + " | ".join(warns)
@@ -593,6 +775,50 @@ def step_upload_youtube(project_id: int,
     return {"status": "draft", "title": meta["title"],
             "channel_name": mapping.get("channel_name", ""),
             "warnings": warns}
+
+
+def _upload_with_gpm_retry(client, profile_id: str,
+                           do_upload: Callable[[str], dict],
+                           progress_cb: Callable[[str, float], None],
+                           attempts: int = 3, pause_sec: float = 15.0,
+                           sleep: Callable[[float], None] | None = None) -> dict:
+    """Bật profile GPMLogin → do_upload(cdp). Nếu KHÔNG NỐI ĐƯỢC CDP (trình duyệt
+    của profile chết ngay sau khi bật, cổng debug không mở — «WebSocket error:
+    connect ECONNREFUSED») thì đóng profile, nghỉ rồi bật lại (cổng MỚI) và thử
+    lại. Lỗi SAU khi đã nối (trong YouTube Studio) KHÔNG thử lại — tránh tải
+    trùng video. Luôn đóng profile khi xong."""
+    import time as _time
+    from .youtube_driver import CDPConnectError
+    sleep = sleep or _time.sleep
+    last: Exception | None = None
+    for i in range(1, attempts + 1):
+        if i > 1:
+            progress_cb(f"Trình duyệt GPMLogin không phản hồi — đóng profile, "
+                        f"bật lại (lần {i}/{attempts})…", 22.0)
+        cdp = client.start_profile(profile_id)
+        try:
+            return do_upload(cdp)
+        except CDPConnectError as e:
+            last = e
+        except Exception as e:
+            # Cửa sổ trình duyệt GPM bị ĐÓNG giữa chừng (tay người / GPMLogin
+            # tắt) → không tự thử lại (có thể người dùng chủ ý đóng).
+            if "has been closed" in str(e) or type(e).__name__ == "TargetClosedError":
+                raise RuntimeError(
+                    "Trình duyệt GPMLogin của kênh bị ĐÓNG giữa lúc đang tải video "
+                    "lên YouTube — đừng đóng cửa sổ GPM (hoặc tắt GPMLogin) khi tool "
+                    "đang đăng nháp. Bấm «Đăng nháp YouTube» để chạy lại (nếu Studio còn "
+                    f"bản nháp «final» dở dang thì xoá nó sau khi bản mới xong). ({e})") from e
+            raise
+        finally:
+            client.close_profile(profile_id)
+        if i < attempts:
+            sleep(pause_sec)     # GPMLogin giải phóng profile chậm sau khi stop
+    raise RuntimeError(
+        f"{last} — đã đóng/bật lại profile {attempts} lần vẫn không nối được. "
+        f"Hãy mở GPMLogin, bấm «Mở» profile này 1 lần xem trình duyệt có lên "
+        f"không (lỗi proxy/nhân trình duyệt/profile hỏng), đóng nó lại rồi bấm "
+        f"«Đăng nháp YouTube» lần nữa. Video đã dựng xong, không mất gì.")
 
 
 def _maybe_auto_upload(project_id: int,

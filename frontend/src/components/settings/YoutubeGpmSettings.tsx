@@ -100,6 +100,10 @@ export function YoutubeGpmSettings() {
       <h3 className="text-base font-semibold text-white">
         📺 YouTube / GPMLogin
       </h3>
+      <p className="text-xs text-amber-300/80">
+        ⓘ Phần này lưu bằng các nút riêng bên dưới (💾 Lưu cấu hình GPM · 💾 Lưu từng
+        dòng ánh xạ · ➕ Thêm) — <b>không</b> dùng nút "Lưu API (OpenAI)" ở cuối.
+      </p>
 
       {/* GPM config */}
       <div className="space-y-2 rounded-lg border border-white/5 bg-[#0f1117] p-3">

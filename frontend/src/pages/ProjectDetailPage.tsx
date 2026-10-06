@@ -1,12 +1,14 @@
-import { useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { Link, useParams, useSearchParams } from 'react-router-dom';
 import AppShell from '../components/layout/AppShell';
 import TrackList from '../components/tracks/TrackList';
+import TrackQcPanel from '../components/tracks/TrackQcPanel';
 import AddTracksPanel from '../components/tracks/AddTracksPanel';
 import MixSettingsPanel from '../components/mixes/MixSettingsPanel';
 import MixProgressModal from '../components/mixes/MixProgressModal';
 import MixHistoryList from '../components/mixes/MixHistoryList';
 import ProjectFormModal from '../components/projects/ProjectFormModal';
+import RenameProjectDialog from '../components/projects/RenameProjectDialog';
 import ConfirmDialog from '../components/shared/ConfirmDialog';
 import { StemPanel } from '../components/stems/StemPanel';
 import { StemSectionHeader } from '../components/stems/StemSectionHeader';
@@ -46,8 +48,15 @@ export default function ProjectDetailPage() {
   const createMix = useCreateMix(projectId);
   const deleteMix = useDeleteMix(projectId);
 
-  const [tab, setTab] = useState<Tab>('suno');
+  const [searchParams] = useSearchParams();
+  const urlTab = searchParams.get('tab') as Tab | null;
+  const [tab, setTab] = useState<Tab>(urlTab ?? 'suno');
+  // Bấm tác vụ ở thanh dưới đáy → /projects/:id?tab=… → mở đúng tab.
+  useEffect(() => {
+    if (urlTab === 'suno' || urlTab === 'audio' || urlTab === 'video') setTab(urlTab);
+  }, [urlTab, projectId]);
   const [editing, setEditing] = useState(false);
+  const [renaming, setRenaming] = useState(false);
   const [activeMixId, setActiveMixId] = useState<number | null>(null);
   const [mixToDelete, setMixToDelete] = useState<Mix | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
@@ -103,6 +112,13 @@ export default function ProjectDetailPage() {
             ← Back
           </Link>
           <button
+            onClick={() => setRenaming(true)}
+            title="Đổi tên project + chữ tiêu đề trên thumbnail/intro"
+            className="rounded-lg bg-surface-2 px-3 py-2 text-sm text-gray-200 hover:bg-white/10"
+          >
+            ✏️ Đổi tên
+          </button>
+          <button
             onClick={() => setEditing(true)}
             className="rounded-lg bg-surface-2 px-3 py-2 text-sm text-gray-200 hover:bg-white/10"
           >
@@ -126,6 +142,13 @@ export default function ProjectDetailPage() {
 
       {tab === 'audio' && (
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+          {trackList.length > 0 && (
+            <div className="lg:col-span-2">
+              <Section title="Rà soát track lẻ · Tạo lại Suno bài lỗi">
+                <TrackQcPanel projectId={projectId} />
+              </Section>
+            </div>
+          )}
           {/* Left column: Tracks */}
           <div className="space-y-4">
             <Section title={`Tracks (${trackList.length})`}>
@@ -178,6 +201,11 @@ export default function ProjectDetailPage() {
                 trackCount={trackList.length}
                 disabled={createMix.isPending}
                 onStart={startMix}
+                savedDuration={project?.mix_duration_minutes}
+                savedCrossfade={project?.mix_crossfade_seconds}
+                onSave={(d, c) =>
+                  updateProject.mutate({ mix_duration_minutes: d, mix_crossfade_seconds: c })
+                }
               />
               {startError && (
                 <p className="mt-2 text-xs text-red-400">{startError}</p>
@@ -200,11 +228,23 @@ export default function ProjectDetailPage() {
           initial={project}
           saving={updateProject.isPending}
           onSubmit={(data) =>
-            updateProject.mutate(data, { onSuccess: () => setEditing(false) })
+            updateProject.mutate(data, {
+              onSuccess: () => setEditing(false),
+              onError: (err: any) =>
+                window.alert(err?.response?.data?.detail ?? 'Không lưu được project.'),
+            })
           }
           onClose={() => setEditing(false)}
         />
       )}
+
+      <RenameProjectDialog
+        open={renaming}
+        projectId={projectId}
+        currentName={project.name}
+        onClose={() => setRenaming(false)}
+        onJobStarted={() => setTab('video')}
+      />
 
       {activeMixId !== null && (
         <MixProgressModal

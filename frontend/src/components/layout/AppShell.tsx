@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { ReactNode } from 'react';
 import Sidebar from './Sidebar';
+import TaskBar from './TaskBar';
 import { SettingsModal } from '../settings/SettingsModal';
 import { useSettings } from '../../api/settings';
 
@@ -15,7 +16,8 @@ export default function AppShell({ title, actions, children }: Props) {
   const { data: settings } = useSettings();
 
   return (
-    <div className="flex h-full bg-background">
+    <div className="flex h-full flex-col bg-background">
+      <div className="flex min-h-0 flex-1">
       <Sidebar />
       <div className="flex flex-1 flex-col overflow-hidden">
         <header className="flex items-center justify-between border-b border-white/5 px-6 py-4">
@@ -40,6 +42,9 @@ export default function AppShell({ title, actions, children }: Props) {
         </header>
         <main className="flex-1 overflow-auto p-6">{children}</main>
       </div>
+      </div>
+      {/* Luôn hiện tác vụ đang chạy dù đang xem project nào */}
+      <TaskBar />
 
       <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </div>

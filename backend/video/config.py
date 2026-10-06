@@ -54,22 +54,69 @@ def uploads_dir(project_id: int, project_name: str | None = None) -> Path:
 
 
 # ── Tham số sinh ảnh / video ────────────────────────────────────
+# Vai trò của 3 ảnh trong quy trình mới (xem VideoParams bên dưới).
+IMG_THUMBNAIL  = 0      # ảnh bìa — tạo DUY NHẤT 1 lần; chỉ làm nguyên liệu clip intro 00
+IMG_MAIN_SHEET = 1      # bản phân tích nhân vật chính (main character sheet)
+IMG_PET_SHEET  = 2      # bản phân tích linh thú/thú cưng (pet character sheet)
+# Hai sheet này được đưa CÙNG LÚC vào Flow làm nguyên liệu cho MỌI clip, nhờ đó
+# 20 clip giữ nguyên một nhân vật + một linh thú nhưng khác bối cảnh.
+SHEET_IMAGES = (IMG_MAIN_SHEET, IMG_PET_SHEET)
+# Clip 00 (intro — cảnh MỞ ĐẦU video) phải là "video thumbnail": ảnh bìa làm
+# nguyên liệu CHÍNH (bố cục/bối cảnh) + hai bảng nhân vật để giữ đúng danh tính.
+INTRO_CLIP = 0
+INTRO_INGREDIENTS = (IMG_THUMBNAIL, IMG_MAIN_SHEET, IMG_PET_SHEET)
+
+IMAGE_ROLES: dict[int, str] = {
+    IMG_THUMBNAIL:  "Ảnh bìa (thumbnail)",
+    IMG_MAIN_SHEET: "Bảng phân tích nhân vật chính",
+    IMG_PET_SHEET:  "Bảng phân tích linh thú / thú cưng",
+}
+
+# Thứ tự TẠO ảnh: hai bảng phân tích TRƯỚC, ảnh bìa SAU (đúng thứ tự người dùng
+# yêu cầu — duyệt được nhân vật ngay từ tấm đầu, và bìa vẽ sau thì bám theo hai
+# bảng đã chốt). Chỉ ảnh hưởng thứ tự chạy, không đổi tên file 0/1/2.png.
+IMAGE_ORDER: tuple[int, ...] = (IMG_MAIN_SHEET, IMG_PET_SHEET, IMG_THUMBNAIL)
+# Ảnh bìa BẮT BUỘC dựa trên 2 bảng nhân vật: driver đính kèm 1.png + 2.png làm
+# ảnh tham chiếu khi tạo ảnh 0 (vì vậy IMAGE_ORDER tạo 2 bảng trước).
+THUMBNAIL_REFS: tuple[int, ...] = SHEET_IMAGES
+THUMBNAIL_REF_NOTE = (
+    " || REFERENCE (mandatory): the two attached images are the MAIN CHARACTER "
+    "MODEL SHEET and the COMPANION SHEET (pet or creature) — generate a NEW image "
+    "that draws EXACTLY those two characters (identical face, hairstyle, outfit, "
+    "instrument, "
+    "fur/scale colours, proportions and palette), but as ONE complete illustrated "
+    "scene, NOT a design sheet, NO text labels.")
+
+# Bộ prompt luôn dùng KHOÁ CHUỖI (prompts.json là JSON).
+IMG_THUMBNAIL_KEY  = str(IMG_THUMBNAIL)
+IMG_MAIN_SHEET_KEY = str(IMG_MAIN_SHEET)
+IMG_PET_SHEET_KEY  = str(IMG_PET_SHEET)
+
+
 @dataclass
 class VideoParams:
-    # Ảnh: 0 = thumbnail, 1..(image_count-1) = cảnh nền
-    image_count:     int   = 41             # 0..40; mỗi ảnh tạo đúng 1 clip
+    # ẢNH — chỉ 3 tấm (quy trình mới):
+    #   0 = thumbnail (ảnh bìa, tạo 1 lần duy nhất)
+    #   1 = main character sheet   2 = pet character sheet
+    image_count:     int   = 3
     aspect_ratio:    str   = "16:9"
-    image_style:     str   = "hoạt hình (animation/cartoon), màu sắc dịu, điện ảnh"
+    image_style:     str   = "animation/cartoon, soft gentle colours, cinematic"
 
-    # Video (Flow / Veo) — CHẾ ĐỘ "THÀNH PHẦN" (ingredients): mỗi clip tạo từ
-    # 1 ảnh nguyên liệu (image-to-video), KHÔNG dùng khung đầu/cuối nữa.
+    # Video (Flow / Veo) — CHẾ ĐỘ "THÀNH PHẦN" (ingredients): MỖI clip dùng CẢ
+    # HAI character sheet làm nguyên liệu + 1 prompt bối cảnh riêng. Ảnh 0 chỉ
+    # tham gia clip 00 (intro = "video thumbnail").
     flow_model:      str   = "Omni 1.1 Flash"
     flow_mode:       str   = "Ingredients"   # Flow có thể hiện tiếng Anh/Việt
     clip_seconds:    int   = 8
     outputs_per_run: int   = 1               # x1 video
-    # Giữ field này để tương thích API/UI cũ; pipeline 1:1 dùng image_count.
-    rest_clips:      int   = 40              # ảnh 1..40, mỗi ảnh đúng 1 clip
-    min_total_clips: int   = 41
+    # 2026-09-28: hạ 40 → 20 clip/video (Flow gắn cờ sau ~5–20 clip/ngày).
+    # 2026-09-29: Gemini Video khoá «Tạo video» sau ~10 lượt/ngày (Ultra) ⇒ CHƯA
+    # nâng lại 40. Nâng thì chỉ đổi 3 số dưới — hồ sơ 20 cảnh được
+    # prompt_workflow.extend_scene_count tự viết thêm cảnh còn thiếu.
+    scene_clips:     int   = 20              # 20 clip, 20 bối cảnh khác nhau
+    # Giữ 2 field này cho API/UI cũ: clip 00 là intro, còn lại chạy cycle random.
+    rest_clips:      int   = 19
+    min_total_clips: int   = 20
 
     # Ghép/mix: blend (crossfade) + làm chậm
     t_window:        int   = 10             # T+10: không lặp trong 10 clip kế
@@ -78,7 +125,7 @@ class VideoParams:
 
     @property
     def total_clips(self) -> int:
-        return self.image_count
+        return self.scene_clips
 
 
 def generate_frame_pairs(image_count: int, total_clips: int,
@@ -108,38 +155,28 @@ def generate_frame_pairs(image_count: int, total_clips: int,
     return pairs[:total_clips]
 
 
-def generate_ingredient_plan(image_count: int, rest_clips: int,
-                             seed: int | None = None) -> list[int]:
+def generate_ingredient_plan(scene_clips: int,
+                             sheets: tuple[int, ...] | list[int] | None = None,
+                             ) -> list[list[int]]:
     """
-    Chế độ "Thành phần": mỗi clip = 1 ảnh nguyên liệu.
-      - Clip ĐẦU TIÊN dùng ẢNH 0 (thumbnail) — chỉ 1 lần duy nhất.
-      - Các clip còn lại (rest_clips) dùng ẢNH 1..(n-1), chia đều + xáo trộn,
-        cố gắng KHÔNG lặp ảnh ngay liền kề (để mỗi clip một cảnh khác nhau).
-    Trả về danh sách chỉ số ảnh cho từng clip, ví dụ [0, 3, 1, 5, 2, 4, 1, ...].
-    """
-    import random
-    rng = random.Random(seed)
-    n = max(image_count, 2)
-    scenery = list(range(1, n))                 # [1..n-1]
-    if not scenery:
-        scenery = [0]
+    Chế độ "Thành phần" (quy trình 3 ảnh): MỌI clip dùng CÙNG bộ nguyên liệu là
+    hai character sheet (ảnh 1 + ảnh 2); cái khác nhau giữa các clip là PROMPT
+    bối cảnh, không phải ảnh nguồn. Nhờ vậy N clip cùng một nhân vật + một linh
+    thú nhưng N bối cảnh khác nhau.
 
-    plan: list[int] = [0]                        # clip 0 = ảnh 0
-    last = 0
-    while len(plan) < 1 + rest_clips:
-        cycle = scenery[:]
-        rng.shuffle(cycle)
-        for im in cycle:
-            if len(plan) >= 1 + rest_clips:
-                break
-            if im == last and len(scenery) > 1:  # tránh lặp liền kề
-                continue
-            plan.append(im)
-            last = im
+    Riêng clip 00 (intro) dựng lại ĐÚNG cảnh ảnh bìa: nguyên liệu [0, 1, 2].
+
+    Trả về danh sách nguyên liệu cho từng clip: [[0, 1, 2], [1, 2], [1, 2], ...].
+    (Trước đây hàm này trả list[int] vì mỗi clip 1 ảnh — pipeline 1:1 đã bỏ.)
+    """
+    ings = list(sheets if sheets is not None else SHEET_IMAGES)
+    plan = [list(ings) for _ in range(max(int(scene_clips), 0))]
+    if sheets is None and plan:
+        plan[INTRO_CLIP] = list(INTRO_INGREDIENTS)
     return plan
 
 
-# ── 2 PHONG CÁCH: 2D & 3D ───────────────────────────────────────
+# ── 10 PHONG CÁCH ẢNH ───────────────────────────────────────────
 # Vấn đề: khi prompt mô tả nhân vật quá "thực" (chất liệu vải, màu da, mã màu
 # hex) và từ khoá phong cách nằm cuối/quá yếu, Gemini render ra ẢNH THẬT
 # (photorealistic). Nên ta ÉP một câu lệnh phong cách mạnh vào ĐẦU mọi prompt
@@ -148,13 +185,18 @@ def generate_ingredient_plan(image_count: int, rest_clips: int,
 # lời hướng dẫn cho AI viết prompt, và gợi ý phong cách cho clip (Flow/Veo).
 # Đổi khi thay đổi định nghĩa phong cách. Cache prompts.json có style_version
 # KHÁC giá trị này (hoặc khác style_key) sẽ bị coi là cũ → sinh lại prompt.
-STYLE_VERSION = "styles-v7"
+STYLE_VERSION = "styles-v8"
 DEFAULT_STYLE = "2d"
 
 # Mỗi phong cách gồm:
 #   icon/label/desc → hiển thị ở UI (bộ chọn cuộn được)
 #   prefix   → chèn vào ĐẦU mọi prompt ảnh
 #   negative → chèn vào CUỐI mọi prompt ảnh (ép đúng phong cách, cấm phong cách khác)
+#              prefix/negative KHÔNG được đọc trực tiếp ở đâu khác ngoài
+#              wrap_style() bên dưới; wrap_style được gọi ở
+#              gemini_driver._prompt_for lúc GỬI prompt cho Gemini. Vì bọc lúc
+#              gửi (không lưu vào prompts.json) nên sửa 2 trường này KHÔNG cần
+#              tăng STYLE_VERSION — prompt body trong cache vẫn hợp lệ.
 #   brief    → đưa vào lời nhắc AI viết prompt (prompt_gen). Với phong cách TẢ THỰC,
 #              brief PHẢI chứa "tả thực" hoặc "photoreal" để prompt_gen bật nhánh
 #              photoreal (xem prompt_gen._is_photoreal).
@@ -165,21 +207,21 @@ STYLES: dict[str, dict[str, str]] = {
         "label": "2D (tranh vẽ / anime / cartoon)",
         "desc": "Tranh vẽ tay 2D, tô màu phẳng, anime/cartoon",
         "prefix": (
-            "TRANH HOẠT HÌNH 2D (2D animation / cartoon / anime-style "
-            "illustration), vẽ tay nét mềm, tô màu phẳng kiểu cel-shading, màu "
-            "pastel dịu, ánh sáng điện ảnh. ĐÂY LÀ TRANH HOẠT HÌNH 2D, KHÔNG "
-            "PHẢI ẢNH CHỤP THẬT. "
+            "2D ANIMATED ILLUSTRATION (2D animation / cartoon / anime-style "
+            "illustration), soft hand-drawn linework, flat cel-shaded colouring, "
+            "gentle pastel colours, cinematic lighting. THIS IS A 2D CARTOON "
+            "ILLUSTRATION, NOT A REAL PHOTOGRAPH. "
         ),
         "negative": (
-            " || Phong cách BẮT BUỘC: hoạt hình 2D vẽ tay / cartoon / anime "
-            "(flat cel-shading). TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh chụp "
-            "thật (photo/photograph/realistic photo), KHÔNG người/da/vải/tóc "
-            "chân thực như đời thật, KHÔNG 3D render thực, KHÔNG hyperrealism. "
-            "Nếu phân vân, luôn nghiêng về nét vẽ tay 2D phẳng."
+            " || REQUIRED STYLE: hand-drawn 2D animation / cartoon / anime "
+            "(flat cel-shading). ABSOLUTELY NOT photorealistic, NOT a real "
+            "photograph (photo/photograph/realistic photo), NO lifelike human "
+            "skin/fabric/hair, NO realistic 3D render, NO hyperrealism. When in "
+            "doubt, always lean towards flat hand-drawn 2D linework."
         ),
         "brief": (
-            "tranh hoạt hình 2D vẽ tay / cartoon / anime-style illustration, "
-            "tô màu phẳng cel-shading, nét viền mềm, màu pastel dịu"
+            "hand-drawn 2D animated illustration / cartoon / anime-style "
+            "illustration, flat cel-shading, soft outlines, gentle pastel colours"
         ),
         "motion": "2D hand-drawn animated cartoon look",
     },
@@ -188,87 +230,88 @@ STYLES: dict[str, dict[str, str]] = {
         "label": "3D (Pixar / Disney CGI)",
         "desc": "Khối 3D mềm mại kiểu Pixar / Disney",
         "prefix": (
-            "PHIM HOẠT HÌNH 3D (3D animated movie / Pixar-Disney style / "
-            "stylized 3D CGI render), nhân vật & cảnh vật tạo khối 3D mềm mại "
-            "đáng yêu, đổ bóng dịu, màu pastel ấm, ánh sáng điện ảnh. ĐÂY LÀ "
-            "ẢNH HOẠT HÌNH 3D, KHÔNG PHẢI ẢNH CHỤP THẬT. "
+            "3D ANIMATED MOVIE (3D animated movie / Pixar-Disney style / "
+            "stylized 3D CGI render), characters and scenery with soft, cute 3D "
+            "volumes, gentle shading, warm pastel colours, cinematic lighting. "
+            "THIS IS A 3D ANIMATED IMAGE, NOT A REAL PHOTOGRAPH. "
         ),
         "negative": (
-            " || Phong cách BẮT BUỘC: hoạt hình 3D kiểu Pixar/Disney (stylized "
-            "3D CGI). TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh chụp thật (photo"
-            "/photograph/realistic photo), KHÔNG người/da/vải/tóc chân thực như "
-            "đời thật, KHÔNG hyperrealism, KHÔNG tranh vẽ 2D phẳng. Nếu phân "
-            "vân, luôn nghiêng về khối 3D cách điệu kiểu phim hoạt hình."
+            " || REQUIRED STYLE: Pixar/Disney-style 3D animation (stylized 3D "
+            "CGI). ABSOLUTELY NOT photorealistic, NOT a real photograph (photo/"
+            "photograph/realistic photo), NO lifelike human skin/fabric/hair, NO "
+            "hyperrealism, NOT a flat 2D drawing. When in doubt, always lean "
+            "towards stylised animated-film 3D volumes."
         ),
         "brief": (
-            "phim hoạt hình 3D kiểu Pixar/Disney (stylized 3D CGI), khối 3D mềm "
-            "mại đáng yêu, đổ bóng dịu, subsurface scattering nhẹ, màu pastel ấm"
+            "Pixar/Disney-style 3D animated film (stylized 3D CGI), soft cute 3D "
+            "volumes, gentle shading, light subsurface scattering, warm pastel colours"
         ),
-        "motion": "stylized 3D Pixar-style animated film look",
+        "motion": "stylized 3D animated feature film look, soft rounded shapes",
     },
     "ghibli": {
         "icon": "🌿",
         "label": "Ghibli (anime vẽ tay)",
         "desc": "Studio Ghibli, nền màu nước mộng mơ",
         "prefix": (
-            "TRANH ANIME VẼ TAY KIỂU STUDIO GHIBLI (hand-painted Ghibli-style "
-            "anime), nền vẽ tay như tranh màu nước, mây khối mềm, ánh sáng ấm "
-            "hoài niệm, chi tiết thiên nhiên tỉ mỉ, màu trong trẻo. ĐÂY LÀ "
-            "TRANH ANIME VẼ TAY, KHÔNG PHẢI ẢNH CHỤP THẬT. "
+            "STUDIO GHIBLI-STYLE HAND-PAINTED ANIME (hand-painted Ghibli-style "
+            "anime), hand-painted watercolour-like backgrounds, soft billowing "
+            "clouds, warm nostalgic light, meticulous nature detail, clear fresh "
+            "colours. THIS IS A HAND-PAINTED ANIME ILLUSTRATION, NOT A REAL "
+            "PHOTOGRAPH. "
         ),
         "negative": (
-            " || Phong cách BẮT BUỘC: anime vẽ tay kiểu Ghibli (painterly, "
-            "watercolor backgrounds). TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh "
-            "chụp thật, KHÔNG 3D CGI, KHÔNG hyperrealism. Nếu phân vân, nghiêng "
-            "về nét vẽ tay màu nước mộng mơ."
+            " || REQUIRED STYLE: hand-painted Ghibli-style anime (painterly, "
+            "watercolor backgrounds). ABSOLUTELY NOT photorealistic, NOT a real "
+            "photograph, NO 3D CGI, NO hyperrealism. When in doubt, lean towards "
+            "dreamy hand-painted watercolour linework."
         ),
         "brief": (
-            "tranh anime vẽ tay kiểu Studio Ghibli, nền màu nước vẽ tay, mây "
-            "mềm, ánh sáng ấm hoài niệm, chi tiết thiên nhiên tỉ mỉ"
+            "hand-painted Studio Ghibli-style anime, hand-painted watercolour "
+            "backgrounds, soft clouds, warm nostalgic light, meticulous nature detail"
         ),
-        "motion": "hand-painted Ghibli-style anime look, gentle painterly motion",
+        "motion": "hand-painted Japanese anime look, gentle painterly motion",
     },
     "anime": {
         "icon": "✨",
         "label": "Anime điện ảnh (Makoto Shinkai)",
         "desc": "Bầu trời rực rỡ, ánh sáng lung linh",
         "prefix": (
-            "ANIME ĐIỆN ẢNH HIỆN ĐẠI (modern cinematic anime, Makoto Shinkai "
-            "style), bầu trời rực rỡ chi tiết, ánh sáng lens-flare lung linh, "
-            "màu bão hoà đẹp, hiệu ứng ánh sáng điện ảnh, nét vẽ sắc. ĐÂY LÀ "
-            "TRANH ANIME, KHÔNG PHẢI ẢNH CHỤP THẬT. "
+            "MODERN CINEMATIC ANIME (modern cinematic anime, Makoto Shinkai "
+            "style), brilliant detailed skies, shimmering lens-flare light, "
+            "beautiful saturated colours, cinematic lighting effects, crisp "
+            "linework. THIS IS AN ANIME ILLUSTRATION, NOT A REAL PHOTOGRAPH. "
         ),
         "negative": (
-            " || Phong cách BẮT BUỘC: anime điện ảnh hiện đại (Makoto Shinkai). "
-            "TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh chụp thật, KHÔNG 3D CGI "
-            "kiểu Pixar, KHÔNG hyperrealism. Nếu phân vân, nghiêng về nét anime "
-            "bầu trời rực rỡ."
+            " || REQUIRED STYLE: modern cinematic anime (Makoto Shinkai). "
+            "ABSOLUTELY NOT photorealistic, NOT a real photograph, NO Pixar-style "
+            "3D CGI, NO hyperrealism. When in doubt, lean towards anime linework "
+            "with brilliant skies."
         ),
         "brief": (
-            "anime điện ảnh hiện đại kiểu Makoto Shinkai, bầu trời rực rỡ chi "
-            "tiết, ánh sáng lens-flare, màu bão hoà, nét vẽ sắc điện ảnh"
+            "modern cinematic anime in the style of Makoto Shinkai, brilliant "
+            "detailed skies, lens-flare light, saturated colours, crisp cinematic linework"
         ),
-        "motion": "cinematic modern anime look (Makoto Shinkai), luminous skies",
+        "motion": "cinematic modern anime look, luminous detailed skies",
     },
     "watercolor": {
         "icon": "🖌️",
         "label": "Màu nước (watercolor)",
         "desc": "Màu loang mềm trên giấy, trong trẻo",
         "prefix": (
-            "TRANH MÀU NƯỚC (watercolor painting illustration), màu loang mềm "
-            "trên giấy, viền ướt, mảng màu trong suốt chồng lớp, khoảng trắng "
-            "thở, nét bút lỏng. ĐÂY LÀ TRANH MÀU NƯỚC VẼ TAY, KHÔNG PHẢI ẢNH "
-            "CHỤP THẬT. "
+            "WATERCOLOUR PAINTING (watercolor painting illustration), soft "
+            "pigments bleeding on paper, wet edges, layered transparent washes, "
+            "breathing white space, loose brushwork. THIS IS A HAND-PAINTED "
+            "WATERCOLOUR, NOT A REAL PHOTOGRAPH. "
         ),
         "negative": (
-            " || Phong cách BẮT BUỘC: tranh màu nước vẽ tay (watercolor). "
-            "TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh chụp thật, KHÔNG 3D CGI, "
-            "KHÔNG nét vector phẳng cứng. Nếu phân vân, nghiêng về màu loang "
-            "mềm trên giấy."
+            " || REQUIRED STYLE: hand-painted watercolour (watercolor). "
+            "ABSOLUTELY NOT photorealistic, NOT a real photograph, NO 3D CGI, NO "
+            "hard flat vector lines. When in doubt, lean towards soft pigments "
+            "bleeding on paper."
         ),
         "brief": (
-            "tranh màu nước vẽ tay, màu loang mềm trên giấy, viền ướt, mảng màu "
-            "trong suốt chồng lớp, khoảng trắng thở"
+            "hand-painted watercolour, soft pigments bleeding on paper, wet edges, "
+            "layered transparent washes, breathing white space"
         ),
         "motion": "hand-painted watercolor illustration look, soft bleeding pigments",
     },
@@ -277,19 +320,20 @@ STYLES: dict[str, dict[str, str]] = {
         "label": "Sơn dầu (oil painting)",
         "desc": "Nét cọ impasto dày, màu giàu chiều sâu",
         "prefix": (
-            "TRANH SƠN DẦU (oil painting), nét cọ dày impasto nhìn thấy rõ, màu "
-            "giàu chiều sâu, ánh sáng ấm kiểu hội hoạ cổ điển, chất sơn dày. "
-            "ĐÂY LÀ TRANH SƠN DẦU VẼ TAY, KHÔNG PHẢI ẢNH CHỤP THẬT. "
+            "OIL PAINTING (oil painting), clearly visible thick impasto "
+            "brushstrokes, rich deep colours, warm classical-painting light, "
+            "thick paint texture. THIS IS A HAND-PAINTED OIL PAINTING, NOT A REAL "
+            "PHOTOGRAPH. "
         ),
         "negative": (
-            " || Phong cách BẮT BUỘC: tranh sơn dầu vẽ tay (oil painting, "
-            "impasto). TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh chụp thật, "
-            "KHÔNG 3D CGI, KHÔNG nét số phẳng. Nếu phân vân, nghiêng về nét cọ "
-            "dày sơn dầu."
+            " || REQUIRED STYLE: hand-painted oil painting (oil painting, "
+            "impasto). ABSOLUTELY NOT photorealistic, NOT a real photograph, NO "
+            "3D CGI, NO flat digital linework. When in doubt, lean towards thick "
+            "oil brushstrokes."
         ),
         "brief": (
-            "tranh sơn dầu vẽ tay, nét cọ impasto dày rõ, màu giàu chiều sâu, "
-            "ánh sáng ấm kiểu hội hoạ cổ điển"
+            "hand-painted oil painting, thick visible impasto brushstrokes, rich "
+            "deep colours, warm classical-painting light"
         ),
         "motion": "oil painting look, visible brushstroke texture",
     },
@@ -298,20 +342,20 @@ STYLES: dict[str, dict[str, str]] = {
         "label": "Thuỷ mặc (ink wash Á Đông)",
         "desc": "Mực loang tối giản, nhiều khoảng trống",
         "prefix": (
-            "TRANH THUỶ MẶC Á ĐÔNG (East-Asian ink wash painting, sumi-e), mực "
-            "đen loang trên giấy xuyến, nhiều khoảng trống, nét bút tối giản "
-            "thanh thoát, điểm nhấn màu nhạt. ĐÂY LÀ TRANH MỰC VẼ TAY, KHÔNG "
-            "PHẢI ẢNH CHỤP THẬT. "
+            "EAST-ASIAN INK WASH PAINTING (East-Asian ink wash painting, sumi-e), "
+            "black ink bleeding on rice paper, generous empty space, minimal "
+            "graceful brushstrokes, pale colour accents. THIS IS A HAND-PAINTED "
+            "INK PAINTING, NOT A REAL PHOTOGRAPH. "
         ),
         "negative": (
-            " || Phong cách BẮT BUỘC: tranh thuỷ mặc Á Đông (ink wash / "
-            "sumi-e). TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh chụp thật, "
-            "KHÔNG 3D CGI, KHÔNG màu bão hoà rực. Nếu phân vân, nghiêng về mực "
-            "loang tối giản nhiều khoảng trống."
+            " || REQUIRED STYLE: East-Asian ink wash painting (ink wash / "
+            "sumi-e). ABSOLUTELY NOT photorealistic, NOT a real photograph, NO 3D "
+            "CGI, NO vivid saturated colours. When in doubt, lean towards minimal "
+            "bleeding ink with lots of empty space."
         ),
         "brief": (
-            "tranh thuỷ mặc Á Đông (ink wash / sumi-e), mực loang trên giấy, "
-            "nhiều khoảng trống, nét bút tối giản thanh thoát"
+            "East-Asian ink wash painting (ink wash / sumi-e), ink bleeding on "
+            "paper, generous empty space, minimal graceful brushstrokes"
         ),
         "motion": "East-Asian ink wash painting look, flowing ink, minimalist",
     },
@@ -320,19 +364,19 @@ STYLES: dict[str, dict[str, str]] = {
         "label": "Lofi aesthetic",
         "desc": "Cozy hoài niệm, hạt film ấm",
         "prefix": (
-            "TRANH MINH HOẠ LOFI (lo-fi anime aesthetic illustration), tông "
-            "màu ấm hoài niệm, hạt nhiễu film nhẹ, ánh đèn dịu cozy, chi tiết "
-            "đời thường ấm cúng, nét vẽ 2D mềm. ĐÂY LÀ TRANH MINH HOẠ, KHÔNG "
-            "PHẢI ẢNH CHỤP THẬT. "
+            "LOFI ILLUSTRATION (lo-fi anime aesthetic illustration), warm "
+            "nostalgic tones, light film-grain noise, soft cozy lamplight, warm "
+            "everyday details, soft 2D linework. THIS IS AN ILLUSTRATION, NOT A "
+            "REAL PHOTOGRAPH. "
         ),
         "negative": (
-            " || Phong cách BẮT BUỘC: tranh minh hoạ lofi aesthetic (2D). "
-            "TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh chụp thật, KHÔNG 3D CGI "
-            "thực. Nếu phân vân, nghiêng về nét minh hoạ 2D ấm hoài niệm."
+            " || REQUIRED STYLE: lofi aesthetic illustration (2D). ABSOLUTELY NOT "
+            "photorealistic, NOT a real photograph, NO realistic 3D CGI. When in "
+            "doubt, lean towards warm nostalgic 2D illustration linework."
         ),
         "brief": (
-            "tranh minh hoạ lofi aesthetic 2D, tông ấm hoài niệm, hạt nhiễu "
-            "film nhẹ, ánh đèn dịu cozy, chi tiết đời thường ấm cúng"
+            "2D lofi aesthetic illustration, warm nostalgic tones, light film "
+            "grain, soft cozy lamplight, warm everyday details"
         ),
         "motion": "lo-fi aesthetic 2D illustration look, cozy warm ambience",
     },
@@ -341,24 +385,24 @@ STYLES: dict[str, dict[str, str]] = {
         "label": "Tả thực điện ảnh (cinematic photoreal)",
         "desc": "Như ảnh chụp / phim điện ảnh thật",
         "prefix": (
-            "ẢNH TẢ THỰC ĐIỆN ẢNH (cinematic photorealistic, hyperrealistic "
-            "photo-real render), ánh sáng điện ảnh, chiều sâu trường ảnh "
-            "(shallow depth of field / bokeh), chất liệu, da, vải, tóc, lông "
-            "chi tiết chân thực như đời thật, độ phân giải cao, tông màu phim. "
-            "ĐÂY LÀ ẢNH TẢ THỰC NHƯ CHỤP THẬT, KHÔNG PHẢI TRANH HOẠT HÌNH. "
+            "CINEMATIC PHOTOREALISTIC IMAGE (cinematic photorealistic, "
+            "hyperrealistic photo-real render), cinematic lighting, shallow depth "
+            "of field / bokeh, true-to-life detail in materials, skin, fabric, "
+            "hair and fur, high resolution, film colour grading. THIS IS A "
+            "PHOTOREALISTIC IMAGE LIKE A REAL PHOTOGRAPH, NOT A CARTOON. "
         ),
         "negative": (
-            " || Phong cách BẮT BUỘC: tả thực điện ảnh / photorealistic (như "
-            "ảnh chụp/phim điện ảnh thật). TUYỆT ĐỐI KHÔNG hoạt hình, KHÔNG "
-            "cartoon/anime, KHÔNG tranh vẽ 2D phẳng (cel-shading), KHÔNG 3D "
-            "kiểu Pixar/Disney cách điệu, KHÔNG nét vẽ tay hay tô màu phẳng. "
-            "Nếu phân vân, luôn nghiêng về ảnh chụp thật với chi tiết chân "
-            "thực và ánh sáng điện ảnh."
+            " || REQUIRED STYLE: cinematic photorealism (like a real photograph / "
+            "live-action film). ABSOLUTELY NO animation, NO cartoon/anime, NO "
+            "flat 2D drawing (cel-shading), NO stylised Pixar/Disney 3D, NO "
+            "hand-drawn linework or flat colouring. When in doubt, always lean "
+            "towards a real photograph with true-to-life detail and cinematic "
+            "lighting."
         ),
         "brief": (
-            "ảnh tả thực điện ảnh (cinematic photorealistic), ánh sáng điện "
-            "ảnh, chiều sâu trường ảnh/bokeh, chất liệu và da/vải/tóc chi tiết "
-            "chân thực như thật, tông màu phim, độ chi tiết cao"
+            "cinematic photorealistic image, cinematic lighting, shallow depth of "
+            "field / bokeh, true-to-life detail in materials, skin, fabric and "
+            "hair, film colour grading, high detail"
         ),
         "motion": (
             "cinematic photorealistic live-action look, realistic natural "
@@ -370,20 +414,20 @@ STYLES: dict[str, dict[str, str]] = {
         "label": "Phim nhựa cổ điển (vintage film)",
         "desc": "Ảnh chụp phim analog cổ, hạt film hoài niệm",
         "prefix": (
-            "ẢNH CHỤP PHIM NHỰA CỔ ĐIỂN (vintage analog film photograph, "
-            "35mm), tả thực như ảnh chụp thật, hạt film rõ, màu ngả hoài niệm "
-            "(faded warm tones), vignette nhẹ, ánh sáng tự nhiên mềm. ĐÂY LÀ "
-            "ẢNH CHỤP THẬT KIỂU PHIM CỔ, KHÔNG PHẢI TRANH HOẠT HÌNH. "
+            "VINTAGE ANALOG FILM PHOTOGRAPH (vintage analog film photograph, "
+            "35mm), photorealistic like a real photo, visible film grain, faded "
+            "warm nostalgic tones, light vignette, soft natural light. THIS IS A "
+            "REAL VINTAGE-FILM PHOTOGRAPH, NOT A CARTOON. "
         ),
         "negative": (
-            " || Phong cách BẮT BUỘC: ảnh chụp phim nhựa analog cổ điển, tả "
-            "thực (photorealistic). TUYỆT ĐỐI KHÔNG hoạt hình, KHÔNG "
-            "cartoon/anime, KHÔNG 3D CGI cách điệu, KHÔNG tranh vẽ. Nếu phân "
-            "vân, nghiêng về ảnh chụp phim thật với hạt film và màu hoài niệm."
+            " || REQUIRED STYLE: vintage analog film photograph, photorealistic. "
+            "ABSOLUTELY NO animation, NO cartoon/anime, NO stylised 3D CGI, NO "
+            "painting. When in doubt, lean towards a real film photograph with "
+            "grain and nostalgic colours."
         ),
         "brief": (
-            "ảnh chụp phim nhựa analog cổ điển 35mm, tả thực như ảnh chụp thật "
-            "(photorealistic), hạt film, màu ngả hoài niệm, vignette nhẹ"
+            "vintage 35mm analog film photograph, photorealistic like a real "
+            "photo, film grain, faded nostalgic colours, light vignette"
         ),
         "motion": "vintage analog film photograph look, realistic 35mm film grain",
     },
@@ -401,9 +445,38 @@ def style_info(style: str | None) -> dict[str, str]:
 
 
 def wrap_style(prompt: str, style: str | None = None) -> str:
-    """Bọc prompt bằng prefix phong cách (2D/3D) + phủ định cấm ảnh thật."""
+    """Bọc prompt bằng prefix phong cách + phủ định cấm các phong cách khác.
+
+    Gọi ở gemini_driver._prompt_for cho MỌI prompt ảnh ngay trước khi gửi."""
     s = style_info(style)
     return f"{s['prefix']}{prompt}{s['negative']}"
+
+
+def wrap_sheet_style(prompt: str, style: str | None = None) -> str:
+    """Bọc riêng cho ẢNH 1 & 2 — BẢNG PHÂN TÍCH NHÂN VẬT.
+
+    KHÔNG dùng wrap_style: prefix điện ảnh ("ánh sáng điện ảnh, bokeh, chiều
+    sâu trường ảnh") nằm ở đầu prompt sẽ đè bố cục tài liệu và khiến Gemini vẽ
+    một CẢNH PHIM thay vì bảng phân tích (đã gặp thật). Ở đây phong cách chỉ
+    dùng để tả CÁCH VẼ NHÂN VẬT, còn tấm ảnh vẫn là tài liệu thiết kế: nền
+    phẳng, ánh sáng đều, CÓ nhãn chữ tiếng Anh.
+    """
+    s = style_info(style)
+    return (
+        "CHARACTER MODEL SHEET (character model sheet / character design "
+        "analysis sheet) — THIS IS A CHARACTER DESIGN DOCUMENT, NOT A FILM "
+        "FRAME. One single sheet, uniform flat background, even neutral studio "
+        "lighting, no environment, no depth of field. "
+        f"The characters on the sheet are drawn in this style: {s['brief']}.\n\n"
+        f"{prompt}"
+        " || It MUST be a CHARACTER MODEL SHEET: document layout, multiple "
+        "frames on one sheet, WITH short uppercase English text labels and "
+        "callout lines, and a colour-palette strip. ABSOLUTELY DO NOT turn it "
+        "into a film scene: no forest/room/landscape background, no bokeh or "
+        "background blur, no dramatic cinematic lighting, no smoke or mist, no "
+        "cropping down to a single figure. All figures must be THE SAME "
+        "character, same proportions, same base line."
+    )
 
 
 # ── Prompt sinh ảnh (chỉnh theo ý muốn) ─────────────────────────
@@ -412,23 +485,24 @@ def wrap_style(prompt: str, style: str | None = None) -> str:
 # tự chứa danh tính + bố cục, kể cả khi Gemini mở chat mới; không dựa vào trí
 # nhớ hội thoại. Ảnh 0 sạch chữ: tiêu đề thật được chèn ở bước thumbnail/intro.
 _CONTINUITY = (
-    "Đây là shot tiếp theo của CÙNG MỘT phim hoạt hình chill chủ đề '{topic}'. "
-    "Giữ chính xác CÙNG nhân vật chính: một người trẻ tóc đen ngắn hơi rối, "
-    "áo hoodie xanh sage rộng, quần kem, giày trắng và tai nghe màu be; giữ "
-    "nguyên khuôn mặt, vóc dáng, trang phục và tỉ lệ nhân vật ở mọi shot. Giữ "
-    "CÙNG bối cảnh: căn cabin gỗ cạnh hồ trong thung lũng rừng thông, cửa sổ "
-    "lớn, bàn gỗ, đèn vàng, cây cảnh, cốc trà và chú mèo tam thể. BỐ CỤC KHÓA: "
-    "wide shot ngang tầm mắt, góc nhìn ba phần tư từ cùng một vị trí trong "
-    "cabin; nhân vật ngồi bên bàn ở một phần ba PHẢI, mèo cuộn tròn trên bệ "
-    "cửa sổ bên phải nhân vật, cốc trà bên trái bàn, đèn phía sau cốc, cây "
-    "cảnh ở mép phải; hồ, rừng thông và núi nhìn qua cửa sổ chiếm nửa TRÁI. "
-    "Không di chuyển camera, nhân vật, đồ vật hoặc kiến trúc. Cùng bảng màu "
-    "xanh sage–kem–vàng hổ phách, cùng hoàng hôn dịu; chỉ biến thiên cực nhỏ "
-    "của ánh sáng và thiên nhiên. Nét mềm, cozy, lofi, serene, relaxing, "
-    "meditation, khung hình 16:9; tư thế nghỉ bình yên và nhịp rất chậm. "
-    "Khi có ảnh tham chiếu, giữ continuity đúng ảnh đó; mọi đặc điểm khóa "
-    "ở trên vẫn bắt buộc kể cả trong chat mới. KHÔNG thêm nhân vật mới, "
-    "KHÔNG đổi trang phục, KHÔNG chữ, logo hay watermark. "
+    "This is the next shot of THE SAME chill animated film on the theme '{topic}'. "
+    "Keep EXACTLY the same main character: a young person with short, slightly "
+    "messy black hair, a loose sage-green hoodie, cream trousers, white shoes and "
+    "beige headphones; keep the face, build, outfit and proportions unchanged in "
+    "every shot. Keep THE SAME setting: a lakeside wooden cabin in a pine-forest "
+    "valley, large window, wooden desk, warm yellow lamp, potted plant, a cup of "
+    "tea and a calico cat. LOCKED COMPOSITION: eye-level wide shot, three-quarter "
+    "view from the same spot inside the cabin; the character sits at the desk in "
+    "the RIGHT third, the cat curled up on the window sill to the character's "
+    "right, the tea cup on the left of the desk, the lamp behind the cup, the "
+    "plant at the right edge; the lake, pine forest and mountains seen through "
+    "the window fill the LEFT half. Do not move the camera, character, objects or "
+    "architecture. Same sage-green, cream and amber palette, same soft sunset; "
+    "only tiny variations of light and nature. Soft, cozy, lofi, serene, "
+    "relaxing, meditation, 16:9 frame; peaceful resting pose and a very slow "
+    "tempo. When a reference image is provided, keep continuity with it exactly; "
+    "every locked trait above still applies even in a new chat. NO new "
+    "characters, NO outfit changes, NO text, logo or watermark. "
 )
 
 
@@ -437,47 +511,26 @@ def _scene(description: str) -> str:
 
 
 DEFAULT_PROMPTS: dict[str, str] = {
-    "0": _scene("Ảnh nền thumbnail mở đầu, HOÀN TOÀN KHÔNG CÓ CHỮ. Nhân vật rõ nhưng không quá lớn ở PHẢI; mặt hồ phẳng với mảng sáng dịu ở nửa TRÁI tạo negative space để phần mềm chèn tiêu đề sau. Ánh viền hổ phách thật nhẹ trên tóc; không thay đổi vị trí đã khóa."),
-    "1": _scene("Biến thể mặt hồ gần như phẳng, vài gợn nước dài thưa phản chiếu màu kem của trời; nhân vật thư thái, đôi tay nghỉ trên bàn."),
-    "2": _scene("Biến thể gợn nước lan rất nhẹ phía bờ xa, các phản chiếu thông mềm và kéo dài; ánh đèn cabin ổn định."),
-    "3": _scene("Biến thể một dải mây mỏng màu kem nằm ngang trên núi xa; hồ phản chiếu dải mây, mọi vật tiền cảnh giữ nguyên."),
-    "4": _scene("Biến thể ánh hoàng hôn xuyên nhẹ qua mép mây, vệt sáng mềm nằm trên mặt bàn cạnh cốc trà; không tia sáng gắt."),
-    "5": _scene("Biến thể lá thông ngoài cửa sổ hơi nghiêng vì gió nhẹ; mèo vẫn cuộn tròn ngủ, nhân vật giữ nguyên tư thế nghỉ."),
-    "6": _scene("Biến thể sương mỏng chỉ ở chân núi xa, không che hồ hoặc nhân vật; độ tương phản toàn cảnh rất dịu."),
-    "7": _scene("Biến thể phản chiếu mây hơi đứt đoạn bởi gợn nước nhỏ; sắc xanh sage của hồ giữ nhất quán."),
-    "8": _scene("Biến thể ánh đèn hổ phách tạo vùng sáng tròn mềm hơn trên bàn; bóng cốc trà mờ, không thêm hay dời đạo cụ."),
-    "9": _scene("Biến thể rèm cửa ở rìa khung hơi cong do gió nhẹ, nhân vật nhìn bình yên về hồ; rèm không che khuôn mặt."),
-    "10": _scene("Biến thể mặt nước trong gần bờ phản chiếu đường cửa sổ thật mờ; núi xa nằm nguyên trên đường chân trời."),
-    "11": _scene("Biến thể vài hạt bụi sáng nhỏ trong tia sáng cạnh cửa sổ, rất thưa và tinh tế; không hiệu ứng kỳ ảo."),
-    "12": _scene("Biến thể mép mây màu hổ phách nhạt, phần giữa mây màu kem; ánh sáng bên trong vẫn ấm dịu và ổn định."),
-    "13": _scene("Biến thể cụm lá cây cảnh tại mép phải bắt sáng mềm; nhân vật và mèo vẫn đúng tỷ lệ, khuôn mặt không đổi."),
-    "14": _scene("Biến thể sương bên bờ hồ xa thành dải ngang mỏng, phản chiếu rừng thông vẫn nhìn thấy rõ; không sương trong cabin."),
-    "15": _scene("Biến thể các gợn hồ tạo đường cong rộng, khoảng nước giữa các gợn phẳng và tĩnh; tổng thể thư giãn, không sóng lớn."),
-    "16": _scene("Biến thể bóng khung cửa mềm rơi trên mép bàn, tai nghe be phản sáng nhẹ; ánh sáng và hướng bóng giữ đúng góc đã khóa."),
-    "17": _scene("Biến thể mây thưa hơn trên đỉnh núi nhưng cùng sắc trời hoàng hôn; nhân vật vẫn ngồi nghỉ cạnh cốc trà."),
-    "18": _scene("Biến thể mép tai mèo có viền sáng hổ phách rất nhẹ, mèo ngủ đúng vị trí trên bệ cửa; không đổi hoa văn tam thể."),
-    "19": _scene("Biến thể hồ phản chiếu vùng trời kem rộng hơn, hàng thông giữ đường viền mềm; không chuyển sang đêm hoặc bình minh."),
-    "20": _scene("Biến thể vài gợn nước nhỏ giao nhau ở giữa hồ, ánh phản chiếu tan mềm; bố cục cabin và nhân vật không đổi sau shot trước."),
-    "21": _scene("Biến thể ánh vàng trên cạnh cốc trà dịu hơn, mặt bàn hiện vân gỗ minh họa mềm; không zoom hoặc cắt thành cận cảnh."),
-    "22": _scene("Biến thể lớp mây mỏng thứ hai xa phía sau đỉnh núi; chiều sâu nhẹ nhàng, không thêm núi hay đổi địa hình."),
-    "23": _scene("Biến thể lá cây cảnh hơi hạ xuống tự nhiên, bóng lá nhòe nhẹ trên cạnh bàn; nhân vật giữ tư thế, trang phục và tai nghe."),
-    "24": _scene("Biến thể phản chiếu hàng thông thành các nét dọc mềm trên mặt hồ, những khoảng nước trống tạo cảm giác tĩnh lặng."),
-    "25": _scene("Biến thể ánh trời kem qua cửa sổ hòa nhẹ với đèn vàng ở tay áo sage; biểu cảm nhân vật bình yên và không thay đổi danh tính."),
-    "26": _scene("Biến thể làn sương mỏng hơi tách thành hai dải ở bờ xa; giữ vùng mặt hồ phía trước sáng và thoáng, không tạo khói từ người hoặc cốc."),
-    "27": _scene("Biến thể rèm cửa gần trở lại thẳng, mép vải mềm trong ánh hổ phách; mọi vật và camera đều đứng yên."),
-    "28": _scene("Biến thể vài chấm đom đóm nhỏ rất thưa bên ngoài cạnh bờ hồ, không vào cabin, không biến thành bokeh che nhân vật."),
-    "29": _scene("Biến thể bề mặt hồ mịn hơn ở vùng trái khung, gợn nước thưa gần bờ phải; không thay đổi khung hình rộng đã khóa."),
-    "30": _scene("Biến thể ánh viền ấm trên đường vai hoodie phản chiếu đèn bàn, gương mặt sáng dịu; nhân vật vẫn ngồi thả lỏng."),
-    "31": _scene("Biến thể phần chân mây mềm hòa với sương núi xa, sắc độ thấp và dễ chịu; không thêm mưa hay bão."),
-    "32": _scene("Biến thể bóng mèo trên bệ cửa mờ hơn vì ánh sáng tán xạ; mèo tam thể ngủ cuộn tròn đúng chỗ cũ."),
-    "33": _scene("Biến thể một vệt phản chiếu vàng nhạt nằm ngang xa trên hồ; không chói, không đổi hướng mặt trời hay thời điểm hoàng hôn."),
-    "34": _scene("Biến thể hạt bụi sáng tập trung rất thưa ở mép cửa trên cao; không có hạt sáng trên mặt hoặc cơ thể nhân vật."),
-    "35": _scene("Biến thể đầu cành thông ngoài cửa sổ nhẹ cong rồi thả tự nhiên, khoảng trời kem vẫn rộng; cảm giác slow tempo."),
-    "36": _scene("Biến thể bóng lá cây cảnh tạo hình mềm nhỏ ở mép bàn phải; cốc, đèn, nhân vật, mèo và hồ giữ nguyên vị trí."),
-    "37": _scene("Biến thể phản chiếu núi hiện rõ hơn một chút giữa các gợn nước thưa; giữ màu sage–kem và độ tương phản thấp."),
-    "38": _scene("Biến thể vài chấm đom đóm xa thưa dần, ánh đèn cabin vẫn đều; không chuyển sang cảnh tối hoặc thêm nguồn sáng mới."),
-    "39": _scene("Biến thể mây mỏng phủ nhẹ vệt nắng, toàn cảnh dịu như một nhịp thở; giữ nguyên tất cả nét nhận dạng và hình học cabin."),
-    "40": _scene("Biến thể mặt hồ trở lại phẳng với gợn dài rất thưa, ánh hoàng hôn ổn định gần shot đầu để nối lặp tự nhiên; nhân vật và mèo vẫn nghỉ trong cùng bố cục."),
+    IMG_MAIN_SHEET_KEY: _scene(
+        "MAIN CHARACTER MODEL SHEET on a flat light-grey background: a full-body "
+        "turnaround row FRONT VIEW / SIDE VIEW / BACK VIEW with the same height "
+        "and base line, a FACE EXPRESSIONS row of four close-up frames, detail "
+        "callouts with uppercase English labels for hair, hands, headphones and "
+        "shoes, and a COLOR PALETTE strip of square swatches with hex codes at the "
+        "bottom. This is a design document, NOT a film scene."),
+    IMG_PET_SHEET_KEY: _scene(
+        "COMPANION CREATURE SHEET (pet character sheet) for the companion CALICO "
+        "CAT, on a flat light-grey background: turnaround FRONT VIEW / SIDE VIEW / "
+        "BACK VIEW, a FACE EXPRESSIONS row of four frames, detail callouts with "
+        "uppercase English labels for head, ears, paws and tail, a SIZE MAP box "
+        "comparing the cat's height with the main character, and a COLOR PALETTE "
+        "strip with hex codes. This is a design document, NOT a film scene."),
+    IMG_THUMBNAIL_KEY: _scene(
+        "Opening thumbnail background image, ABSOLUTELY NO TEXT. The character is "
+        "clear but not too large on the RIGHT, the calico cat curled up beside "
+        "them; a calm lake surface with a soft bright area on the LEFT half creates "
+        "negative space for software to add the title later. A very faint amber "
+        "rim light on the hair."),
 }
 
 # Từ khoá healing ghép vào tiêu đề thumbnail (dòng nhỏ). Mỗi lần chọn ngẫu
@@ -489,8 +542,20 @@ THUMBNAIL_KEYWORDS = [
 ]
 
 # Prompt mô tả chuyển động cho Flow (áp cho mọi clip; có thể để rỗng).
+# Prompt clip 00 (intro): làm SỐNG ĐỘNG đúng ảnh bìa, không bịa cảnh mới.
+INTRO_MOTION_PROMPT = (
+    "Bring the THUMBNAIL reference image (the full scene, not the "
+    "character sheets) to life as the opening shot: reproduce exactly its "
+    "composition, framing, scenery, lighting, color palette and the positions "
+    "and poses of the character and companion; use the two character sheets "
+    "only to keep their identity consistent. Chill meditative film, "
+    "very slow tempo, locked camera, no zoom, pan or orbit; only gentle "
+    "in-place breathing and micro-motion, soft drifting mist, leaves, water "
+    "ripples and light; seamless, no scene cut, no new character, no text"
+)
+
 FLOW_MOTION_PROMPT = (
-    "chill meditative animated film, very slow tempo, locked camera; "
+    "chill meditative film, very slow tempo, locked camera; "
     "no zoom, pan or orbit; gentle natural in-place micro-motion of the character, "
     "soft ambient motion of leaves, drifting mist, water ripples and light only; "
     "preserve the exact same character identity, face, hairstyle, outfit, props, "
@@ -498,26 +563,42 @@ FLOW_MOTION_PROMPT = (
     "no scene cut, no sudden motion, no dialogue, no lip sync, no new character"
 )
 
-# Phủ định CỨNG gắn vào CUỐI mọi prompt chuyển động gửi Veo/Flow. Chặn các lỗi
-# "ảo giác" Veo hay tạo ra: khói/hơi/lửa bốc ra từ miệng hay nhạc cụ, đầu xoay
-# ngược, méo mó mặt/tay/ngón, thừa chi, biến hình, nhân bản, cắt cảnh, chữ...
-# Áp dụng cho MỌI clip (cả motion AI lẫn motion mặc định).
+# Phủ định CỨNG gắn vào CUỐI mọi prompt clip gửi Flow/Veo (chặn khói/đầu-ngược/
+# méo tay…). 2026-09-29: người dùng yêu cầu QUAY VỀ prompt đầy đủ này. Bản gọn
+# (veo_safety: tả tích cực, bỏ hex) vẫn bật được bằng override
+# "clip_prompt_mode": "safe" nếu Flow/Gemini từ chối "I can't generate that video".
 MOTION_NEGATIVE = (
-    " || NGHIÊM CẤM (negative — tránh tuyệt đối): KHÔNG khói, hơi nước, hơi thở "
-    "thành khói, lửa, tàn lửa hay sương khói bốc ra từ miệng, mũi, sáo hoặc bất "
-    "kỳ nhạc cụ/vật thể nào; KHÔNG đầu hay cổ xoay ngược, xoay 180°, giật ngược "
-    "bất thường; KHÔNG méo mó/biến dạng khuôn mặt, mắt, răng, tay, ngón tay; "
-    "KHÔNG thừa hay thiếu ngón/chi; KHÔNG mọc thêm người, chi hay vật; KHÔNG "
-    "biến hình (morph), KHÔNG nhân bản/tách đôi nhân vật; KHÔNG đổi trang phục "
-    "hay đạo cụ giữa chừng; KHÔNG cắt cảnh, KHÔNG nháy hình, KHÔNG chuyển động "
-    "giật cục hay đột ngột; KHÔNG mấp máy môi như đang nói; KHÔNG chữ, logo, "
-    "watermark. negative prompt: no smoke, no steam, no vapor, no breath vapor, "
+    " || STRICTLY FORBIDDEN (avoid absolutely): NO smoke, steam, visible breath, "
+    "fire, embers or mist rising from the mouth, nose, flute or any instrument/"
+    "object; NO head or neck turning backwards, 180-degree turns or unnatural "
+    "jerks; NO distortion of the face, eyes, teeth, hands or fingers; NO extra or "
+    "missing fingers/limbs; NO extra people, limbs or objects appearing; NO "
+    "morphing, NO duplicated or split characters; NO outfit or prop changes "
+    "mid-shot; NO scene cuts, NO flicker, NO jerky or sudden motion; NO lip "
+    "movement as if talking; NO text, logo or watermark. "
+    "negative prompt: no smoke, no steam, no vapor, no breath vapor, "
     "no fog from mouth, no smoke from flute or instrument, no fire, no head "
     "spinning, no reversed head, no 180-degree head turn, no face distortion, "
     "no warped or melting hands, no extra fingers, no extra limbs, no morphing, "
     "no duplicated character, no scene cut, no flicker, no text. Keep anatomy "
     "correct, physically plausible, and the character identity fully consistent."
 )
+
+# Mở đầu prompt cảnh: 2 ảnh nguyên liệu là BẢNG THIẾT KẾ nhân vật, không phải
+# khung hình — chỉ lấy DANH TÍNH rồi dựng 1 cảnh phim liền mạch.
+INGREDIENT_LOCK_FULL = (
+    "The two ingredient images are CHARACTER MODEL SHEETS (design documents), "
+    "NOT film frames: use them only to get the EXACT identity. Build ONE "
+    "continuous film scene with the main character from ingredient 1 and the "
+    "companion (pet or creature) from ingredient 2, keeping face, hair, outfit, colours, "
+    "instrument and props unchanged. ABSOLUTELY NO side-by-side views, no text "
+    "labels, no colour-swatch strip, no flat studio backdrop, no duplicated "
+    "character."
+)
+
+# "full" (mặc định) = prompt đầy đủ ở trên; "safe" = bản gọn veo_safety.
+CLIP_PROMPT_MODES = ("full", "safe")
+DEFAULT_CLIP_PROMPT_MODE = "full"
 
 
 # ── Cấu hình trình duyệt ────────────────────────────────────────
@@ -528,16 +609,92 @@ class BrowserConfig:
     nav_timeout_ms:  int  = 60_000
     action_timeout_ms: int = 30_000
     # Thời gian tối đa chờ 1 ảnh / 1 clip render xong (giây)
-    image_wait_sec:  int  = 180
+    # Gemini Pro · Mở rộng: đo live 2026-09-30 ~200s/ảnh (180s cũ cắt ngang ảnh
+    # đang vẽ). Quá image_wait_sec mà Gemini VẪN đang tạo → chờ tiếp tới
+    # image_wait_max_sec thay vì bỏ ảnh (xem gemini_driver._wait_new_image).
+    image_wait_sec:  int  = 300
+    image_wait_max_sec: int = 720
     clip_wait_sec:   int  = 900            # Veo có thể lâu vài phút
+    # Gemini Video (Veo trong app Gemini): đo thật 2026-09-29 ~90s/clip.
+    gemini_video_wait_sec: int = 600
     # Cứ tạo bao nhiêu ảnh thì mở CHAT MỚI để cắt ngữ cảnh dài (0 = không cắt).
     # Hội thoại quá dài (vd ảnh ~37/41 cùng 1 chat) khiến Gemini trả chữ/từ chối
     # → time-out. Mỗi prompt tự chứa danh tính nhân vật nên cắt chat vẫn đồng bộ.
     image_new_chat_every: int = 8
     # None = dùng Chromium bundled của Playwright (ổn định nhất, chạy
     # `playwright install chromium` 1 lần). Đặt "chrome" nếu muốn dùng Google
-    # Chrome đã cài; "msedge" cho Edge. (Cốc Cốc không hỗ trợ trực tiếp.)
+    # Chrome đã cài; "msedge" cho Edge.
     chrome_channel:  str | None = None
+    # Đường dẫn TUYỆT ĐỐI tới 1 trình duyệt nhân Chromium khác (vd Cốc Cốc).
+    # Playwright không có "channel" cho Cốc Cốc nên phải chỉ thẳng file .exe.
+    # None = tự dò Cốc Cốc trong COCCOC_CANDIDATES (xem resolve_browser_exe).
+    browser_executable: str | None = None
+
+
+# Cốc Cốc cài mặc định ở Program Files; bản portable/per-user nằm trong
+# LocalAppData. Google Flow CHẶN Chromium bundled của Playwright («hoạt động
+# bất thường») nhưng chạy bình thường trên Cốc Cốc → ưu tiên Cốc Cốc nếu có.
+COCCOC_CANDIDATES = (
+    r"C:\Program Files\CocCoc\Browser\Application\browser.exe",
+    r"C:\Program Files (x86)\CocCoc\Browser\Application\browser.exe",
+    str(Path.home() / r"AppData\Local\CocCoc\Browser\Application\browser.exe"),
+)
+
+
+# Trình duyệt RIÊNG cho từng site (khoá = tên site truyền vào BrowserSession).
+# "" = ép Chromium bundled của Playwright.
+#   • gemini: Cốc Cốc tự đóng cửa sổ ngay bước tải ảnh (Playwright báo
+#     TargetClosedError; tiến trình browser.exe vẫn sống) → dùng Chromium bundled.
+#   • flow  : PHẢI giữ Cốc Cốc, Chromium bundled bị Flow chặn "hoạt động bất thường".
+SITE_BROWSER: dict[str, str] = {"gemini": ""}
+
+
+def resolve_browser_exe(site: str | None = None) -> str | None:
+    """Trả về .exe trình duyệt sẽ dùng, hoặc None = Chromium bundled.
+
+    Thứ tự: override `browser_executable.<site>` (hoặc SITE_BROWSER[site]) →
+    override `browser_executable` trong video_overrides.json →
+    BROWSER.browser_executable → tự dò Cốc Cốc. Đặt override = "" (chuỗi rỗng)
+    để ÉP dùng Chromium bundled, bỏ qua bước tự dò."""
+    overrides = load_overrides()
+    if site:
+        per_site = overrides.get("browser_executable_by_site") or {}
+        ov = per_site.get(site, SITE_BROWSER.get(site))
+        if ov is not None:
+            ov = str(ov).strip()
+            return ov if ov and Path(ov).exists() else None
+    ov = overrides.get("browser_executable")
+    if ov is not None:
+        ov = str(ov).strip()
+        return ov if ov and Path(ov).exists() else None
+    if BROWSER.browser_executable:
+        p = str(BROWSER.browser_executable).strip()
+        if Path(p).exists():
+            return p
+    for cand in COCCOC_CANDIDATES:
+        if Path(cand).exists():
+            return cand
+    return None
+
+
+# Thư mục profile RIÊNG theo site (tên thư mục nằm cạnh project root).
+# Dùng khi profile cũ đã bị Google gắn cờ «hoạt động bất thường»: profile SẠCH
+# (đăng nhập tay lại 1 lần) thường gỡ được, mà không cần stealth/anti-detect.
+# Override qua "profile_dir_by_site" trong video_overrides.json.
+SITE_PROFILE: dict[str, str] = {}
+
+
+def site_profile_dir(site: str | None) -> Path | None:
+    """Thư mục profile cho site, hoặc None = dùng PROFILE_DIR chung."""
+    if not site:
+        return None
+    per_site = load_overrides().get("profile_dir_by_site") or {}
+    name = per_site.get(site, SITE_PROFILE.get(site))
+    name = str(name).strip() if name else ""
+    if not name:
+        return None
+    p = Path(name)
+    return p if p.is_absolute() else (_ROOT / name)
 
 
 # ── URL ─────────────────────────────────────────────────────────
@@ -550,12 +707,76 @@ YOUTUBE_STUDIO_URL = "https://studio.youtube.com/"
 # "tư duy mở rộng" = bản thinking/Pro.
 GEMINI_IMAGE_MODEL = "3.1 Pro"
 
+# ── Máy tạo CLIP ────────────────────────────────────────────────
+# 2026-09-29: thử tạo clip TRỰC TIẾP trên Gemini (chế độ Video) — chạy được nhưng
+# Gemini khoá «Tạo video» sau ~10 lượt/ngày ⇒ người dùng chọn QUAY VỀ Flow làm
+# mặc định. Gemini vẫn bật được: video_overrides.json "clip_engine": "gemini".
+# 2026-10-05: thêm "muse" (Muse.ai qua profile GPM — muse_video.py), thông số nằm
+# trong prompt; ảnh tham chiếu/phân tích nhân vật vẫn do Gemini làm.
+# 2026-10-05: người dùng chọn Muse.ai làm MẶC ĐỊNH (Flow/Gemini vẫn chọn được
+# trong dropdown «Máy tạo clip» hoặc video_overrides.json "clip_engine").
+CLIP_ENGINES = ("flow", "gemini", "muse")
+CLIP_ENGINE_LABELS = {"flow": "Flow/Veo", "gemini": "Gemini Video", "muse": "Muse.ai"}
+DEFAULT_CLIP_ENGINE = "muse"
+# Ghi RÕ trong mọi prompt clip gửi Gemini (yêu cầu người dùng): Full HD + 8s.
+# Đặt ĐẦU prompt như yêu cầu xuất file: ghi ở cuối như một câu mô tả thì
+# Gemini từng VẼ huy hiệu "Full HD 1080p" lên hình (lô thử 2026-09-29, clip 05).
+GEMINI_VIDEO_SPEC = ("Create an 8-second video (exactly 8 seconds long) in Full HD 1080p "
+                     "resolution (1920x1080), 16:9 landscape. These are file output "
+                     "settings only, not part of the picture: keep the frame clean with "
+                     "no on-screen text or logos. Scene:")
+# Gemini hiện TRẢ file gốc 1280x720 (+ tiếng AAC) dù prompt ghi 1080p (đo thật
+# 2026-09-29) → hậu kỳ: BỎ HẲN luồng âm thanh + nâng lên đúng 1920x1080.
+GEMINI_VIDEO_OUT_SIZE = (1920, 1080)
+
 # Độ phân giải khi TẢI clip từ Flow (menu Tải xuống có menu con):
 #   "720p" = kích thước gốc (tải NGAY, KHÔNG upscale); "1080p"/"4K" = upscale
 #   (chờ "Upscaling your video", 4K tốn tín dụng). Omni 1.1 Flash render gốc
 #   720p và chỉ có 360p/720p → dùng "720p" để tải trực tiếp, tránh upscale.
 #   Override qua "flow_download_resolution" trong video_overrides.json.
 FLOW_DOWNLOAD_RESOLUTION = "720p"
+
+# ĐƯỜNG TẢI CHÍNH: lấy thẳng file media của tile qua URL /asb/<id>=<biến thể>,
+# KHÔNG dùng cơ chế download của trình duyệt (Cốc Cốc crash 0xC0000005 ngay khi
+# Playwright chặn download — lần tải thứ 2 trở đi luôn chết cửa sổ).
+# Biến thể lấy từ <video src> khi hover là "mm,22,15" (h264 Baseline ~1.8 Mbps);
+# đo thực tế "mm,37,15" cho h264 High ~3.2 Mbps, 1280x720 — CAO HƠN cả bản 720p
+# tải qua menu (2.75 Mbps). Override qua "flow_media_variant".
+FLOW_MEDIA_VARIANT = "mm,37,15"
+
+# NHỊP THAO TÁC "GIỐNG NGƯỜI" (giây, nghỉ NGẪU NHIÊN trong khoảng min–max).
+# Flow gắn cờ «hoạt động bất thường» khi thao tác quá nhanh/quá đều (2026-09-25:
+# chặn lại đúng sau 5 clip liên tiếp). Người dùng yêu cầu mọi bước đều nghỉ như
+# người thật — RIÊNG ô prompt vẫn dán một lần (người cũng copy-paste).
+# Override qua "flow_human_pace" trong video_overrides.json.
+# 2026-09-26: profile đang chạy tốt bị chặn NGAY clip đầu dù tài khoản sạch (user
+# tự tạo tay trên Cốc Cốc vẫn được) ⇒ nới chậm MỌI bước, kể cả upload/dán prompt/tải.
+FLOW_HUMAN_PACE: dict[str, tuple[float, float]] = {
+    "ui": (1.5, 4.0),               # bấm menu / chọn option
+    "open": (8.0, 20.0),            # vào dashboard, nhìn quanh rồi mới tạo dự án
+    "step": (6.0, 14.0),            # xong một việc lớn (thêm nguyên liệu…)
+    "upload": (8.0, 18.0),          # giữa hai lần upload ảnh (upload TỪNG ảnh)
+    "before_prompt": (4.0, 10.0),   # nhìn ô soạn rồi mới dán prompt
+    "before_generate": (15.0, 35.0),  # đọc lại prompt rồi mới bấm Tạo
+    "after_render": (10.0, 25.0),   # clip xong, xem thử rồi mới đi tải
+    "before_download": (4.0, 10.0),  # rê chuột tới tile rồi mới tải
+    "between_clips": (90.0, 180.0),  # nghỉ giữa hai clip
+}
+
+# HẠN MỨC MỖI PHIÊN. Nghỉ giống người CHƯA đủ: đo thực tế 2026-09-25, cùng một
+# phiên/dự án Flow bị gắn cờ «hoạt động bất thường» sau 5 clip (13:08) rồi 6 clip
+# (14:02, đã có nhịp nghỉ). Cờ TỰ HẾT sau ~20–30 phút (13:08 chặn → 13:39 chạy
+# lại bình thường). ⇒ Cách chạy trọn 40 clip: mỗi phiên chỉ tạo
+# FLOW_CLIPS_PER_SESSION clip rồi ĐÓNG trình duyệt, nghỉ FLOW_SESSION_COOLDOWN
+# giây (ngẫu nhiên) và mở phiên mới (dự án Flow mới) làm nốt phần thiếu.
+# Nếu vẫn dính thẻ chặn → nghỉ lâu hơn (FLOW_BLOCK_COOLDOWN) rồi thử lại, tối đa
+# FLOW_MAX_BLOCK_RETRIES lần. Override qua "flow_clips_per_session",
+# "flow_session_cooldown", "flow_block_cooldown", "flow_max_sessions".
+FLOW_CLIPS_PER_SESSION = 4
+FLOW_SESSION_COOLDOWN: tuple[float, float] = (1200.0, 1800.0)   # 20–30 phút
+FLOW_BLOCK_COOLDOWN: tuple[float, float] = (1800.0, 2700.0)     # 30–45 phút
+FLOW_MAX_BLOCK_RETRIES = 3
+FLOW_MAX_SESSIONS = 40
 
 
 # ── SELECTOR (best-effort — SỬA Ở ĐÂY khi automation lỗi) ────────
@@ -634,6 +855,47 @@ GEMINI_SELECTORS: dict[str, list[str]] = {
         "button[aria-label*='Tải']",
         "a[download]",
     ],
+    # Đính kèm ảnh tham chiếu (thumbnail dựa trên 2 bảng nhân vật). Dò live
+    # 2026-09-26: nút '+' aria «Nội dung tải lên và công cụ» → mục «Tải tệp lên»
+    # (data-test-id local-images-files-uploader-button) mở file chooser.
+    "upload_menu": [
+        "button[aria-label='Nội dung tải lên và công cụ']",
+        "button[aria-label*='tải lên và công cụ']",
+        "button[aria-label*='upload' i]",
+        "button[aria-label*='Tải tệp']",
+        "button[aria-label*='Add files']",
+    ],
+    "upload_files_item": [
+        "[data-test-id='local-images-files-uploader-button']",
+        "[role='menuitem']:has-text('Tải tệp lên')",
+        "button:has-text('Tải tệp lên')",
+        "[role='menuitem']:has-text('Upload files')",
+        "button:has-text('Upload files')",
+    ],
+    # Chip ảnh đã đính kèm trong ô soạn (để chờ upload xong).
+    "attachment_preview": [
+        "uploader-file-preview img",
+        "gem-media-attachment img",
+    ],
+    # Công cụ «Tạo hình ảnh» (dò live 2026-10-06): mục menuitemcheckbox trong
+    # menu «Nội dung tải lên và công cụ». KHÔNG bật → Gemini trả chữ «my image
+    # generation tool has been disabled for this request». Không giữ qua lần
+    # tải trang/chat mới → phải bật lại mỗi lần.
+    "image_tool_item": [
+        "[role='menuitemcheckbox']:has-text('Tạo hình ảnh')",
+        "[role='menuitemcheckbox']:has-text('Create image')",
+        "[role='menuitemcheckbox']:has-text('Images')",
+    ],
+    # Chip hiện trong ô soạn khi công cụ đã bật.
+    "image_tool_chip": [
+        "button[aria-label^='Bỏ chọn Hình ảnh']",
+        "button[aria-label*='Deselect Image' i]",
+    ],
+    # Nút tỷ lệ (chỉ hiện khi đã bật «Tạo hình ảnh»), mục = menuitemradio aria '16:9'.
+    "image_ratio_button": [
+        "button:has-text('Tỷ lệ khung hình')",
+        "button:has-text('Aspect ratio')",
+    ],
     # Nút "Trò chuyện mới" — cắt ngữ cảnh dài (hội thoại quá dài khiến Gemini
     # hay trả CHỮ/từ chối). Không bấm được → driver reload thẳng GEMINI_URL.
     "new_chat": [
@@ -666,6 +928,66 @@ GEMINI_SELECTORS: dict[str, list[str]] = {
 }
 
 # Selector Flow đã kiểm chứng trực tiếp; ưu tiên tiếng Anh và giữ fallback tiếng Việt.
+# Gemini chế độ VIDEO — dò live 2026-09-29 (giao diện tiếng Việt, tài khoản Ultra).
+GEMINI_VIDEO_SELECTORS: dict[str, list[str]] = {
+    # '+' → menu công cụ → «Tạo video» (menuitemcheckbox). Bấm xong Gemini mở
+    # trang thư viện Video kèm lớp phủ cdk-overlay-backdrop → Escape để đóng.
+    "tools_menu": [
+        "button[aria-label='Nội dung tải lên và công cụ']",
+        "button[aria-label*='tải lên và công cụ']",
+    ],
+    "video_tool": [
+        "[role='menuitemcheckbox']:has-text('Tạo video')",
+        "[role='menuitemcheckbox']:has-text('Create video')",
+        "[role='menuitem']:has-text('Tạo video')",
+    ],
+    # Chip "Video" đang bật trong ô soạn.
+    "video_chip": [
+        "button[aria-label='Bỏ chọn Video']",
+        "button[aria-label*='Deselect Video']",
+    ],
+    # Nút chế độ: aria «Mở công cụ chọn chế độ, hiện tại là Pro Mở rộng».
+    "mode_button": ["[data-test-id='bard-mode-menu-button']"],
+    "mode_pro": [
+        "gem-menu-item:has-text('3.1 Pro')",
+        "[role='menuitem']:has-text('3.1 Pro')",
+    ],
+    "mode_thinking": [
+        "gem-menu-item:has-text('Tư duy mở rộng')",
+        "[role='menuitem']:has-text('Tư duy mở rộng')",
+        "gem-menu-item:has-text('Extended thinking')",
+    ],
+    # Nút tải tệp NGAY dưới ô soạn ở chế độ Video (mở file chooser).
+    "upload_button": [
+        "button[aria-label='Tải tệp lên']",
+        "button[aria-label*='Upload file']",
+    ],
+    "attachment_chip": [
+        "button[aria-label='đóng tệp đính kèm']",
+        "button[aria-label*='Remove file']",
+    ],
+    "aspect_button": [
+        "button[aria-label^='Tỷ lệ khung hình']",
+        "button[aria-label^='Aspect ratio']",
+    ],
+    "aspect_landscape": [
+        "[role='menuitem']:has-text('16:9')",
+        "[role='menuitemradio']:has-text('16:9')",
+        "gem-menu-item:has-text('Ngang')",
+        "[role='menuitem']:has-text('Ngang')",
+    ],
+    "send_button": [
+        "button[aria-label='Gửi tin nhắn']",
+        "button[aria-label*='Send message']",
+    ],
+    # Video kết quả: <generated-video><video-player><video src=…usercontent…>
+    "result_video": ["generated-video video"],
+    "download_button": [
+        "button[aria-label='Tải video xuống']",
+        "button[aria-label*='Download video']",
+    ],
+}
+
 FLOW_SELECTORS: dict[str, list[str]] = {
     # Trang giới thiệu có thể xuất hiện trước dashboard.
     "flow_entry": [
@@ -692,6 +1014,15 @@ FLOW_SELECTORS: dict[str, list[str]] = {
         "role=button[name='Điều kiện kích hoạt cài đặt']",
         # Fallback cuối: chip cạnh nút 'Start generation' chứa 'crop_16_9'/tỉ lệ.
         "[role='button']:has-text('crop_16_9')",
+    ],
+    # Loại đầu ra Ảnh↔Video. Dự án Flow MỚI mặc định ra ẢNH (🍌 Nano Banana),
+    # khi đó KHÔNG có radio 'Thành phần' lẫn model Veo/Omni → phải bấm Video
+    # trước. Icon material 'videocam' dính liền nhãn nên text là 'videocamVideo'.
+    "output_video": [
+        "[role='radio']:has-text('videocam')",
+        "[role='tab']:has-text('videocam')",
+        "[role='button']:has-text('videocam')",
+        "[role='radio']:has-text('Video')",
     ],
     # Chế độ Khung hình (start+end frame)
     "mode_frames": [
@@ -729,8 +1060,15 @@ FLOW_SELECTORS: dict[str, list[str]] = {
         "button[aria-label='Select model family']",
         "button[aria-label='Chọn nhóm mô hình']",
     ],
+    # Số clip mỗi lượt tạo. Dự án MỚI mặc định x2 (tốn gấp đôi credit) → phải
+    # ép x1. Flow không render nhất quán thẻ role='radio' cho nhóm này nên
+    # khớp thêm button/role=button/tab với text ĐÚNG BẰNG 'x1'.
     "outputs_x1": [
         "[role='radio']:text-is('x1')",
+        "[role='button']:text-is('x1')",
+        "button:text-is('x1')",
+        "[role='tab']:text-is('x1')",
+        "[role='radio']:has-text('x1')",
     ],
     # Upload ảnh vào project: nút "+" trên cùng → menu "Tải lên" (mở file chooser)
     "add_media_menu": [
@@ -811,6 +1149,35 @@ YOUTUBE_SELECTORS: dict[str, list[str]] = {
     "file_input": [
         "input[type='file']",
     ],
+    # ── Hình thu nhỏ (thumbnail) tuỳ chỉnh ──
+    # Input file RIÊNG của khung thumbnail (accept ảnh) — KHÔNG được trùng input
+    # video (accept video/*), nếu không sẽ set nhầm ảnh vào chỗ video.
+    "thumbnail_input": [
+        "ytcp-thumbnail-editor input[type='file']",
+        "ytcp-thumbnails-compact-editor input[type='file']",
+        "input[type='file'][accept*='image']",
+        "#file-loader",
+    ],
+    # Nút "Tải tệp lên / Upload file" mở hộp chọn hình thu nhỏ (khi input ẩn chỉ
+    # được dựng sau khi bấm) — dùng kèm expect_file_chooser.
+    "thumbnail_button": [
+        "ytcp-thumbnail-uploader #select-button",
+        "ytcp-thumbnail-editor #still-picker button",
+        "ytcp-button:has-text('Upload file')",
+        "ytcp-button:has-text('Tải tệp lên')",
+        "button:has-text('Upload file')",
+        "button:has-text('Tải tệp lên')",
+        "button[aria-label*='thumbnail']",
+        "button[aria-label*='hình thu nhỏ']",
+    ],
+    # Dấu hiệu ảnh thu nhỏ ĐÃ được nạp (để xác nhận, không đoán mò).
+    "thumbnail_selected": [
+        "ytcp-thumbnail-editor img[src^='blob:']",
+        "ytcp-thumbnail-editor img[src^='data:']",
+        "ytcp-thumbnails-compact-editor img[src^='blob:']",
+        "#custom-thumbnail-image",
+        "ytcp-still-cell[selected]",
+    ],
     # Ô tiêu đề (contenteditable) trong dialog Details.
     "title_box": [
         "ytcp-social-suggestions-textbox[label*='title'] #textbox",
@@ -838,12 +1205,12 @@ YOUTUBE_SELECTORS: dict[str, list[str]] = {
         "ytcp-button:has-text('Hiện thêm')",
     ],
     # "Không, đây không phải nội dung dành cho trẻ em" (Made for kids = No).
+    # (DOM thật 2026-10-03: ytkc-made-for-kids-select trong div#audience, radio
+    #  name VIDEO_MADE_FOR_KIDS_MFK / VIDEO_MADE_FOR_KIDS_NOT_MFK.)
     "mfk_no": [
         "tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']",
-        "#audience #radioContainer tp-yt-paper-radio-button:nth-of-type(2)",
-        "tp-yt-paper-radio-button:has-text(\"not Made for Kids\")",
-        "tp-yt-paper-radio-button:has-text('không dành cho trẻ em')",
-        "[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']",
+        "ytkc-made-for-kids-select tp-yt-paper-radio-button:has-text('không dành cho trẻ em')",
+        "ytkc-made-for-kids-select tp-yt-paper-radio-button:has-text(\"not made for kids\")",
     ],
     # Ô nhập Tags (thẻ) — trong phần Show more.
     "tags_box": [
@@ -852,36 +1219,73 @@ YOUTUBE_SELECTORS: dict[str, list[str]] = {
         "input[aria-label*='thẻ']",
         "#tags-container input",
     ],
-    # Nội dung có yếu tố AI / Altered content: chọn "Có" (Yes).
-    # Nút mở phần Altered content (nếu là 1 dòng bấm để mở radios).
+    # Nội dung có yếu tố AI («Sử dụng AI» / Altered content): chọn "Có".
+    # DOM thật 2026-10-03: div#altered-content > ytkp-altered-content-select,
+    # radio name VIDEO_HAS_ALTERED_CONTENT_YES / _NO.
+    # TUYỆT ĐỐI không dùng selector chữ "Có"/"Yes" KHÔNG giới hạn vùng: nút đầu
+    # tiên có chữ "Có" trên trang là «Có, nội dung này dành cho trẻ em».
     "altered_content_section": [
-        "#altered-content",
-        "ytcp-button:has-text('Altered content')",
-        "*:has-text('Altered content')",
-        "*:has-text('Nội dung đã bị thay đổi')",
+        "div#altered-content",
+        "ytkp-altered-content-select",
     ],
     "altered_content_yes": [
+        "tp-yt-paper-radio-button[name='VIDEO_HAS_ALTERED_CONTENT_YES']",
+        "ytkp-altered-content-select tp-yt-paper-radio-button[name$='_YES']",
+        "#altered-content tp-yt-paper-radio-button[name$='_YES']",
         "tp-yt-paper-radio-button[name='VIDEO_ALTERED_CONTENT_YES']",
-        "#altered-content tp-yt-paper-radio-button:has-text('Yes')",
-        "tp-yt-paper-radio-button:has-text('Yes')",
-        "tp-yt-paper-radio-button:has-text('Có')",
-        "[name='VIDEO_ALTERED_CONTENT_YES']",
     ],
     # Ngôn ngữ video → dropdown → English (United States).
+    # (Studio 2026: component thật là ytcp-form-language-input#language-input —
+    #  #video-language chỉ còn là fallback cho bản cũ.)
     "video_language_dropdown": [
+        "ytcp-form-language-input#language-input ytcp-dropdown-trigger",
+        "#language-input ytcp-dropdown-trigger",
+        "#language-input ytcp-text-dropdown-trigger",
+        "#language-input",
         "#video-language ytcp-dropdown-trigger",
         "ytcp-form-select#video-language",
         "#video-language",
     ],
+    # Lựa chọn theo test-id = mã ngôn ngữ (không phụ thuộc giao diện EN/VN:
+    # bản VN hiển thị «Tiếng Anh (Hoa Kỳ)»). "{lang}" được thay bằng mã kênh.
+    "video_language_option": [
+        "tp-yt-paper-item[test-id='{lang}']",
+        "[role='option'][test-id='{lang}']",
+    ],
     "video_language_en_us": [
-        "tp-yt-paper-item:has-text('English (United States)')",
-        "[role='option']:has-text('English (United States)')",
-        "tp-yt-paper-item:has-text('English (US)')",
-        "*:has-text('English (United States)')",
+        "tp-yt-paper-item[test-id='en-US']",
+        "tp-yt-paper-item:text-is('English (United States)')",
+        "tp-yt-paper-item:text-is('Tiếng Anh (Hoa Kỳ)')",
+    ],
+    # Danh mục video → "Âm nhạc" (Music). Nằm trong phần "Hiện thêm"; kênh nhạc
+    # để sai danh mục sẽ bị gợi ý/kiếm tiền lệch nên coi là metadata BẮT BUỘC.
+    "category_dropdown": [
+        "ytcp-form-select#category ytcp-dropdown-trigger",
+        "#category ytcp-dropdown-trigger",
+        "#category-container ytcp-dropdown-trigger",
+        "ytcp-form-select#category",
+        "#category",
+    ],
+    # test-id không phụ thuộc ngôn ngữ (bản VN hiển thị «Nhạc», không phải «Âm nhạc»).
+    "category_music": [
+        "tp-yt-paper-item[test-id='CREATOR_VIDEO_CATEGORY_MUSIC']",
+        "tp-yt-paper-item:text-is('Music')",
+        "tp-yt-paper-item:text-is('Nhạc')",
+        "tp-yt-paper-item:text-is('Âm nhạc')",
+    ],
+    # Tên kênh đang mở trong Studio (thanh điều hướng trái) — chặn upload nhầm
+    # kênh khi 1 tài khoản Google có nhiều kênh.
+    "studio_channel_name": [
+        "ytcp-navigation-drawer #entity-name",
     ],
     # Đóng dialog upload → YouTube TỰ LƯU thành Draft (bản nháp). Đây là bước
     # "lưu nháp": KHÔNG bao giờ bấm Next tới Publish/Xuất bản.
     "close_dialog": [
+        # id thật của nút X trên dialog Upload (Studio 2026).
+        "ytcp-button#ytcp-uploads-dialog-close-button",
+        "#ytcp-uploads-dialog-close-button",
+        "ytcp-uploads-dialog button[aria-label='Close']",
+        "ytcp-uploads-dialog button[aria-label='Đóng']",
         "ytcp-button#close-button",
         "#close-button",
         "button[aria-label='Close']",
@@ -890,10 +1294,11 @@ YOUTUBE_SELECTORS: dict[str, list[str]] = {
     ],
     # Hộp thoại xác nhận sau khi đóng: nút "Lưu bản nháp / Đã lưu dưới dạng nháp"
     # hoặc chỉ cần đóng. Xác nhận đã lưu draft (nếu hiện).
+    # (Chỉ để NHẬN BIẾT — không bấm: selector chữ dạng *:has-text sẽ khớp cả
+    #  <html> và click vào giữa trang.)
     "saved_draft_confirm": [
-        "*:has-text('saved as a draft')",
-        "*:has-text('lưu dưới dạng bản nháp')",
-        "*:has-text('Draft saved')",
+        "ytcp-uploads-dialog :text('saved as a draft')",
+        "ytcp-uploads-dialog :text('dưới dạng bản nháp')",
     ],
     # Xác nhận đã đăng nhập Studio (avatar / nút Create hiện ra).
     "studio_ready": [
@@ -908,7 +1313,45 @@ YOUTUBE_SELECTORS: dict[str, list[str]] = {
         "ytcp-video-upload-progress",
         "span.ytcp-video-upload-progress",
     ],
+    # Trạng thái quét bản quyền / vi phạm chính sách ("Checks"). Chỉ được làm
+    # tác vụ khác sau khi mục này báo xong (no issues / đã kiểm tra xong).
+    "checks_status": [
+        "ytcp-video-upload-progress .progress-label",
+        "ytcp-checks-status",
+        "#checks-status",
+        ".ytcp-video-upload-progress",
+    ],
 }
+
+# Các mẫu chữ (thường hoá) dùng để đọc trạng thái upload + quét chính sách.
+# Đọc TEXT chứ không đoán theo thời gian — giao diện EN lẫn VN đều bắt được.
+# TÁCH 3 PHA vì chúng kết thúc ở thời điểm khác nhau:
+#   tải lên  → bắt buộc chờ xong;
+#   quét bản quyền/chính sách ("checks") → bắt buộc chờ xong;
+#   xử lý/transcode ("processing") → KHÔNG cần chờ để lưu nháp; video thiền
+#   2-3 tiếng có thể xử lý hàng giờ, chờ nữa là kẹt cả dây chuyền.
+YOUTUBE_UPLOAD_BUSY_PATTERNS = (          # đang TẢI LÊN
+    "uploading", "đang tải lên", "đang tải",
+)
+YOUTUBE_CHECK_BUSY_PATTERNS = (           # đang QUÉT bản quyền/chính sách
+    "checking", "đang kiểm tra", "running checks",
+)
+YOUTUBE_PROCESS_BUSY_PATTERNS = (         # đang XỬ LÝ video (transcode)
+    "processing", "đang xử lý", "xử lý video",
+)
+YOUTUBE_UPLOAD_DONE_PATTERNS = (          # đã TẢI LÊN xong
+    "upload complete", "tải lên xong", "đã tải lên", "upload đã xong",
+)
+YOUTUBE_CHECK_DONE_PATTERNS = (           # đã QUÉT xong
+    "checks complete", "no issues found", "no copyright issues",
+    "đã kiểm tra xong", "kiểm tra hoàn tất", "không phát hiện vấn đề",
+    "không có vấn đề",
+)
+# Phát hiện vấn đề bản quyền/chính sách → KHÔNG chặn lưu nháp, nhưng phải cảnh báo.
+YOUTUBE_UPLOAD_ISSUE_PATTERNS = (
+    "issues found", "copyright", "bản quyền", "vấn đề", "restriction",
+    "hạn chế", "claim", "khiếu nại",
+)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -952,6 +1395,7 @@ class SunoConfig:
     max_create_actions:      int = 15           # mỗi Create chọn 1 bài → cần 15 lần Create cho 15 bài
     max_generation_credits:  int = 100          # trần credit tiêu cho 1 batch
     max_new_song_downloads:  int = 15           # trần số WAV tải về/batch
+    max_replacement_creates: int = 5            # lượt Create THÊM khi cả 2 bài của 1 lượt đều lỗi (ngắn/hỏng)
 
 
 # Preset lưu NGUYÊN VĂN Styles + Exclusions tiếng Anh đã gửi (mục E). KHÔNG
@@ -1052,13 +1496,8 @@ SUNO_SELECTORS: dict[str, list[str]] = {
         "input[placeholder='Exclude styles']",
         "input[placeholder*='Exclude']",
     ],
-    # Duration: nút Custom/Auto + ô số giây.
-    "duration_custom": ["button:has-text('Custom')", "[role=button]:has-text('Custom')"],
-    "duration_auto":   ["button:has-text('Auto')", "[role=button]:has-text('Auto')"],
-    "duration_seconds_input": [
-        "input[type=number][placeholder='Auto']",
-        "input[type=number]",
-    ],
+    # Duration: LUÔN Auto (người dùng chốt) — tool chỉ KIỂM (suno_driver.
+    # ensure_duration_auto / _JS_DURATION_STATE), không bấm Custom.
     # Max Mode Off/On.
     "max_mode_off": ["button:has-text('Off')"],
     "max_mode_on":  ["button:has-text('On')"],
@@ -1077,6 +1516,7 @@ SUNO_SELECTORS: dict[str, list[str]] = {
     "song_more_options": ["button[aria-label='More options']"],
     # Menu ⋯ → Download → dialog format WAV.
     "download_entry": [
+        "div.hxc-menu-item:has-text('Download')",
         "div.context-menu-item:has-text('Download')",
         "button[aria-label='Download']",
         "[role=menuitem]:has-text('Download')",
@@ -1112,15 +1552,19 @@ SUNO_SELECTORS: dict[str, list[str]] = {
     # Quy trình: ⋯ → Edit → Open in Studio → Single-track → (chờ load) →
     # Export → Full Song → (chờ 'Song Saved') → Go to Song → (chờ hết
     # 'Preparing song for playback...') → ⋯ → Download → WAV.
-    # Menu ⋯ dùng cấu trúc `div.context-menu-item > button.hxc-btn-base`
+    # Menu ⋯ dùng cấu trúc `div.context-menu-item > button.hxc-btn-base`;
+    # từ 2026-09-30 Suno đổi sang `div.hxc-menu-item` (submenu có thêm class
+    # `hxc-submenu-trigger`) → selector mới đặt TRƯỚC, giữ selector cũ dự phòng.
     # (KHÔNG phải role=menuitem). Submenu 'Edit' mở khi HOVER.
     "studio_edit_menu": [
+        "div.hxc-menu-item:has-text('Edit')",
         "div.context-menu-item:has-text('Edit')",
         "button.hxc-btn-base:has-text('Edit')",
     ],
     # 'Open in Studio' nằm trong submenu Edit (kèm badge 'New' → text là
     # 'Open in StudioNew', :has-text khớp chuỗi con nên vẫn trúng).
     "open_in_studio": [
+        "div.hxc-menu-item:has-text('Open in Studio')",
         "div.context-menu-item:has-text('Open in Studio')",
         "button.hxc-btn-base:has-text('Open in Studio')",
     ],
@@ -1138,6 +1582,7 @@ SUNO_SELECTORS: dict[str, list[str]] = {
     ],
     # Menu Export → 'Full Song' (còn có 'Selected Time Range', 'Multitrack').
     "studio_full_song": [
+        "div.hxc-menu-item:has-text('Full Song')",
         "div.context-menu-item:has-text('Full Song')",
         "button.hxc-btn-base:has-text('Full Song')",
     ],
@@ -1151,6 +1596,7 @@ SUNO_SELECTORS: dict[str, list[str]] = {
         "button:has-text('Go to Song')",
         "a:has-text('Go to Song')",
         "[role=button]:has-text('Go to Song')",
+        "div.hxc-menu-item:has-text('Go to Song')",
         "div.context-menu-item:has-text('Go to Song')",
     ],
     # Trạng thái 'Preparing song for playback...' — CHỜ tới khi biến mất mới tải.
@@ -1171,6 +1617,15 @@ def load_overrides() -> dict:
     return {}
 
 
+def save_override(key: str, value) -> None:
+    """Ghi 1 khoá cấp cao vào video_overrides.json, giữ nguyên các khoá khác."""
+    data = load_overrides()
+    data[key] = value
+    OVERRIDES.parent.mkdir(parents=True, exist_ok=True)
+    OVERRIDES.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def save_selector_overrides(site: str, discovered: dict[str, list[str]]) -> None:
     """Ghi/gộp các selector đã dò được vào video_overrides.json dưới
     selectors.<site>.<key>. KHÔNG xoá các key khác (giữ nguyên override sẵn có
@@ -1188,11 +1643,24 @@ def save_selector_overrides(site: str, discovered: dict[str, list[str]]) -> None
         json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def clip_engine() -> str:
+    """'flow' (mặc định) | 'gemini' | 'muse' — máy tạo clip tự động."""
+    v = str(load_overrides().get("clip_engine") or DEFAULT_CLIP_ENGINE).strip().lower()
+    return v if v in CLIP_ENGINES else DEFAULT_CLIP_ENGINE
+
+
+def clip_prompt_mode() -> str:
+    """'full' (mặc định: prompt đầy đủ + STRICTLY FORBIDDEN) | 'safe' (veo_safety)."""
+    v = str(load_overrides().get("clip_prompt_mode") or DEFAULT_CLIP_PROMPT_MODE).strip().lower()
+    return v if v in CLIP_PROMPT_MODES else DEFAULT_CLIP_PROMPT_MODE
+
+
 def get_selectors(site: str) -> dict[str, list[str]]:
     """site = 'chatgpt' | 'gemini' | 'flow'. Merge override (nếu có) lên default."""
     table = {
         "chatgpt": CHATGPT_SELECTORS,
         "gemini":  GEMINI_SELECTORS,
+        "gemini_video": GEMINI_VIDEO_SELECTORS,
         "flow":    FLOW_SELECTORS,
         "youtube": YOUTUBE_SELECTORS,
         "suno":    SUNO_SELECTORS,

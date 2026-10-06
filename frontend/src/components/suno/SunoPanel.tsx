@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   useSunoConfig, useSunoStatus, useSunoDryRun, useSunoStart,
   useSunoResume, useSunoPause, useSunoCancel, useSunoGenerateStyles,
@@ -134,6 +135,11 @@ const BLOCKING: SunoPhase[] = [
 const RESUMABLE: SunoPhase[] = [...BLOCKING, "PAUSED"];
 const TERMINAL: SunoPhase[] = ["COMPLETED", "CANCELLED"];
 
+/** Lỗi HTTP → câu tiếng Việt (ưu tiên detail của backend, vd 409 worker bận). */
+const errText = (e: unknown, fallback: string) =>
+  (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+  ?? (e as Error)?.message ?? fallback;
+
 export default function SunoPanel({ projectId }: { projectId: number }) {
   const { data: cfg, isLoading: cfgLoading } = useSunoConfig(projectId);
   const { data: status } = useSunoStatus(projectId);
@@ -214,6 +220,54 @@ export default function SunoPanel({ projectId }: { projectId: number }) {
   const loginBusy = job?.kind === "suno-login" &&
     (job.status === "running" || job.status === "pending");
   const selectorCheck = status?.selector_check ?? null;
+
+  const failedAction = [start, dryRun, resume, openBrowser].find((m) => m.isError);
+  const actionError = failedAction ? errText(failedAction.error, "Không gửi được lệnh") : null;
+  const queued = job?.status === "pending" ? job.message : "";
+
+  /** «✨ AI viết prompt & CHẠY TỰ ĐỘNG»: viết Styles + phân kênh rồi Start LIVE
+   *  ngay → import → Mix → Video → lưu nháp YouTube (không hỏi lại). */
+  async function runAuto() {
+    try {
+      const res = await genStyles.mutateAsync({ idea, preset, save: true });
+      setStyles(res.styles);
+      setExclusions(res.exclusions);
+      setGenNote(res.note);
+      setChannel(res.channel);
+      start.mutate({
+        ...buildBody(),
+        styles: res.styles,
+        exclusions: res.exclusions,
+      }, {
+        onError: (e) => setGenNote(
+          "Đã viết prompt nhưng KHÔNG khởi động được Suno: " +
+          errText(e, "lỗi không rõ")),
+      });
+    } catch (e) {
+      setGenNote("Không gọi được AI viết prompt: " +
+        errText(e, "kiểm tra API key ở ⚙️ Settings."));
+    }
+  }
+
+  // New Project → «Tạo & CHẠY TỰ ĐỘNG» mở trang với ?autorun=1 → tự bấm nút ✨
+  // đúng 1 lần khi cấu hình/ý tưởng/trạng thái đã tải xong.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const autorunRequested = searchParams.get("autorun") === "1";
+  const autoFired = useRef(false);
+  useEffect(() => {
+    if (!autorunRequested || autoFired.current) return;
+    if (!inited || !ideaInited || !project || status === undefined) return;
+    autoFired.current = true;
+    const next = new URLSearchParams(searchParams);
+    next.delete("autorun");
+    setSearchParams(next, { replace: true });
+    if (busy) {
+      setGenNote("Suno của project đang bận nên chưa tự chạy — bấm nút ✨ khi rảnh.");
+      return;
+    }
+    void runAuto();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autorunRequested, inited, ideaInited, project, status, busy]);
 
   const canResume = !busy && phase != null && RESUMABLE.includes(phase);
   const isTerminal = phase != null && TERMINAL.includes(phase);
@@ -317,6 +371,8 @@ export default function SunoPanel({ projectId }: { projectId: number }) {
             bên dưới. Khi bấm <b>AI viết prompt</b>, AI sẽ viết brief thật chi tiết cho Suno
             (BPM, tông/âm giai, vòng hợp âm, tính chất giai điệu, phối khí, mix) để chất
             lượng cao nhất. Nhạc luôn <b>instrumental, không giọng hát/lời</b>.
+            Có thể gõ tiếng Việt — tool <b>tự dịch sang tiếng Anh</b> khi lưu để mọi
+            prompt đồng nhất 100% tiếng Anh.
           </p>
           <textarea
             value={idea}
@@ -324,7 +380,10 @@ export default function SunoPanel({ projectId }: { projectId: number }) {
             onChange={(e) => setIdea(e.target.value)}
             onBlur={() => {
               if ((project?.suno_idea ?? "") !== idea) {
-                updateProject.mutate({ suno_idea: idea });
+                // Server lưu bản TIẾNG ANH (tự dịch) → hiện lại bản đã lưu.
+                updateProject.mutate({ suno_idea: idea }, {
+                  onSuccess: (p) => setIdea((cur) => (cur === idea ? p.suno_idea ?? cur : cur)),
+                });
               }
             }}
             rows={2}
@@ -334,24 +393,7 @@ export default function SunoPanel({ projectId }: { projectId: number }) {
           <button
             className={`${primary} mt-2 w-full`}
             disabled={busy || genStyles.isPending || start.isPending}
-            onClick={async () => {
-              try {
-                const res = await genStyles.mutateAsync({ idea, preset, save: true });
-                setStyles(res.styles);
-                setExclusions(res.exclusions);
-                setGenNote(res.note);
-                setChannel(res.channel);
-                // CHẠY TỰ ĐỘNG (không hỏi lại): dùng prompt vừa viết để Start
-                // Suno LIVE → import → Mix → Video → lưu nháp YouTube.
-                start.mutate({
-                  ...buildBody(),
-                  styles: res.styles,
-                  exclusions: res.exclusions,
-                });
-              } catch {
-                setGenNote("Không gọi được AI. Kiểm tra API key ở ⚙️ Settings.");
-              }
-            }}
+            onClick={() => void runAuto()}
           >
             {genStyles.isPending
               ? "✨ Đang viết prompt…"
@@ -510,8 +552,13 @@ export default function SunoPanel({ projectId }: { projectId: number }) {
                 </p>
               )}
             </div>
-          ) : (
+          ) : queued ? null : (
             <p className="text-xs text-gray-500">Chưa có batch Suno nào cho project này.</p>
+          )}
+          {queued && !batch && (
+            <p className="mt-2 rounded bg-sky-950/30 p-2 text-xs text-sky-300 break-words">
+              {queued}
+            </p>
           )}
         </Section>
       </div>
@@ -613,6 +660,11 @@ export default function SunoPanel({ projectId }: { projectId: number }) {
             >
               ▶ Start Suno Project (LIVE — tạo & tải 15 WAV)
             </button>
+            {actionError && (
+              <p className="rounded bg-red-950/30 p-2 text-xs text-red-300 break-words">
+                ⚠️ {actionError}
+              </p>
+            )}
 
             <div className="grid grid-cols-3 gap-2 pt-1">
               <button className={ghost} disabled={!busy || pause.isPending}

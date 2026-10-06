@@ -51,6 +51,36 @@ class Project(SQLModel, table=True):
     # Tự động đăng nháp lên YouTube ngay sau khi render video xong. Mặc định TẮT
     # (an toàn — người dùng bật khi đã cấu hình mapping). Project cũ: migration 0.
     auto_upload: bool = False
+    # Nhóm project cùng 1 lô sản xuất hàng loạt (batch). NULL = tạo lẻ như cũ.
+    batch_id: Optional[str] = Field(default=None, index=True)
+    # Tổng thời lượng mix (= độ dài video) + crossfade. Lưu theo project để CẢ
+    # bấm Start Mix tay LẪN chuỗi tự động Suno→Mix→Video dùng đúng 1 con số.
+    mix_duration_minutes: float = 120.0
+    mix_crossfade_seconds: float = 5.0
+
+
+class BatchRun(SQLModel, table=True):
+    """
+    1 lô sản xuất hàng loạt N sản phẩm YouTube. Orchestrator (backend/batch_service.py)
+    tạo N Project cùng batch_key rồi chạy TUẦN TỰ trọn pipeline từng project
+    (Suno → Mix → Video → đăng nháp). Bảng này là state tiến độ + tham số để UI
+    theo dõi i/N và để resume/hủy an toàn.
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    batch_key: str = Field(index=True, unique=True)   # UUID lô
+    total: int = 0                                    # N sản phẩm
+    completed: int = 0                                # số project đã xong chuỗi
+    failed: int = 0                                   # số project lỗi/blocking
+    # running | completed | cancelled | blocked | failed
+    status: str = Field(default="running")
+    current_index: int = 0                            # đang chạy project thứ (0-based)
+    current_project_id: Optional[int] = None
+    params_json: str = "{}"                           # snapshot tham số lô
+    message: str = ""                                 # mô tả trạng thái cho UI
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc))
 
 
 class Track(SQLModel, table=True):

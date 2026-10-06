@@ -241,10 +241,11 @@ export function SettingsModal({ open, onClose }: Props) {
             <button
               onClick={handleSave}
               disabled={updateMutation.isPending || !dirty}
+              title="Chỉ lưu API Key / Base URL / Model. Phần YouTube/GPMLogin có nút Lưu riêng."
               className="px-4 py-2 text-sm bg-violet-600 hover:bg-violet-500
                          disabled:opacity-40 rounded-lg text-white font-medium"
             >
-              {updateMutation.isPending ? 'Saving...' : 'Save Settings'}
+              {updateMutation.isPending ? 'Đang lưu…' : 'Lưu API (OpenAI)'}
             </button>
           </div>
         </div>

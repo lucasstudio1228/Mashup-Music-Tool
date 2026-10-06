@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlmodel import Session
@@ -23,6 +23,10 @@ class RunImagesBody(BaseModel):
 
 class RunClipsBody(BaseModel):
     mode: str = "restart"          # "restart" | "resume"
+
+class ManualClipsBody(BaseModel):
+    only: Optional[list[int]] = None   # None = mọi clip còn thiếu; [k] = làm lại clip k
+    assemble: bool = True              # đủ clip + có nhạc → ghép video luôn
 
 class AssembleBody(BaseModel):
     audio_path: Optional[str] = None
@@ -68,6 +72,70 @@ def list_styles(project_id: int):
     }
 
 
+class ThumbnailFontBody(BaseModel):
+    key: str
+
+
+@router.get("/thumbnail-fonts")
+def list_thumbnail_fonts(project_id: int):
+    """Danh mục font tiêu đề (thumbnail + intro) + font đang chọn (chung mọi project)."""
+    from backend.video import thumbnail as th
+    return {
+        "selected": th.selected_font_key(),
+        "default": th.DEFAULT_FONT_KEY,
+        "fonts": [{"key": f["key"], "label": f["label"], "note": f["note"]}
+                  for f in th.FONT_CATALOG if Path(f["file"]).exists()],
+    }
+
+
+@router.put("/thumbnail-fonts")
+def set_thumbnail_font(project_id: int, body: ThumbnailFontBody):
+    from backend.video import thumbnail as th
+    f = th.font_entry(body.key)
+    if not f or not Path(f["file"]).exists():
+        raise HTTPException(400, f"Font '{body.key}' không có trên máy.")
+    config.save_override("thumbnail_font", body.key)
+    return {"selected": body.key}
+
+
+class ClipEngineBody(BaseModel):
+    engine: str
+
+
+@router.put("/clip-engine")
+def set_clip_engine(project_id: int, body: ClipEngineBody):
+    """Chọn máy tạo clip (chung mọi project): flow | gemini | muse. Không đổi
+    giữa lúc job video đang chạy (job đang chạy giữ máy đã chọn lúc bắt đầu)."""
+    key = (body.engine or "").strip().lower()
+    if key not in config.CLIP_ENGINES:
+        raise HTTPException(400, f"Máy tạo clip '{body.engine}' không hợp lệ.")
+    if video_job_manager.is_busy():
+        raise HTTPException(409, "Đang có job video chạy — đợi xong rồi hãy đổi máy tạo clip.")
+    config.save_override("clip_engine", key)
+    return {"clip_engine": key, "clip_engine_label": config.CLIP_ENGINE_LABELS[key]}
+
+
+@router.get("/thumbnail-fonts/{key}/preview")
+def thumbnail_font_preview(project_id: int, key: str,
+                           db: Session = Depends(get_session)):
+    """Ảnh mẫu: tên project viết bằng font `key` trên ảnh bìa của project."""
+    import hashlib
+    from backend.video import thumbnail as th
+    project = _project_or_404(db, project_id)
+    if not th.font_entry(key):
+        raise HTTPException(404, f"Không có font '{key}'.")
+    title = (project.name or "Healing Music").strip()
+    bg = config.images_dir(project_id, project.name) / "0.png"
+    stamp = f"{title}|{bg.stat().st_mtime if bg.exists() else 0}"
+    h = hashlib.sha1(stamp.encode("utf-8")).hexdigest()[:10]
+    out = config.OVERRIDES.parent / "thumb_font_previews" / f"{project_id}_{key}_{h}.jpg"
+    if not out.exists() and not th.render_font_preview(
+            key, out, title, service._thumbnail_keywords(),
+            bg if bg.exists() else None):
+        raise HTTPException(500, "Không vẽ được ảnh mẫu cho font này.")
+    return FileResponse(str(out), media_type="image/jpeg")
+
+
 @router.get("/status")
 def status(project_id: int, db: Session = Depends(get_session)):
     project = _project_or_404(db, project_id)
@@ -82,9 +150,17 @@ def status(project_id: int, db: Session = Depends(get_session)):
         "image_count": p.image_count, "clip_seconds": p.clip_seconds,
         "rest_clips": p.rest_clips, "total_clips": p.total_clips,
         "t_window": p.t_window, "model": p.flow_model,
+        # Máy tạo clip: flow (mặc định) | gemini | muse (override clip_engine).
+        "clip_engine": config.clip_engine(), "clip_engine_label": service.clip_engine_label(),
+        "clip_engines": [{"key": k, "label": config.CLIP_ENGINE_LABELS.get(k, k)}
+                         for k in config.CLIP_ENGINES],
         "aspect_ratio": p.aspect_ratio, "flow_mode": p.flow_mode,
         "blend_seconds": p.blend_seconds, "slow_speed": p.slow_speed,
+        # Nhãn vai trò 3 ảnh (0 bìa, 1 nhân vật chính, 2 linh thú) cho UI.
+        "image_roles": {str(k): v for k, v in config.IMAGE_ROLES.items()},
     }
+    from backend.video.flow_manual import manual_state
+    media["manual"] = manual_state(project_id)
     return media
 
 
@@ -132,6 +208,76 @@ def gen_clips(project_id: int, body: RunClipsBody = RunClipsBody(),
     video_job_manager.submit(project_id, "clips", service.step_clips,
                              mode, project.name, project.video_style)
     return {"status": "submitted", "kind": "clips", "mode": mode}
+
+
+@router.get("/clips/manual")
+def manual_clip_prompts(project_id: int, db: Session = Depends(get_session)):
+    """Chế độ thủ công: đủ N prompt clip (đúng chữ tool sẽ gửi Flow) + nguyên
+    liệu + clip đã có chưa + trạng thái phiên thủ công đang chạy."""
+    from backend.video import flow_driver
+    from backend.video.flow_manual import manual_state
+    project = _project_or_404(db, project_id)
+    try:
+        service._validate_saved_workflow(project_id, project.name)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    clips = flow_driver.clip_prompt_list(project_id, project.name,
+                                         config.normalize_style(project.video_style))
+    return {"total": config.PARAMS.total_clips, "clips": clips,
+            "state": manual_state(project_id)}
+
+
+@router.post("/clips/manual")
+def start_manual_clips(project_id: int, body: ManualClipsBody = ManualClipsBody(),
+                       db: Session = Depends(get_session)):
+    """"Tạo video thủ công": tool mở Flow + đưa 2 bảng nhân vật vào ô soạn,
+    người dùng dán prompt + bấm Tạo, tool tải về + đặt tên clip_NN.mp4."""
+    project = _project_or_404(db, project_id)
+    _guard_busy()
+    media = service.list_media(project_id, project.name)
+    if media["image_count"] < config.PARAMS.image_count:
+        raise HTTPException(400, f"Chưa đủ {config.PARAMS.image_count} ảnh — hãy tạo ảnh trước.")
+    only = None
+    if body.only:
+        only = sorted({int(k) for k in body.only})
+        bad = [k for k in only if not (0 <= k < config.PARAMS.total_clips)]
+        if bad:
+            raise HTTPException(400, f"Chỉ số clip không hợp lệ: {bad} "
+                                     f"(0..{config.PARAMS.total_clips - 1}).")
+    video_job_manager.submit(project_id, "clips-manual", service.run_manual_clips,
+                             project.name, project.video_style, only, body.assemble)
+    return {"status": "submitted", "kind": "clips-manual", "only": only}
+
+
+@router.post("/clips/{index}/import")
+async def import_clip(project_id: int, index: int, file: UploadFile = File(...),
+                      db: Session = Depends(get_session)):
+    """Nhập 1 file mp4 người dùng tự tạo (vd ở trình duyệt riêng khi cửa sổ của
+    tool bị gắn cờ) → clips/clip_NN.mp4. Cho phép cả khi phiên thủ công đang
+    chờ — phiên sẽ nhận file này và chuyển sang clip kế."""
+    import tempfile
+    from backend.video.flow_manual import import_clip_file
+    project = _project_or_404(db, project_id)
+    job = video_job_manager.get(project_id)
+    if video_job_manager.is_busy() and not (
+            job and job.kind == "clips-manual"
+            and job.status in ("pending", "running", "paused")):
+        raise HTTPException(409, "Đang có tác vụ video tự động chạy — đợi xong hoặc huỷ "
+                                 "rồi mới nhập file clip.")
+    if not (file.filename or "").lower().endswith(".mp4"):
+        raise HTTPException(400, "Chỉ nhận file .mp4.")
+    fd, tmp = tempfile.mkstemp(suffix=".mp4")
+    try:
+        with open(fd, "wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                out.write(chunk)
+        try:
+            dest = import_clip_file(project_id, project.name, index, Path(tmp))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+    return {"status": "imported", "index": index, "path": str(dest)}
 
 
 @router.post("/assemble")
@@ -194,12 +340,13 @@ def regen_image(project_id: int, index: int,
 @router.post("/clips/{index}/regenerate")
 def regen_clip(project_id: int, index: int,
                db: Session = Depends(get_session)):
-    """Tạo lại ĐÚNG 1 clip (ghi đè), giữ nguyên clip khác (cần _plan.json)."""
+    """Tạo lại ĐÚNG 1 clip (ghi đè), giữ nguyên clip khác."""
     project = _project_or_404(db, project_id)
     _guard_busy()
-    if not (0 <= index < config.PARAMS.image_count):
+    # Clip nhiều hơn ảnh (3 ảnh → N clip) nên bound theo total_clips.
+    if not (0 <= index < config.PARAMS.total_clips):
         raise HTTPException(400, f"Chỉ số clip {index} không hợp lệ "
-                                 f"(0..{config.PARAMS.image_count - 1}).")
+                                 f"(0..{config.PARAMS.total_clips - 1}).")
     video_job_manager.submit(project_id, "clips", service.regen_clip,
                              index, project.name, project.video_style)
     return {"status": "submitted", "kind": "clips", "index": index,
@@ -208,7 +355,7 @@ def regen_clip(project_id: int, index: int,
 
 @router.post("/motions/regenerate")
 def regen_motions(project_id: int, db: Session = Depends(get_session)):
-    """Sinh lại CHỈ prompt chuyển động (motions) từ prompt ảnh đã lưu."""
+    """Sinh lại CHỈ bộ prompt cảnh (motions) từ hai bảng nhân vật đã khoá."""
     project = _project_or_404(db, project_id)
     _guard_busy()
     video_job_manager.submit(project_id, "motions", service.regen_motions,
@@ -279,6 +426,31 @@ def resume(project_id: int, db: Session = Depends(get_session)):
     if not ok:
         raise HTTPException(409, "Không có tác vụ video nào đang tạm dừng để tiếp tục.")
     return {"status": "resuming", "project_id": project_id}
+
+
+@router.post("/open-browser")
+def open_browser(project_id: int, site: str = "flow", db: Session = Depends(get_session)):
+    """Mở cửa sổ Flow/Gemini bằng đúng profile tool dùng để theo dõi/đăng nhập/kiểm tra.
+    Chạy trên worker video duy nhất → bị khoá khi đang có tác vụ video."""
+    from backend.video import monitor_browser
+    _project_or_404(db, project_id)
+    if site not in monitor_browser.SITES:
+        raise HTTPException(400, f"site phải là: {', '.join(monitor_browser.SITES)}")
+    if video_job_manager.is_busy():
+        raise HTTPException(409, "Đang có tác vụ video chạy (hoặc cửa sổ trình duyệt đang mở) "
+                                 "— không mở thêm để tránh 2 cửa sổ tranh cùng 1 profile.")
+    video_job_manager.submit(project_id, f"browser-{site}",
+                             monitor_browser.run_monitor_browser, site=site)
+    return {"status": "opening", "site": site, "project_id": project_id}
+
+
+@router.post("/close-browser")
+def close_browser(project_id: int, db: Session = Depends(get_session)):
+    _project_or_404(db, project_id)
+    job = video_job_manager.get(project_id)
+    if not job or not job.kind.startswith("browser-") or not video_job_manager.cancel(project_id):
+        raise HTTPException(409, "Không có cửa sổ trình duyệt nào đang mở.")
+    return {"status": "closing", "project_id": project_id}
 
 
 @router.get("/progress")

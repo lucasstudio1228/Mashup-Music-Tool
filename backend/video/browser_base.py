@@ -10,11 +10,13 @@ trong cửa sổ đó. Session được lưu vào .browser_profile nên các l�
 đăng nhập lại.
 """
 from __future__ import annotations
+import threading
 import time
 import sys
 from pathlib import Path
 from typing import Optional
 
+from . import config
 from .config import BROWSER, PROFILE_DIR
 
 # Backend trên Windows có thể chạy bằng Python hệ thống khi virtualenv cũ bị
@@ -46,18 +48,65 @@ def _install_chromium() -> None:
     print("  ✅ Đã cài Chromium riêng cho tool.")
 
 
+def _profile_variant(exe: str) -> str:
+    """Tên hậu tố profile theo trình duyệt (mỗi .exe 1 profile RIÊNG)."""
+    low = str(exe).lower()
+    for known in ("coccoc", "chrome", "msedge", "edge", "brave"):
+        if known in low:
+            return known
+    return "ext"
+
+
+# Thư mục nặng/không cần khi nhân bản profile sang trình duyệt khác — bỏ đi để
+# chép nhanh (436MB → vài chục MB) mà vẫn giữ cookie/đăng nhập.
+_PROFILE_SKIP = {
+    "cache", "code cache", "gpucache", "shadercache", "grshadercache",
+    "gpupersistentcache", "dawngraphitecache", "dawnwebgpucache",
+    "browsermetrics", "crashpad", "component_crx_cache",
+    "extensions_crx_cache", "safe browsing", "service worker",
+}
+
+
+def _seed_profile(src: Path, dst: Path) -> None:
+    """Nhân bản profile sang thư mục riêng của trình duyệt khác (1 lần đầu).
+
+    ⚠️ KHÔNG dùng chung 1 user_data_dir cho 2 .exe khác phiên bản: Cốc Cốc
+    152 sẽ nâng cấp profile và Chromium 151 bundled sau đó từ chối mở."""
+    import shutil
+    if dst.exists() or not src.exists():
+        return
+    print(f"  ⧉ Nhân bản profile sang {dst.name} (giữ đăng nhập sẵn có)...")
+    try:
+        shutil.copytree(
+            src, dst,
+            ignore=lambda d, names: [n for n in names
+                                     if n.lower() in _PROFILE_SKIP],
+            dirs_exist_ok=True, symlinks=True,
+            ignore_dangling_symlinks=True)
+    except Exception as e:                      # copy lỗi → vẫn chạy, chỉ phải
+        print(f"  (không nhân bản được profile: {e} — sẽ cần đăng nhập lại)")
+        dst.mkdir(parents=True, exist_ok=True)
+
+
 class BrowserSession:
     """Bọc 1 persistent browser context. Dùng như context manager."""
 
     def __init__(self, headless: Optional[bool] = None,
-                 profile_dir: Optional[Path] = None):
+                 profile_dir: Optional[Path] = None,
+                 site: Optional[str] = None):
         self._pw = None
         self.context = None
         self._old_policy = None
         self.headless = BROWSER.headless if headless is None else headless
+        # site="gemini"/"flow"… → cho phép mỗi site dùng trình duyệt RIÊNG
+        # (xem config.SITE_BROWSER). None = quy tắc chung như trước.
+        self.site = site
         # profile_dir=None → dùng .browser_profile chung (ChatGPT/Flow, hành vi cũ).
         # Suno truyền SUNO_PROFILE_DIR để có session RIÊNG, không đụng profile khác.
-        self.profile_dir = Path(profile_dir) if profile_dir else PROFILE_DIR
+        # site cũng có thể chỉ định profile riêng (config.site_profile_dir) —
+        # dùng khi profile cũ đã bị Google gắn cờ và cần profile SẠCH.
+        self.profile_dir = (Path(profile_dir) if profile_dir
+                            else (config.site_profile_dir(site) or PROFILE_DIR))
 
     def __enter__(self) -> "BrowserSession":
         try:
@@ -84,12 +133,22 @@ class BrowserSession:
             except Exception:
                 self._old_policy = None
 
+        # Trình duyệt ngoài (vd Cốc Cốc): Google Flow CHẶN Chromium bundled của
+        # Playwright («hoạt động bất thường») nhưng chấp nhận Cốc Cốc.
+        exe = config.resolve_browser_exe(self.site)
+        base_profile = self.profile_dir
+        if exe:
+            self.profile_dir = base_profile.with_name(
+                f"{base_profile.name}_{_profile_variant(exe)}")
+            _seed_profile(base_profile, self.profile_dir)
+            print(f"  🌐 Trình duyệt: {exe}")
+
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self._pw = sync_playwright().start()
 
-        # Tự tải Chromium riêng nếu chưa có (chỉ 1 lần) → tool luôn chạy
-        # Chromium độc lập, không dùng Cốc Cốc mặc định của máy.
-        if not _chromium_installed(self._pw):
+        # Tự tải Chromium riêng nếu chưa có (chỉ 1 lần) → dự phòng khi không có
+        # trình duyệt ngoài.
+        if not exe and not _chromium_installed(self._pw):
             try:
                 _install_chromium()
             except Exception as e:
@@ -112,13 +171,19 @@ class BrowserSession:
             accept_downloads=True,   # cần cho Suno WAV download-wait (expect_download)
         )
 
-        # Thử lần lượt: kênh cấu hình (nếu có) → Chromium bundled → chrome → msedge
+        # Thử lần lượt: .exe ngoài (Cốc Cốc) → kênh cấu hình → Chromium bundled
+        # → chrome → msedge
         attempts: list[dict] = []
+        if exe:
+            attempts.append({**base_kwargs, "executable_path": exe})
+        # Dự phòng dùng LẠI profile gốc: profile bản sao đã bị Cốc Cốc 152 nâng
+        # cấp thì Chromium 151 bundled không mở được nữa.
+        fb = {**base_kwargs, "user_data_dir": str(base_profile)}
         if BROWSER.chrome_channel:
-            attempts.append({**base_kwargs, "channel": BROWSER.chrome_channel})
-        attempts.append(dict(base_kwargs))               # bundled chromium
-        attempts.append({**base_kwargs, "channel": "chrome"})
-        attempts.append({**base_kwargs, "channel": "msedge"})
+            attempts.append({**fb, "channel": BROWSER.chrome_channel})
+        attempts.append(dict(fb))                        # bundled chromium
+        attempts.append({**fb, "channel": "chrome"})
+        attempts.append({**fb, "channel": "msedge"})
 
         last_err: Exception | None = None
         for kw in attempts:
@@ -167,10 +232,60 @@ class BrowserSession:
 
 # ── Helper thao tác selector (thử nhiều selector, fallback dần) ──
 
+# ── Huỷ NHANH giữa các thao tác Playwright chặn lâu ──────────────
+# Cờ huỷ của job chỉ được kiểm khi job gọi progress_cb → các vòng chờ dài
+# (Studio build 300s, render, chờ bài…) làm nút Huỷ phải đợi vài phút. Job đăng
+# ký 1 hàm kiểm tra (theo THREAD) → query_first / wait_ms / cancellable_sleep
+# kiểm nó mỗi ≤0.5s và ném OperationCancelled.
+class OperationCancelled(BaseException):
+    """Người dùng bấm Huỷ/Tạm dừng. Kế thừa BaseException để KHÔNG bị các khối
+    `except Exception` (thử lại, bỏ qua lỗi UI…) nuốt mất."""
+
+
+_cancel_local = threading.local()
+
+
+def set_cancel_check(fn) -> None:
+    """fn() → True khi cần dừng. None để gỡ. Chỉ áp dụng cho thread hiện tại."""
+    _cancel_local.fn = fn
+
+
+def check_cancel() -> None:
+    fn = getattr(_cancel_local, "fn", None)
+    if fn is not None and fn():
+        raise OperationCancelled()
+
+
+def wait_ms(page, ms: float) -> None:
+    """page.wait_for_timeout nhưng chia nhỏ ≤500ms và kiểm cờ huỷ giữa chừng
+    (vẫn bơm sự kiện Playwright như wait_for_timeout)."""
+    check_cancel()
+    end = time.time() + ms / 1000.0
+    while True:
+        rem = (end - time.time()) * 1000.0
+        if rem <= 0:
+            return
+        page.wait_for_timeout(min(500.0, rem))
+        check_cancel()
+
+
+def cancellable_sleep(seconds: float) -> None:
+    """time.sleep kiểm cờ huỷ mỗi 0.5s."""
+    check_cancel()
+    end = time.time() + max(0.0, seconds)
+    while True:
+        rem = end - time.time()
+        if rem <= 0:
+            return
+        time.sleep(min(0.5, rem))
+        check_cancel()
+
+
 def query_first(page, selectors: list[str], timeout_ms: int = 8000):
     """Trả về locator đầu tiên tìm thấy trong danh sách selector, hoặc None."""
     deadline = time.time() + timeout_ms / 1000.0
     while time.time() < deadline:
+        check_cancel()
         for sel in selectors:
             loc = page.locator(sel).first
             try:
@@ -211,19 +326,33 @@ def fill_first(page, selectors: list[str], text: str,
 
 
 def upload_first(page, selectors: list[str], file_path: str,
-                 timeout_ms: int = 8000) -> bool:
-    """Set file cho input[type=file] đầu tiên khớp."""
+                 timeout_ms: int = 8000, set_timeout_ms: int = 300_000,
+                 log=None) -> bool:
+    """Set file cho input[type=file] đầu tiên khớp.
+
+    `set_timeout_ms`: hạn riêng cho set_input_files — file video thiền vài GB
+    lâu hơn nhiều so với action_timeout mặc định (30s) của context.
+    `log`: nhận thông báo lỗi THẬT; trước đây lỗi bị nuốt nên hỏng ở đây chỉ
+    thấy 'không tìm thấy ô chọn file', rất khó lần ra nguyên nhân.
+    """
     deadline = time.time() + timeout_ms / 1000.0
+    last_err = ""
     while time.time() < deadline:
         for sel in selectors:
             loc = page.locator(sel).first
             try:
                 if loc.count() > 0:
-                    loc.set_input_files(file_path)
+                    loc.set_input_files(file_path, timeout=set_timeout_ms)
                     return True
-            except Exception:
+            except Exception as exc:
+                last_err = f"{sel} → {type(exc).__name__}: {exc}"
                 continue
         page.wait_for_timeout(300)
+    if log and last_err:
+        try:
+            log(f"upload_first thất bại: {last_err[:400]}")
+        except Exception:
+            pass
     return False
 
 

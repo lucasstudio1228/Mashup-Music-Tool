@@ -31,17 +31,17 @@ PAGE_LEVEL: list[str] = [
 ]
 
 # Selector page-level nhưng CHỈ hiện khi ở đúng trạng thái phụ (Song Title phải
-# cuộn/mở thêm; ô Duration số chỉ hiện khi Duration=Custom). Không thấy → báo
-# "conditional" (thông tin), KHÔNG tính là hỏng/cần-sửa-tay để tránh báo nhầm.
+# cuộn/mở thêm). Không thấy → báo "conditional" (thông tin), KHÔNG tính là
+# hỏng/cần-sửa-tay để tránh báo nhầm.
 CONDITIONAL: list[str] = [
-    "song_title", "duration_seconds_input",
+    "song_title",
 ]
 
 # Selector chỉ xuất hiện SAU thao tác (mở menu ⋯, popover model, hộp thoại
 # Download, luồng Studio) hoặc phụ thuộc dữ liệu (phải có bài trong workspace).
 # Không kiểm ở trạng thái tĩnh → báo "skipped" để tránh báo hỏng nhầm.
 INTERACTIVE: list[str] = [
-    "model_option_v6", "duration_custom", "duration_auto", "max_mode_off",
+    "model_option_v6", "max_mode_off",
     "max_mode_on", "clear_form", "new_workspace", "song_row_play",
     "song_more_options", "download_entry", "download_dialog",
     "download_format_wav", "download_format_mp3", "download_confirm",
@@ -102,10 +102,6 @@ HEAL_CANDIDATES: dict[str, list[str]] = {
     "song_title": [
         "input[placeholder='Song Title (Optional)']",
         "input[placeholder*='Song Title' i]",
-    ],
-    "duration_seconds_input": [
-        "input[type=number][placeholder='Auto']",
-        "input[type=number]",
     ],
 }
 
@@ -170,11 +166,18 @@ def _best_effort_reveal(page, selectors: dict) -> None:
 
 
 def is_logged_in(page, selectors: dict, timeout_ms: int = 6000) -> bool:
-    """Đăng nhập rồi nếu thấy 1 trong các mốc chính của form tạo bài."""
+    """Đăng nhập rồi nếu ĐANG Ở /create, thấy 1 trong các mốc chính của form
+    tạo bài và KHÔNG có dấu hiệu đăng xuất. Trang chủ khi đăng xuất cũng có nút
+    «Create»/«Advanced» → nếu chỉ dò form sẽ tưởng đã đăng nhập rồi kiểm/"heal"
+    selector trên nhầm trang."""
+    from .suno_driver import suno_logged_out
+    if "/create" not in (page.url or "") or suno_logged_out(page):
+        return False
     probes = (selectors.get("create_button", [])
               + selectors.get("styles_box", [])
               + selectors.get("mode_advanced_tab", []))
-    return query_first(page, probes, timeout_ms=timeout_ms) is not None
+    return (query_first(page, probes, timeout_ms=timeout_ms) is not None
+            and not suno_logged_out(page))
 
 
 def run_selector_check(page, selectors: dict) -> dict:
@@ -271,13 +274,28 @@ def run_login_and_check(project_id: int, progress_cb: Callable[[str, float], Non
 
         # Chờ đăng nhập tối đa ~5 phút, vẫn phản hồi nút Đóng (progress_cb ném
         # JobCancelled khi bị huỷ). Người dùng đăng nhập xong thì check chạy.
+        from .suno_driver import suno_logged_out
         logged_in = False
         wait_deadline = time.time() + 300
+        stuck_since = time.time()
         try:
             while time.time() < wait_deadline:
                 if is_logged_in(page, selectors, timeout_ms=1500):
                     logged_in = True
                     break
+                url = page.url or ""
+                # Đăng nhập xong Suno hay đưa về trang chủ; session-recovery có
+                # lúc treo → sau 20s mà không ở luồng đăng nhập thì tự về /create.
+                if ("/create" in url or "/auth/" in url or "sign-in" in url
+                        or suno_logged_out(page)) and "session-recovery" not in url:
+                    stuck_since = time.time()
+                elif time.time() - stuck_since > 20:
+                    try:
+                        page.goto(vconfig.SUNO_URL, wait_until="domcontentloaded",
+                                  timeout=45000)
+                    except Exception:
+                        pass
+                    stuck_since = time.time()
                 progress_cb("Đang chờ đăng nhập Suno trong cửa sổ trình duyệt…",
                             30.0)
                 page.wait_for_timeout(1500)

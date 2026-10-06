@@ -15,6 +15,7 @@ if str(_ROOT) not in sys.path:
 import numpy as np  # noqa: E402
 import soundfile as sf  # noqa: E402
 
+from analyzer import find_transition_points  # noqa: E402
 from api_config import APIConfig  # noqa: E402
 from audio_loader import (SUPPORTED_EXTENSIONS, Track, load_library)  # noqa: E402
 from crossfade_engine import render_mix  # noqa: E402
@@ -228,30 +229,36 @@ def run_mix_job(
     if not sample_rate or sample_rate <= 0:
         sample_rate = resolve_target_sample_rate([t.sample_rate for t in tracks])
 
-    # Step 2/6 – Generate playlist
-    progress_cb(2, "Generating playlist", 15.0)
-    target_seconds = duration_minutes * 60
-    playlist = generate_playlist(tracks, target_seconds, crossfade_seconds)
-
-    # Step 3/6 – Name tracks
-    progress_cb(3, "Naming tracks", 22.0)
-    names = generate_names(len(playlist), api_config)
-
-    # Step 4/6 – Pre-load audio (stems nếu có, fallback nếu không)
-    progress_cb(4, "Loading stems & mixing", 28.0)
+    # Step 2/6 – Pre-load audio (stems nếu có, fallback nếu không). Nạp TRƯỚC khi
+    # xếp playlist để đo độ dài THỰC mỗi bài đóng góp vào mix (render bỏ dead-air
+    # đầu/đuôi + overlap crossfade) — ước lượng theo duration file làm mix hụt
+    # so với yêu cầu (vd đặt 60' ra 58'35").
+    progress_cb(2, "Loading stems", 8.0)
     preloaded: dict[str, np.ndarray] = {}
-    for i, track in enumerate(playlist):
+    effective: dict[str, float] = {}
+    for i, track in enumerate(tracks):
         if track.path in preloaded:
-            continue     # track lặp lại (T+3) — đã load, khỏi xử lý lại
-        pct = 28.0 + (i / max(len(playlist), 1)) * 30.0
+            continue
+        pct = 8.0 + (i / max(len(tracks), 1)) * 42.0
         stem_status = _get_track_stem_status(track.path, db_path)
-        msg = (f"[{i+1}/{len(playlist)}] "
+        msg = (f"[{i+1}/{len(tracks)}] "
                f"{'[STEMS] ' if stem_status == 'completed' else '[ORIGINAL] '}"
                f"{Path(track.path).name}")
-        progress_cb(4, msg, pct)
-        preloaded[track.path] = _load_track_audio_with_stems(
-            track.path, sample_rate, db_path
-        )
+        progress_cb(2, msg, pct)
+        audio = _load_track_audio_with_stems(track.path, sample_rate, db_path)
+        preloaded[track.path] = audio
+        tail, head = find_transition_points(audio, sample_rate, crossfade_seconds)
+        effective[track.path] = (tail - head) / sample_rate - crossfade_seconds
+
+    # Step 3/6 – Generate playlist (shuffle theo vòng + T+5)
+    progress_cb(3, "Generating playlist", 52.0)
+    target_seconds = duration_minutes * 60
+    playlist = generate_playlist(tracks, target_seconds, crossfade_seconds,
+                                 effective=effective)
+
+    # Step 4/6 – Name tracks
+    progress_cb(4, "Naming tracks", 55.0)
+    names = generate_names(len(playlist), api_config)
 
     # Step 5/6 – Render mix (dùng preloaded audio)
     output_wav = os.path.join(output_dir, "mix.wav")
@@ -295,6 +302,80 @@ def run_mix_job(
     return {
         "total_duration_seconds": info.duration,
         "track_count": len(playlist),
+        "output_dir": output_dir,
+        "sample_rate": sample_rate,
+        "bit_depth": bit_depth,
+    }
+
+
+def run_patch_mix_job(
+    mix_id: int,
+    progress_cb,           # callback(step, step_name, percent, message="")
+    sequence: list[str],   # đường dẫn file theo ĐÚNG thứ tự bản mix cũ
+    names: list[str],      # tên từng đoạn của bản mix cũ (giữ nguyên)
+    output_dir: str,
+    crossfade_seconds: float,
+    sample_rate: int,
+    bit_depth: int,
+    db_path: str,
+    target_seconds: float,
+) -> dict:
+    """
+    "Vá mix": render lại theo ĐÚNG playlist + tên của bản mix cũ, chỉ khác ở các
+    bài đã được thay (sequence đã trỏ sang file mới). KHÔNG shuffle lại, KHÔNG
+    đặt tên lại ⇒ mọi đoạn trước lần xuất hiện đầu tiên của bài thay giống hệt
+    bản cũ; đoạn sau chỉ dịch đi đúng phần chênh độ dài.
+    Cắt cứng tại target_seconds (= độ dài bản cũ, có fade-out) để video đã dựng
+    vẫn khớp — chỉ cần thay track âm thanh trong final.mp4.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    progress_cb(1, "Loading tracks", 5.0)
+    seq = [str(Path(p)) for p in sequence]
+    uniq = list(dict.fromkeys(seq))
+    lib = {t.path: t for t in _load_ignore_minimum(uniq)}
+    missing = [p for p in uniq if p not in lib]
+    if missing:
+        raise ValueError("Không đọc được: " + ", ".join(Path(p).name for p in missing))
+
+    progress_cb(2, "Loading stems", 8.0)
+    preloaded: dict[str, np.ndarray] = {}
+    for i, p in enumerate(uniq):
+        progress_cb(2, f"[{i+1}/{len(uniq)}] {Path(p).name}",
+                    8.0 + (i / max(len(uniq), 1)) * 42.0)
+        preloaded[p] = _load_track_audio_with_stems(p, sample_rate, db_path)
+
+    output_wav = os.path.join(output_dir, "mix.wav")
+
+    def render_progress(written, total):
+        pct = (written / total) if total else 0.0
+        progress_cb(5, "Rendering audio", 55.0 + min(pct, 1.0) * 33.0)
+
+    timestamps = render_mix(
+        playlist=[lib[p] for p in seq],
+        output_path=output_wav,
+        crossfade_sec=crossfade_seconds,
+        target_sr=sample_rate,
+        bit_depth=bit_depth,
+        target_seconds=target_seconds,
+        hard_cut=True,
+        progress_callback=render_progress,
+        preloaded_audio=preloaded,
+    )
+    for i, ts in enumerate(timestamps):
+        ts["name"] = names[i] if i < len(names) and names[i] else f"Track {i + 1}"
+
+    progress_cb(6, "Writing metadata", 92.0)
+    info = sf.info(output_wav)
+    write_metadata(
+        timestamps=timestamps, output_wav_path=output_wav,
+        total_duration_sec=info.duration, sample_rate=sample_rate,
+        bit_depth=bit_depth, crossfade_sec=crossfade_seconds,
+        channels=info.channels,
+    )
+    progress_cb(6, "Completed", 100.0)
+    return {
+        "total_duration_seconds": info.duration,
+        "track_count": len(timestamps),
         "output_dir": output_dir,
         "sample_rate": sample_rate,
         "bit_depth": bit_depth,

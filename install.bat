@@ -23,7 +23,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [1/4] Tao virtual environment (.venv)...
+echo [1/5] Tao virtual environment (.venv)...
 if not exist ".venv" (
     python -m venv .venv
     if errorlevel 1 (
@@ -35,10 +35,10 @@ if not exist ".venv" (
     echo       .venv da ton tai - bo qua.
 )
 
-echo [2/4] Nang cap pip...
+echo [2/5] Nang cap pip...
 call .venv\Scripts\python.exe -m pip install --upgrade pip
 
-echo [3/4] Cai PyTorch (CUDA 12.1 - can GPU NVIDIA)...
+echo [3/5] Cai PyTorch (CUDA 12.1 - can GPU NVIDIA)...
 echo       (Neu may KHONG co GPU NVIDIA, xoa " --index-url ..." de dung ban CPU - se cham hon)
 call .venv\Scripts\pip.exe install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 if errorlevel 1 (
@@ -46,12 +46,27 @@ if errorlevel 1 (
     call .venv\Scripts\pip.exe install torch==2.5.1
 )
 
-echo [4/4] Cai cac thu vien con lai (co the mat vai phut)...
+echo [4/5] Cai cac thu vien con lai (co the mat vai phut)...
 call .venv\Scripts\pip.exe install -r requirements.txt
 if errorlevel 1 (
     echo [LOI] Cai dependencies that bai.
     pause
     exit /b 1
+)
+
+echo [5/5] Cai trinh duyet Chromium cho Playwright (tu dong hoa Gemini/Suno)...
+call .venv\Scripts\python.exe -m playwright install chromium
+if errorlevel 1 (
+    echo [CANH BAO] Cai Chromium that bai - chay lai: .venv\Scripts\python.exe -m playwright install chromium
+)
+
+REM --- Kiem tra ffmpeg (bat buoc cho ghep video / tron nhac) ---
+ffmpeg -version >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo [CANH BAO] Khong tim thay ffmpeg trong PATH.
+    echo   Cai bang lenh:  winget install Gyan.FFmpeg
+    echo   hoac tai tu https://www.gyan.dev/ffmpeg/builds/ roi them thu muc bin vao PATH.
 )
 
 REM --- Tao file .env neu chua co ---

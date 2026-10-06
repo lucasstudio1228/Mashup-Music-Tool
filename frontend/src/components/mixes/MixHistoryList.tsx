@@ -13,8 +13,9 @@ function fmtDate(iso: string): string {
 
 function fmtDuration(sec?: number): string {
   if (!sec) return '';
-  const m = Math.floor(sec / 60);
-  const s = Math.round(sec % 60);
+  const total = Math.round(sec);   // làm tròn trước — tránh "58m 60s"
+  const m = Math.floor(total / 60);
+  const s = total % 60;
   return `${m}m ${s.toString().padStart(2, '0')}s`;
 }
 

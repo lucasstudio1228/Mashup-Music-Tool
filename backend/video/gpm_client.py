@@ -212,7 +212,32 @@ class GPMClient:
         Ưu tiên websocket_debugging_url (ws://...), fallback http://127.0.0.1:PORT.
         """
         params = dict(extra_params or {})
-        data = self._get(f"/api/v1/profiles/start/{profile_id}", params or None)
+        try:
+            data = self._get(f"/api/v1/profiles/start/{profile_id}", params or None)
+        except GPMError as exc:
+            # ProfileInUse = profile còn mở từ lần chạy trước (hoặc job trước bị
+            # dừng đột ngột). Đóng rồi bật lại 1 lần thay vì chết cả job.
+            if "profileinuse" not in str(exc).lower():
+                raise
+            # GPMLogin giải phóng profile CHẬM sau khi stop (quan sát: >6 giây) —
+            # đóng rồi thử lại nhiều lần trong ~60 giây thay vì bỏ cuộc ngay.
+            self.close_profile(profile_id)
+            data = None
+            for _ in range(6):
+                time.sleep(10)
+                try:
+                    data = self._get(f"/api/v1/profiles/start/{profile_id}",
+                                     params or None)
+                    break
+                except GPMError as exc2:
+                    if "profileinuse" not in str(exc2).lower():
+                        raise
+                    exc = exc2
+            if data is None:
+                raise GPMError(
+                    f"GPMLogin vẫn báo ProfileInUse sau ~60 giây cho profile "
+                    f"{profile_id}. Hãy đóng profile này trong GPMLogin rồi thử "
+                    f"lại. ({exc})")
         payload = data.get("data") if isinstance(data, dict) else {}
         if not isinstance(payload, dict):
             payload = {}

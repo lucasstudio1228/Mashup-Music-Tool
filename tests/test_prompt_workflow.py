@@ -39,13 +39,23 @@ class PromptWorkflowTests(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
+    SHEET = "Same adult woman, brown bob, cream cardigan."
+    PET = "Same small grey tabby cat, white paws, green eyes."
+
     def fake_generate(self, **kwargs):
-        sheet = "Same adult woman, brown bob, cream cardigan."
-        scene = "Locked wide shot, piano right, cedar window left, stable amber light."
-        kwargs["metadata_out"].update(character_sheet=sheet, scene_sheet=scene)
-        n = kwargs["image_count"]
-        return ({str(i): f"{sheet} {scene} Small visual state {i}." for i in range(n)},
-                {str(i): f"Source state {i}; subtle breathing, locked camera." for i in range(n)})
+        sheet, pet = self.SHEET, self.PET
+        kwargs["metadata_out"].update(character_sheet=sheet, pet_sheet=pet,
+                                      pet_name="Mun", palette=["#AABBCC"],
+                                      settings=[], character_bible="bible")
+        prompts = {
+            "0": f"{sheet} {pet} Clean cover, negative space left.",
+            "1": f"{sheet} MAIN CHARACTER SHEET, FRONT VIEW / SIDE VIEW / BACK VIEW.",
+            "2": f"{pet} COMPANION CREATURE SHEET, FRONT VIEW / SIDE VIEW / BACK VIEW.",
+        }
+        n = kwargs["scene_count"]
+        motions = {str(i): f"{sheet} {pet} Scene {i}: a distinct setting."
+                   for i in range(n)}
+        return prompts, motions
 
     def test_normalization_cross_project_duplicates_and_atomic_claim(self):
         catalog.claim_prompts(1, "suno", {"0": "Piano   AMBIENT"})
@@ -106,19 +116,20 @@ class PromptWorkflowTests(unittest.TestCase):
             second = workflow.prepare(1, "Cedar Rain")
             self.assertEqual(first, second)
             self.assertEqual(ai.call_count, 1)
-            self.assertEqual(len(first["motions"]), config.PARAMS.image_count)
-            self.assertIn("No fade-in", first["motions"]["0"])
+            self.assertEqual(len(first["prompts"]), config.PARAMS.image_count)
+            self.assertEqual(len(first["motions"]), config.PARAMS.total_clips)
+            self.assertIn("no cuts", first["motions"]["0"])
             self.assertTrue((config.images_dir(1, "Cedar Rain") / "prompts.json").exists())
 
     def test_partial_cache_is_rejected_and_full_restart_can_repair(self):
         with patch("backend.video.prompt_gen.generate_prompts", side_effect=self.fake_generate):
             first = workflow.prepare(1, "Cedar Rain")
-            first["prompts"].pop("40")
+            first["prompts"].pop("2")
             workflow.save_manifest(config.images_dir(1, "Cedar Rain") / "prompts.json", first)
-            with self.assertRaisesRegex(ValueError, "41"):
+            with self.assertRaisesRegex(ValueError, "đủ 3 mục"):
                 workflow.prepare(1, "Cedar Rain")
             repaired = workflow.prepare(1, "Cedar Rain", allow_rebuild=True)
-            self.assertEqual(len(repaired["prompts"]), 41)
+            self.assertEqual(len(repaired["prompts"]), config.PARAMS.image_count)
 
     def test_changed_context_does_not_mix_new_prompts_with_existing_images(self):
         with patch("backend.video.prompt_gen.generate_prompts", side_effect=self.fake_generate) as ai:
@@ -134,12 +145,18 @@ class PromptWorkflowTests(unittest.TestCase):
     def test_missing_motion_or_character_lock_is_not_silently_accepted(self):
         with patch("backend.video.prompt_gen.generate_prompts", side_effect=self.fake_generate):
             saved = workflow.prepare(1, "Cedar Rain")
+        keep = saved["motions"]["2"]
         saved["motions"].pop("2")
         with self.assertRaises(ValueError):
             workflow.validate_manifest(1, saved)
-        saved["motions"]["2"] = "restored motion"
-        saved["prompts"]["3"] = "some disconnected scene"
+        # Cảnh mất khối khoá nhân vật → clip sẽ lệch nhân vật, phải bị chặn.
+        saved["motions"]["2"] = "restored motion without any identity lock"
         with self.assertRaisesRegex(ValueError, "character_sheet"):
+            workflow.validate_manifest(1, saved)
+        # Bảng linh thú (ảnh 2) mất khối khoá pet_sheet cũng bị chặn.
+        saved["motions"]["2"] = keep
+        saved["prompts"]["2"] = "some disconnected sheet"
+        with self.assertRaisesRegex(ValueError, "pet_sheet"):
             workflow.validate_manifest(1, saved)
 
     def test_suno_plan_unique_under_limit_and_vocal_exclusions(self):
@@ -166,6 +183,7 @@ class PromptWorkflowTests(unittest.TestCase):
         driver.wait_for_new_songs.return_value = []
         selected = [0]
         with patch.object(suno_service, "_touch"), \
+                patch.object(suno_service, "_throttle_inflight"), \
                 patch.object(suno_service, "_count", side_effect=lambda *a, **k: selected[0]), \
                 patch.object(suno_service, "_mark_selection", side_effect=lambda *a: selected.__setitem__(0, selected[0]+1)):
             suno_service._generate_until_target(None, batch,
@@ -173,12 +191,30 @@ class PromptWorkflowTests(unittest.TestCase):
         self.assertEqual(driver.click_create.call_count, 3)
         self.assertEqual([c.args[0] for c in driver.fill_styles.call_args_list], [p["styles"] for p in plan])
 
-    def test_actual_ai_parser_requires_and_prepends_both_locks(self):
+    def test_actual_ai_parser_builds_three_sheets_and_locks_every_scene(self):
         from backend.video.prompt_gen import generate_prompts
-        payload = {"character_sheet": "The same adult woman wearing a cream cardigan.",
-                   "scene_sheet": "A locked wide frame, piano right, window left, amber light.",
-                   "prompts": {"0": "Clean thumbnail.", "1": "Small rain variation."},
-                   "motions": {"0": "Still camera.", "1": "Small finger motion."}}
+        payload = {
+            "character_bible": "A pianist and her cat in a cedar room.",
+            "character_sheet": "The same adult woman wearing a cream cardigan.",
+            "main_subject": "Slim adult woman, 6.5 heads tall, relaxed stance.",
+            "main_expressions": ["NEUTRAL — calm", "CALM — eyes half shut"],
+            "main_insets": ["HAIR DETAIL — bob", "HANDS — long fingers",
+                            "CARDIGAN — cream wool", "SHOES — felt slippers"],
+            "main_scale": "HEIGHT 1.62 m",
+            "pet_name": "Mun",
+            "pet_sheet": "The same small grey tabby cat with white paws.",
+            "pet_subject": "Small tabby cat, rounded body, upright ears.",
+            "pet_expressions": ["NEUTRAL — still", "ALERT — ears up"],
+            "pet_insets": ["HEAD — round", "EARS — upright", "PAWS — white",
+                           "TAIL — striped"],
+            "pet_scale": "SIZE MAP: 1.62 m woman vs 25 cm cat",
+            "pet_traits": ["CURIOUS — follows the music"],
+            "palette": ["#F0E6D2 — cream", "#6E7F6B — sage", "#3A2E28 — brown"],
+            "thumbnail": ("Clean cover art with the woman on the right and her cat, "
+                          "wide negative space on the left half, no text at all."),
+            "scenes": [{"setting": "rain garden", "prompt": "Rain garden at dusk."},
+                       {"setting": "night lake", "prompt": "Still lake under stars."}],
+        }
         client = Mock()
         client.chat.completions.create.return_value = SimpleNamespace(choices=[SimpleNamespace(
             message=SimpleNamespace(content=json.dumps(payload)), finish_reason="stop")])
@@ -188,9 +224,27 @@ class PromptWorkflowTests(unittest.TestCase):
             result = generate_prompts("pianist", "Cedar", "Zen", 2, "16:9", "2d", api,
                                       creative_brief="shared signature", metadata_out=metadata)
         self.assertIsNotNone(result)
-        for value in result[0].values():
+        prompts, scenes = result
+        # ĐÚNG 3 ảnh, mỗi ảnh mang khối khoá của chính nó.
+        self.assertEqual(set(prompts), {"0", "1", "2"})
+        self.assertIn(payload["character_sheet"], prompts["1"])
+        self.assertIn(payload["pet_sheet"], prompts["2"])
+        for key in ("0", "1", "2"):
+            for lock in ("character_sheet", "pet_sheet"):
+                if lock == "character_sheet" and key == "2":
+                    continue
+                if lock == "pet_sheet" and key == "1":
+                    continue
+                self.assertIn(payload[lock], prompts[key])
+        self.assertIn("FRONT VIEW", prompts["1"])
+        self.assertIn("SIZE MAP", prompts["2"])
+        # MỌI prompt cảnh mang CẢ HAI khối khoá → 2 clip cùng nhân vật, khác cảnh.
+        self.assertEqual(set(scenes), {"0", "1"})
+        for value in scenes.values():
             self.assertIn(payload["character_sheet"], value)
-            self.assertIn(payload["scene_sheet"], value)
+            self.assertIn(payload["pet_sheet"], value)
+        self.assertEqual(metadata["pet_name"], "Mun")
+        self.assertEqual(metadata["settings"], ["rain garden", "night lake"])
         request = client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
         self.assertIn("SHUFFLE-SAFE", request)
         self.assertIn("shared signature", request)

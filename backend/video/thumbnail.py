@@ -27,6 +27,57 @@ _SUBTITLE_FONTS = [
     "C:/Windows/Fonts/arial.ttf",      # Arial
 ]
 
+# Danh mục font TIÊU ĐỀ cho bộ chọn ở tab Video (chữ tiếng Anh). Lựa chọn lưu
+# chung cho mọi project trong video_overrides.json → "thumbnail_font".
+_WF = "C:/Windows/Fonts/"
+FONT_CATALOG: list[dict] = [
+    {"key": "segoe_script_bold", "label": "Segoe Script Bold",
+     "note": "Viết tay tròn, dễ đọc", "file": _WF + "segoescb.ttf"},
+    {"key": "mistral", "label": "Mistral",
+     "note": "Nét cọ phóng, thư pháp mạnh", "file": _WF + "MISTRAL.TTF"},
+    {"key": "brush_script", "label": "Brush Script",
+     "note": "Bút lông nghiêng, mềm", "file": _WF + "BRUSHSCI.TTF"},
+    {"key": "lucida_calligraphy", "label": "Lucida Calligraphy",
+     "note": "Thư pháp cổ điển, sang", "file": _WF + "LCALLIG.TTF"},
+    {"key": "vivaldi", "label": "Vivaldi",
+     "note": "Thư pháp hoa mỹ", "file": _WF + "VIVALDII.TTF"},
+    {"key": "papyrus", "label": "Papyrus",
+     "note": "Cổ, thô ráp", "file": _WF + "PAPYRUS.TTF"},
+    {"key": "ink_free", "label": "Ink Free",
+     "note": "Bút mực tự do", "file": _WF + "Inkfree.ttf"},
+    {"key": "rage_italic", "label": "Rage Italic",
+     "note": "Bút sắt nghiêng, gân guốc", "file": _WF + "RAGE.TTF"},
+    {"key": "kunstler_script", "label": "Kunstler Script",
+     "note": "Thư pháp Âu, rất mảnh", "file": _WF + "KUNSTLER.TTF"},
+    {"key": "old_english", "label": "Old English",
+     "note": "Gothic cổ, kiểu trung cổ", "file": _WF + "OLDENGL.TTF"},
+    {"key": "segoe_ui_bold", "label": "Segoe UI Bold",
+     "note": "Không chân, đậm, hiện đại", "file": _WF + "segoeuib.ttf"},
+]
+DEFAULT_FONT_KEY = "segoe_script_bold"
+
+
+def font_entry(key: str | None) -> dict | None:
+    return next((f for f in FONT_CATALOG if f["key"] == key), None)
+
+
+def selected_font_key() -> str:
+    """Font tiêu đề đang chọn (video_overrides.json → thumbnail_font)."""
+    try:
+        from . import config
+        key = config.load_overrides().get("thumbnail_font")
+    except Exception:
+        key = None
+    f = font_entry(key)
+    if f and Path(f["file"]).exists():
+        return key
+    return DEFAULT_FONT_KEY
+
+
+def _selected_title_fonts() -> list[str]:
+    f = font_entry(selected_font_key())
+    return ([f["file"]] if f else []) + _TITLE_FONTS
+
 # Bảng màu chữ 3D "hấp dẫn": mặt chữ gradient VÀNG GOLD ấm (nổi bật trên nền
 # healing xanh), thân 3D teal đậm, viền tối sắc nét, quầng sáng ấm. Có thể chỉnh
 # qua overrides.json (title_face_top/title_face_bottom/title_extrude/...).
@@ -101,6 +152,24 @@ def _wrap(text: str, font, draw, max_w: int) -> list[str]:
     return lines
 
 
+def _fit_wrapped(candidates: list[str], text: str, draw, max_w: int,
+                 start_size: int, max_lines: int = 3, min_size: int = 14):
+    """Cỡ font lớn nhất để `text` ngắt thành ≤ max_lines dòng, mỗi dòng vừa
+    max_w. Trả (font, lines) hoặc (None, [])."""
+    size = start_size
+    while size >= min_size:
+        font = _load_font(candidates, size)
+        if font is None:
+            return None, []
+        lines = _wrap(text, font, draw, max_w)
+        if (len(lines) <= max_lines
+                and all(draw.textlength(ln, font=font) <= max_w for ln in lines)):
+            return font, lines
+        size -= 2
+    font = _load_font(candidates, min_size)
+    return font, (_wrap(text, font, draw, max_w) if font else [])
+
+
 def _compose_title(base, title: str, subtitle: str, tf: list[str],
                    sf: list[str]):
     """Vẽ lớp tối gradient + tiêu đề (viền + bóng mềm) lên ảnh RGBA `base`.
@@ -129,11 +198,12 @@ def _compose_title(base, title: str, subtitle: str, tf: list[str],
 
     draw = ImageDraw.Draw(base)
 
-    # 2) Chọn cỡ + ngắt dòng tiêu đề
-    title_font = _fit_font(tf, title, text_max_w, int(H * 0.16))
+    # 2) Chọn cỡ + ngắt dòng tiêu đề: cỡ LỚN NHẤT mà ngắt được ≤ 3 dòng (tiêu
+    # đề dài ép 1 dòng thì chữ bé, mất chất "thư pháp").
+    title_font, title_lines = _fit_wrapped(tf, title, draw, text_max_w,
+                                           int(H * 0.16), max_lines=3)
     if title_font is None:
         return None
-    title_lines = _wrap(title, title_font, draw, text_max_w)
 
     sub_font = None
     sub_lines: list[str] = []
@@ -277,7 +347,7 @@ def render_title(
         _log(f"thumbnail: thiếu Pillow ({e}) — bỏ qua overlay")
         return False
 
-    tf = title_fonts or _TITLE_FONTS
+    tf = title_fonts or _selected_title_fonts()
     sf = subtitle_fonts or _SUBTITLE_FONTS
 
     try:
@@ -293,6 +363,31 @@ def render_title(
     except Exception as e:
         _log(f"thumbnail: lỗi overlay ({type(e).__name__}: {e}) — giữ ảnh gốc")
         return False
+
+
+def render_font_preview(font_key: str, out_path: str | Path, title: str,
+                        subtitle: str = "", background: str | Path | None = None,
+                        max_w: int = 720) -> bool:
+    """Ảnh mẫu JPEG cho bộ chọn font: vẽ tiêu đề bằng ĐÚNG `font_key` lên ảnh bìa
+    của project (hoặc nền gradient tối nếu chưa có ảnh bìa)."""
+    f = font_entry(font_key)
+    if not f or not Path(f["file"]).exists():
+        return False
+    from PIL import Image
+    if background and Path(background).exists():
+        base = Image.open(background).convert("RGBA")
+    else:
+        base = _vgrad_region(1280, 720, 0, 720, (32, 58, 52), (8, 16, 14)
+                             ).convert("RGBA")
+    out = _compose_title(base, (title or "Healing Music").strip(), subtitle,
+                         [f["file"]] + _TITLE_FONTS, _SUBTITLE_FONTS)
+    if out is None:
+        return False
+    out = out.convert("RGB")
+    out.thumbnail((max_w, max_w))
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    out.save(out_path, format="JPEG", quality=85)
+    return True
 
 
 def render_title_overlay_png(
@@ -326,7 +421,7 @@ def render_title_overlay_png(
         _log(f"thumbnail: thiếu Pillow ({e}) — bỏ qua overlay intro")
         return False
 
-    tf = title_fonts or _TITLE_FONTS
+    tf = title_fonts or _selected_title_fonts()
     sf = subtitle_fonts or _SUBTITLE_FONTS
     try:
         base = Image.new("RGBA", (width, height), (0, 0, 0, 0))

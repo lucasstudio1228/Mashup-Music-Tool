@@ -18,6 +18,8 @@ from backend.routers.stems import router as stems_router        # noqa: E402
 from backend.routers.video import router as video_router        # noqa: E402
 from backend.routers.youtube import router as youtube_router    # noqa: E402
 from backend.routers.suno import router as suno_router          # noqa: E402
+from backend.routers.track_qc import router as track_qc_router  # noqa: E402
+from backend.routers.tasks import router as tasks_router        # noqa: E402
 from backend.stem_job_manager import stem_job_manager           # noqa: E402
 from backend.video.job_manager import video_job_manager         # noqa: E402
 
@@ -54,6 +56,8 @@ app.include_router(stems_router)   # đã có prefix="/api" nội bộ
 app.include_router(video_router)   # đã có prefix nội bộ
 app.include_router(youtube_router) # đã có prefix="/api/youtube" nội bộ
 app.include_router(suno_router)    # STEP 0 — Suno; prefix nội bộ
+app.include_router(track_qc_router)  # rà soát track lẻ + tạo lại Suno + vá mix
+app.include_router(tasks_router)     # thanh tác vụ toàn cục (chỉ đọc)
 
 
 @app.get("/api/health")
@@ -73,9 +77,16 @@ if (_FRONTEND_DIST / "index.html").exists():
     if _assets_dir.exists():
         app.mount("/assets", StaticFiles(directory=str(_assets_dir)), name="assets")
 
+    # index.html KHÔNG được cache: mỗi lần `npm run build` tên file assets đổi
+    # (hash) → index.html cũ trong cache trỏ tới asset đã xoá → 404 trắng trang.
+    _NO_CACHE = {"Cache-Control": "no-cache, no-store, must-revalidate"}
+
+    def _index_response():
+        return FileResponse(str(_FRONTEND_DIST / "index.html"), headers=_NO_CACHE)
+
     @app.get("/")
     def _serve_index():
-        return FileResponse(str(_FRONTEND_DIST / "index.html"))
+        return _index_response()
 
     # SPA catch-all: file tĩnh thì trả file, còn lại trả index.html
     @app.get("/{full_path:path}")
@@ -83,4 +94,4 @@ if (_FRONTEND_DIST / "index.html").exists():
         candidate = _FRONTEND_DIST / full_path
         if candidate.is_file():
             return FileResponse(str(candidate))
-        return FileResponse(str(_FRONTEND_DIST / "index.html"))
+        return _index_response()

@@ -36,3 +36,16 @@ Thumbs.db
 
 # TS build cache
 *.tsbuildinfo
+
+# Ho so trinh duyet / phien dang nhap (TUYET DOI khong day len)
+.browser_profile*/
+*.cookies
+storage_state*.json
+
+# Log + file rac
+*.log
+/0.05
+
+# Script do live trinh duyet (chi dung khi phat trien)
+tests/_probe_*.py
+tests/_run_*.py

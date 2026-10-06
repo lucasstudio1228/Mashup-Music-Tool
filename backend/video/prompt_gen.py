@@ -1,14 +1,22 @@
 """
 video/prompt_gen.py — Dùng OpenAI GPT để biến IDEA của người dùng thành bộ
-prompt ảnh liên kết cho một "phim hoạt hình ngắn" chill/relaxing.
+prompt cho quy trình 3 ẢNH → N CLIP (mặc định 20).
 
 Đầu ra: (prompts, motions), cùng hồ sơ continuity cho caller lưu.
-- Ảnh 0  : nền thumbnail 16:9 SẠCH; chữ được overlay khi ghép.
-- Ảnh 1..: các shot nối tiếp, KHÔNG chữ, giữ NGUYÊN nhân vật/bối cảnh/bảng màu.
+- prompts: ĐÚNG 3 prompt ảnh (Gemini)
+    "1" = BẢN PHÂN TÍCH NHÂN VẬT CHÍNH (main character model sheet): turnaround
+          trước/nghiêng/sau + hàng biểu cảm + các ô cận cảnh (trang phục, nhạc
+          cụ, đạo cụ) + dải bảng màu, có nhãn chữ IN HOA tiếng Anh.
+    "2" = BẢN PHÂN TÍCH LINH THÚ / THÚ CƯNG (pet character sheet) cùng kiểu, kèm
+          SIZE MAP so sánh tỉ lệ với người.
+    "0" = ẢNH BÌA (thumbnail) — tạo 1 lần duy nhất, SẠCH chữ, chừa nửa trái.
+- motions: ĐÚNG N prompt CẢNH + CHUYỂN ĐỘNG cho Flow/Veo. Cả N clip dùng CHUNG
+  hai character sheet làm nguyên liệu (ingredients) nên nhân vật & linh thú giữ
+  nguyên; mỗi prompt tả một BỐI CẢNH KHÁC NHAU.
 
-Mọi prompt là "tự chứa" (self-contained): mỗi prompt tự mô tả lại nhân vật &
-bối cảnh, vì Gemini web không nhớ ngữ cảnh giữa các lượt → nhờ vậy nhân vật
-đồng bộ xuyên suốt.
+Khung bố cục của hai model sheet do CODE dựng (hàm `_model_sheet_prompt`), AI
+chỉ điền nội dung riêng của nhân vật — nhờ vậy mọi project ra đúng một kiểu
+trang thay vì phụ thuộc may rủi của model.
 
 An toàn: thiếu API key / lỗi mạng / JSON hỏng → None; workflow dừng trước
 khi mở công cụ tạo media, không thay ý tưởng bằng cảnh mặc định.
@@ -19,6 +27,66 @@ import json
 import re
 from typing import Optional
 
+from . import music_spec
+from .translate import TranslationError, non_english_fields, to_english
+
+# Số clip (= số bối cảnh) mặc định nếu caller không truyền. Giữ khớp
+# config.VideoParams.scene_clips.
+DEFAULT_SCENE_COUNT = 20
+
+# Tỉ lệ cảnh tối thiểu phải nhắc ĐÚNG nhạc cụ của project (người dùng chốt: làm
+# nhạc piano thì nhân vật phải đánh piano, không phải gõ laptop/ôm guitar).
+MIN_INSTRUMENT_SCENE_RATIO = 0.6
+
+
+def _instrument_coverage(scenes: dict[str, str] | None, spec) -> float:
+    if not spec or not scenes:
+        return 1.0
+    hits = sum(1 for v in scenes.values() if music_spec.mentions_instrument(v, spec))
+    return hits / max(1, len(scenes))
+
+
+def _scene_bodies(raw) -> dict[str, str]:
+    """Phần SCENE do AI viết (chưa gắn khối khoá) — để đo độ phủ nhạc cụ."""
+    if isinstance(raw, list):
+        return {str(i): (it.get("prompt") if isinstance(it, dict) else it) or ""
+                for i, it in enumerate(raw)}
+    if isinstance(raw, dict):
+        return {str(k): (v.get("prompt") if isinstance(v, dict) else v) or ""
+                for k, v in raw.items()}
+    return {}
+
+
+def _misuse_count(bodies: dict, spec) -> int:
+    return sum(_instrument_misuse(b, spec) for b in bodies.values() if isinstance(b, str))
+
+
+def _drop_misuse_sentences(text: str, spec) -> str:
+    """Bỏ riêng các câu tả nhạc cụ sai thực tế (dùng khi đã hết lượt viết lại)."""
+    sents = re.split(r"(?<=[.!?])\s+", text or "")
+    kept = [x for x in sents if not _instrument_misuse(x, spec)]
+    return " ".join(kept).strip() or (text or "")
+
+
+def _without_misuse(raw, spec):
+    """Bản sao 'scenes' (list/dict như AI trả) đã bỏ câu tả nhạc cụ sai."""
+    def fix(item):
+        if isinstance(item, dict):
+            p = item.get("prompt")
+            return {**item, "prompt": _drop_misuse_sentences(p, spec)} if isinstance(p, str) else item
+        return _drop_misuse_sentences(item, spec) if isinstance(item, str) else item
+    if isinstance(raw, list):
+        return [fix(x) for x in raw]
+    if isinstance(raw, dict):
+        return {k: fix(v) for k, v in raw.items()}
+    return raw
+
+
+def _resolve_instrument(instrument: str, idea: str, api_config, log):
+    """Nhạc cụ project: tham số > khoá 'instrument' trong JSON ngữ cảnh."""
+    name = (instrument or "").strip() or music_spec.instrument_from_context(idea)
+    return music_spec.resolve_instrument(name, api_config, log) if name else None
+
 
 def _is_photoreal(style: str | None) -> bool:
     """Phong cách tả thực (photoreal) hay hoạt hình? Nhận diện từ chuỗi brief."""
@@ -28,35 +96,36 @@ def _is_photoreal(style: str | None) -> bool:
 
 def _system_for(style_brief: str) -> str:
     if _is_photoreal(style_brief):
-        medium = "PHIM ĐIỆN ẢNH TẢ THỰC"
+        medium = "PHOTOREALISTIC CINEMATIC FILM"
         rule1 = (
-            f"'{style_brief}' — BẮT BUỘC tả thực điện ảnh / photorealistic như "
-            "ẢNH CHỤP / PHIM THẬT (da/vải/tóc/lông/chất liệu chi tiết chân thực, "
-            "ánh sáng điện ảnh, chiều sâu trường ảnh). TUYỆT ĐỐI KHÔNG hoạt "
-            "hình, KHÔNG cartoon/anime, KHÔNG tranh vẽ 2D phẳng, KHÔNG 3D cách "
-            "điệu kiểu Pixar/Disney. Khi tả nhân vật/vật liệu, luôn tả CHÂN "
-            "THỰC như đời thật. "
+            f"'{style_brief}' — it MUST be cinematic photorealism that looks like "
+            "a REAL PHOTOGRAPH / LIVE-ACTION FILM (true-to-life skin, fabric, hair, "
+            "fur and material detail, cinematic lighting, depth of field). "
+            "ABSOLUTELY NO animation, NO cartoon/anime, NO flat 2D illustration, "
+            "NO stylised Pixar/Disney-like 3D. Always describe characters and "
+            "materials as they look in real life. "
         )
     else:
-        medium = "PHIM HOẠT HÌNH"
+        medium = "ANIMATED FILM"
         rule1 = (
-            f"'{style_brief}' — TUYỆT ĐỐI KHÔNG photorealistic, KHÔNG ảnh chụp "
-            "thật, KHÔNG người/da/vải/tóc chân thực như đời thật, KHÔNG "
-            "hyperrealism. Khi tả nhân vật/vật liệu, luôn tả theo NGÔN NGỮ của "
-            "phong cách hoạt hình đã chọn, không tả như người/vật thật. "
+            f"'{style_brief}' — ABSOLUTELY NOT photorealistic, NOT a real "
+            "photograph, NO lifelike human skin/fabric/hair, NO hyperrealism. "
+            "Always describe characters and materials in the VISUAL LANGUAGE of "
+            "the chosen animation style, never as real people or objects. "
         )
     return (
-        "Bạn là đạo diễn hình ảnh cấp cao (senior visual director) chuyên "
-        f"{medium} ({style_brief}) chill/relaxing/meditation/lofi. Bạn có tư "
-        "duy điện ảnh (cinematic thinking): mỗi shot là một KHUNG HÌNH PHIM có "
-        "MỤC ĐÍCH kể chuyện — không phải miêu tả khô khan. Bạn đồng thời là đạo "
-        "diễn CHUYỂN ĐỘNG: với mỗi ảnh, hình dung nó sẽ được làm động thành clip "
-        "8s và viết prompt chuyển động hợp logic vật lý, tinh tế, thiền. "
-        f"NGUYÊN TẮC TỐI THƯỢNG 1: mọi shot BẮT BUỘC đúng phong cách {rule1}"
-        "NGUYÊN TẮC TỐI THƯỢNG 2: phải BÁM SÁT ý tưởng người dùng (đúng nhân "
-        "vật, đạo cụ, bối cảnh, hành động); TUYỆT ĐỐI không thay bằng nhân "
-        "vật/bối cảnh mặc định nào khác. Bạn CHỈ trả về JSON hợp lệ, không kèm "
-        "giải thích, không markdown."
+        "You are a senior visual director specialising in "
+        f"{medium} ({style_brief}) for chill / relaxing / meditation / lofi "
+        "content. You think cinematically: every shot is a FILM FRAME with a "
+        "storytelling PURPOSE, not a dry description. You are also a MOTION "
+        "director: for every image, imagine it animated into an 8-second clip and "
+        "write motion that is physically plausible, subtle and meditative. "
+        f"SUPREME RULE 1: every shot MUST follow the style {rule1}"
+        "SUPREME RULE 2: stay FAITHFUL to the user's idea (the exact characters, "
+        "props, setting and actions); NEVER replace them with any default "
+        "character or setting. WRITE EVERYTHING IN ENGLISH ONLY — every value in "
+        "the JSON must be English (no other language, no diacritics). Return "
+        "ONLY valid JSON, no explanation, no markdown."
     )
 
 # Model dự phòng khi cấu hình lỡ để tên model của Claude cũ.
@@ -68,307 +137,620 @@ _FALLBACK_MODEL = "gpt-4o-mini"
 _MAX_ATTEMPTS = 3
 
 
-def _act_ranges(n: int) -> str:
-    """Chia shot cảnh (1..n-1) thành 4 hồi theo tỉ lệ, mô tả ĐỘNG theo n.
-    Giữ đúng tỉ lệ của bản 20 shot cũ (intro ~21%, hành trình ~42%, cao trào
-    ~26%, outro phần còn lại) để phim dài (41 shot) vẫn có nhịp hợp lý."""
-    m = n - 1                                   # số shot cảnh (bỏ shot 0)
-    if m < 4:
-        return f"toàn bộ shot 1–{n - 1} kể liền một mạch"
-    e1 = max(1, round(m * 0.21))                # kết hồi 1
-    e2 = max(e1 + 1, round(m * 0.63))           # kết hồi 2
-    e3 = max(e2 + 1, round(m * 0.89))           # kết hồi 3
-    e3 = min(e3, m - 1)                          # chừa ít nhất 1 shot cho outro
-    return (f"GIỚI THIỆU (shot 1–{e1}) → HÀNH TRÌNH / PHÁT TRIỂN "
-            f"({e1 + 1}–{e2}) → CAO TRÀO / ĐÍCH ĐẾN ({e2 + 1}–{e3}) → "
-            f"LẮNG ĐỌNG / OUTRO ({e3 + 1}–{n - 1})")
+def _bullets(items, prefix: str = "   – ") -> str:
+    return "\n".join(f"{prefix}{str(x).strip()}" for x in items if str(x).strip())
+
+
+def _text(v) -> str:
+    """Chuỗi đã trim; mọi kiểu khác (None/số/dict) → ''."""
+    return v.strip() if isinstance(v, str) else ""
+
+
+def _str_list(v, min_len: int = 1, max_len: int = 12) -> list[str]:
+    """Danh sách chuỗi đã làm sạch; trả [] nếu không đủ min_len phần tử.
+
+    Model hay trả list of dict ({"label": ..., "hex": ...}) → gộp value lại
+    thành một dòng thay vì vứt cả mục.
+    """
+    if isinstance(v, str):
+        v = [line for line in v.splitlines() if line.strip()]
+    if not isinstance(v, (list, tuple)):
+        return []
+    out: list[str] = []
+    for item in v:
+        if isinstance(item, dict):
+            item = " — ".join(str(x).strip() for x in item.values() if str(x).strip())
+        s = str(item).strip().lstrip("-•– ").strip()
+        if s:
+            out.append(s)
+    if len(out) < min_len:
+        return []
+    return out[:max_len]
+
+
+def _settings_of(scenes) -> list[str]:
+    """Rút danh sách bối cảnh (để lưu vào manifest & tránh lặp khi sinh bù)."""
+    if not isinstance(scenes, (list, tuple)):
+        return []
+    out: list[str] = []
+    for s in scenes:
+        if isinstance(s, dict):
+            val = _text(s.get("setting")) or _text(s.get("prompt"))[:80]
+            if val:
+                out.append(val)
+    return out
+
+
+# ── Bảng nhân vật CHỈ vẽ NGƯỜI (yêu cầu 2026-10-02) ──────────────────────
+# Gemini từng vẽ laptop cạnh FRONT VIEW và một "cây đàn piano" méo sau BACK
+# VIEW: AI viết "Instrument: …" + "Props: silver laptop…" vào khối danh tính →
+# khối này được dán vào MỌI khung của bảng. Nay: khối danh tính chỉ còn cơ thể
+# + trang phục; nhạc cụ có ô INSTRUMENT REFERENCE riêng, quần áo có ô OUTFIT
+# REFERENCE riêng, đồ vật chỉ xuất hiện trong prompt CẢNH.
+_PROP_WORDS = re.compile(
+    r"\b(?:laptops?|computers?|monitors?|screens?|(?:smart)?phones?|tablets?|"
+    r"books?|notebooks?|journals?|papers?|sheet music|pens?|pencils?|desks?|"
+    r"tables?|chairs?|stools?|benches|bench|sofas?|couch(?:es)?|cushions?|cups?|"
+    r"mugs?|teacups?|teapots?|bottles?|lanterns?|candles?|gourds?|bags?|"
+    r"backpacks?|satchels?|baskets?|umbrellas?|keyboards?|lamps?|props?|"
+    r"prayer beads|staffs?|walking sticks?|headphones?)\b", re.I)
+_OBJECT_LABEL = re.compile(
+    r"^\s*(?:instruments?|props?|items?|objects?|held items?|equipment|devices?)\s*:", re.I)
+_INSET_DROP_HEADS = ("INSTRUMENT", "PROP", "ITEM", "OBJECT", "EQUIPMENT", "DEVICE")
+# Alias quá ngắn/đa nghĩa ("hang" = handpan) không dùng để lọc câu.
+_AMBIGUOUS_ALIASES = {"hang", "fiddle", "lute"}
+
+
+def _instrument_words_re(spec) -> re.Pattern:
+    words = {a.lower() for it in music_spec.INSTRUMENTS for a in it["aliases"]}
+    words |= {it["label"].lower() for it in music_spec.INSTRUMENTS}
+    if spec:
+        words |= {spec["label"].lower(), *(a.lower() for a in spec.get("aliases", []))}
+    words |= {"instrument", "instruments", "guitar", "ukulele", "saxophone"}
+    words -= _AMBIGUOUS_ALIASES
+    alt = "|".join(sorted((re.escape(w) for w in words if w), key=len, reverse=True))
+    return re.compile(rf"\b(?:{alt})s?\b", re.I)
+
+
+def _strip_objects(text: str, spec=None, *, instruments: bool = True) -> str:
+    """Bỏ mọi câu/vế nhắc ĐỒ VẬT (và nhạc cụ nếu `instruments`) — giữ cơ thể,
+    khuôn mặt, tóc, trang phục và phụ kiện ĐEO trên người."""
+    inst_re = _instrument_words_re(spec) if instruments else None
+    out: list[str] = []
+    for line in (text or "").splitlines():
+        kept: list[str] = []
+        for sent in re.split(r"(?<=[.;!?])\s+", line):
+            if not sent.strip() or _OBJECT_LABEL.match(sent):
+                continue
+            parts = [part for part in re.split(r",\s*", sent)
+                     if part.strip() and not _PROP_WORDS.search(part)
+                     and not (inst_re and inst_re.search(part))]
+            if not parts:
+                continue
+            clean = ", ".join(parts).strip()
+            if clean[-1] not in ".;!?":
+                clean += "."
+            kept.append(clean)
+        if kept:
+            out.append(" ".join(kept))
+    return "\n".join(out).strip()
+
+
+def _split_head(item: str) -> tuple[str, str]:
+    for sep in ("—", " - ", ":"):
+        if sep in item:
+            head, body = item.split(sep, 1)
+            return head.strip(), body.strip()
+    return "", item.strip()
+
+
+def _split_main_insets(insets: list[str], spec) -> tuple[list[str], str]:
+    """(ô cận cảnh CHỈ cơ thể/trang phục, mô tả nhạc cụ cho ô INSTRUMENT REFERENCE).
+    Ô nhạc cụ sai (vd guitar ở project piano) bị bỏ; ô đồ vật bị bỏ."""
+    callouts: list[str] = []
+    inst_desc = ""
+    for item in insets:
+        head, body = _split_head(item)
+        up = head.upper()
+        if "INSTRUMENT" in up:
+            if not inst_desc and (not spec or music_spec.mentions_instrument(item, spec)):
+                inst_desc = body
+            continue
+        if any(h in up for h in _INSET_DROP_HEADS):
+            continue
+        body = _strip_objects(body, spec)
+        if body:
+            callouts.append(f"{head} — {body}" if head else body)
+    return callouts, inst_desc
+
+
+def _instrument_identity(spec) -> str:
+    """Dòng NHẠC CỤ (code tự viết, đúng thực tế) nối sau khối danh tính trong ảnh
+    bìa + prompt cảnh — KHÔNG có trong bảng nhân vật (turnaround tay không)."""
+    if not spec:
+        return ""
+    name = spec["label"].lower()
+    line = (f"INSTRUMENT ({spec['label']}): {spec['visual']}. Whenever playing, the "
+            f"character is {spec['pose']}.")
+    if not spec["portable"]:
+        line += (f" The {name} is a large fixed instrument: the character sits at it "
+                 f"and never holds, lifts or carries it"
+                 f"{'; ' + spec['placement'] if spec.get('placement') else ''}.")
+    return line
+
+
+def _identity_with_instrument(sheet: str, spec) -> str:
+    sheet = (sheet or "").strip()
+    line = _instrument_identity(spec)
+    if not line or "INSTRUMENT (" in sheet:
+        return sheet
+    return f"{sheet}\n{line}"
+
+
+_HOLD_VERBS = (r"(?:hold|holds|holding|held|carry|carries|carrying|carried|cradl\w*|"
+               r"hug|hugs|hugging|clutch\w*|lift|lifts|lifting|lifted)")
+_GAP_WORD = (r"(?:(?!(?:hands?|fingers?|wrists?|palms?|over|above|near|beside|by|at|to|"
+             r"toward|towards|from|on|onto|in|next)\b)[\w'-]+\s+)")
+_FIXED_SPOT = r"(?:desk|table|lap|shelf|windowsill|counter|nightstand|bed)"
+
+
+def _instrument_misuse(text: str, spec) -> bool:
+    """Prompt tả SAI thực tế với nhạc cụ cố định: cầm/bê/ôm piano, piano trên
+    bàn hay trong lòng… (ảnh bìa project 11: "piano and laptop are on the desk")."""
+    if not spec or spec["portable"] or not text:
+        return False
+    names = {spec["label"].lower(), *(a.lower() for a in spec.get("aliases", []))}
+    names -= _AMBIGUOUS_ALIASES
+    alt = "|".join(sorted((re.escape(n) for n in names if n), key=len, reverse=True))
+    t = text.lower()
+    if re.search(rf"\b{_HOLD_VERBS}\s+{_GAP_WORD}{{0,3}}(?:{alt})s?\b", t):
+        return True
+    if re.search(rf"\b(?:{alt})s?\s+(?:[\w'-]+\s+){{0,3}}(?:in|into)\s+"
+                 rf"(?:her|his|their|both)\s+(?:hands|arms)\b", t):
+        return True
+    if spec.get("placement") and re.search(
+            rf"\b(?:{alt})s?\b(?:\s+and\s+(?:a\s+|an\s+|the\s+|her\s+|his\s+)?[\w-]+)?"
+            rf"\s+(?:(?:is|are|sits|sit|rests|rest|placed|sitting|resting|lies|lying|"
+            rf"stands|standing)\s+)?(?:on|atop|upon)\s+(?:the|a|her|his|their)\s+"
+            rf"(?:[\w-]+\s+)?{_FIXED_SPOT}\b", t):
+        return True
+    return False
+
+
+def _instrument_sheet_parts(spec, detail: str = "") -> tuple[list[str], str]:
+    """(ô bổ sung, luật vẽ) cho NHẠC CỤ trên bảng nhân vật chính.
+
+    Nhạc cụ KHÔNG nằm trong turnaround 360° (luôn tay không) mà có hai ô riêng:
+    INSTRUMENT REFERENCE (nhạc cụ đứng một mình, đúng tỉ lệ thật) + PLAYING POSE
+    (cùng nhân vật ở tư thế chơi đúng — piano: ngồi ghế đàn, đàn đứng trên sàn)."""
+    if not spec:
+        if not detail:
+            return [], ""
+        return ([f'INSTRUMENT REFERENCE — a separate box labelled "INSTRUMENT REFERENCE": '
+                 f"the instrument ALONE (no person), realistic real-world proportions: "
+                 f"{detail}"],
+                "• The instrument appears ONLY in the INSTRUMENT REFERENCE box — never "
+                "in the turnaround, expressions or detail callouts.")
+    name = spec["label"].lower()
+    extra = f" {detail.rstrip('.')}." if detail else ""
+    ref = (f'INSTRUMENT REFERENCE — a separate box labelled "INSTRUMENT REFERENCE": the '
+           f"{name} ALONE (no person), drawn like the real instrument with correct "
+           f"real-world size, proportions and construction: {spec['visual']}.{extra}")
+    if spec["portable"]:
+        place = f"The {name} is held only in its correct playing position"
+    else:
+        place = (f"The {name} is a large fixed instrument: the character SITS at it to "
+                 f"play and never holds, lifts or carries it"
+                 f"{'; ' + spec['placement'] if spec.get('placement') else ''}")
+    pose = (f'PLAYING POSE — a separate larger box labelled "PLAYING POSE": the same '
+            f"character {spec['pose']} — {spec['visual']}. {place}. Correct hand "
+            f"placement, natural fingers, realistic scale between the person and the {name}.")
+    others = ", ".join(music_spec.other_instruments(spec))
+    rule = (f"• INSTRUMENT LOCK: the ONLY musical instrument on this sheet is the "
+            f"{spec['label'].upper()}. It appears ONLY in the INSTRUMENT REFERENCE box "
+            f"and the PLAYING POSE box — never in the turnaround, the expressions or the "
+            f"detail callouts. {place}. Do NOT draw any other instrument ({others}).")
+    return [ref, pose], rule
+
+
+def _model_sheet_prompt(*, title_en: str, subject: str, insets,
+                        palette, scale_note: str, expressions,
+                        extra_sections=None, aspect_ratio: str = "16:9",
+                        instrument_spec=None, kind: str = "main",
+                        outfit_items=None, instrument_detail: str = "") -> str:
+    """Dựng prompt cho MỘT tấm "bảng phân tích nhân vật" (character model sheet).
+
+    Khung bố cục cố định (turnaround 3 góc → hàng biểu cảm → các ô cận cảnh có
+    nhãn → dải bảng màu → chú thích tỉ lệ) do code quy định, AI chỉ điền nội
+    dung. Nhãn viết IN HOA TIẾNG ANH, NGẮN — model sinh ảnh đánh vần kém nên
+    chữ càng ngắn càng ít lỗi; đây là ảnh tài liệu nên CÓ chữ là đúng ý đồ
+    (khác ảnh 0 thumbnail: tuyệt đối không chữ).
+    """
+    main = kind == "main"
+    boxes, inst_rule = (_instrument_sheet_parts(instrument_spec, instrument_detail)
+                        if main else ([], ""))
+    if main:
+        outfit = (_bullets(outfit_items) if outfit_items else
+                  "   – every clothing piece and worn accessory described in SUBJECT")
+        boxes = [('OUTFIT REFERENCE — a separate box labelled "OUTFIT REFERENCE": each '
+                  "clothing piece and worn accessory drawn ON ITS OWN, laid out flat (flat-lay, "
+                  "no body, no mannequin), each with a tiny label, exactly matching the "
+                  f"turnaround:\n{outfit}"), *boxes]
+        turn = ("relaxed upright standing pose, EMPTY-HANDED with the arms relaxed at the "
+                "sides — ONLY the character's body, hair and worn outfit; nothing in or "
+                "near the hands, no instrument, no furniture, no objects of any kind")
+        callout_note = "an enlarged view of a BODY, FACE, HAIR or OUTFIT detail (no objects)"
+        only_rule = ("• CHARACTER ONLY: the turnaround, the expressions and the detail "
+                     "callouts show the person alone — no laptop, phone, book, cup, bag, "
+                     "lantern, desk, chair, bench, plant or any other prop. The musical "
+                     "instrument appears only in its own reference boxes; the clothing is "
+                     "worn on the body and repeated piece by piece in OUTFIT REFERENCE.")
+        same = "identical face, hair, outfit and colours"
+    else:
+        turn = ("natural relaxed standing pose — ONLY the animal itself; no objects, no "
+                "toys, no furniture, no instrument, no person beside it")
+        callout_note = "an enlarged view of one body detail"
+        only_rule = ("• ANIMAL ONLY: no objects, toys, furniture or instruments anywhere on "
+                     "the sheet (the SCALE note may use a plain human silhouette).")
+        same = "identical face, body, fur/feathers, markings and colours"
+    extra = "\n".join(f"• {s.strip()}" for s in [*boxes, *(extra_sections or [])]
+                      if s.strip())
+    return f"""CHARACTER MODEL SHEET / TURNAROUND — one single {aspect_ratio} sheet, laid out neatly like an animation production design document: flat neutral light-grey background (#ECECEC) with a very faint thin grid, clearly separated blocks, thin callout lines connecting each label to its detail.
+
+TOP TITLE (large uppercase English text, short): "{title_en}".
+
+SUBJECT (draw it IDENTICALLY in every frame on this sheet):
+{subject}
+
+REQUIRED LAYOUT, top to bottom:
+• FULL-BODY 360° TURNAROUND ROW — same base line, SAME HEIGHT, same proportions, same neutral lighting, {turn}: three figures side by side, labelled underneath "FRONT VIEW", "SIDE VIEW", "BACK VIEW". All three MUST be the same character, matching every detail and colour.
+• EXPRESSION ROW — label "FACE EXPRESSIONS": four close-up face frames of the same face, each with a small label:
+{_bullets(expressions)}
+• DETAIL CALLOUTS — each box is {callout_note} with a short uppercase English label and a callout line to the matching spot on the turnaround:
+{_bullets(insets)}
+• COLOUR STRIP at the bottom — label "COLOR PALETTE": square colour swatches in a horizontal row, each with its small hex code underneath, in this exact order:
+{_bullets(palette)}
+• SCALE NOTE — label "SCALE": {scale_note}
+{extra}
+
+DRAWING RULES:
+• This is a DESIGN DOCUMENT, NOT a film scene: no environment, no landscape, no atmospheric effects, no dramatic shadows — flat background, even lighting, clear readable shapes.
+• Every frame on the sheet must be THE SAME character: {same}. Any mismatch between views is a serious error.
+{only_rule}
+• Text is only for LABELS: uppercase, English, very short, placed neatly, never over the figures, no long paragraphs, no watermark, no logo.
+• Never crop the character's feet or head in any frame; leave clean margins around the sheet.{chr(10) + inst_rule if inst_rule else ""}"""
+
+
+def _style_notes(style: str) -> tuple[str, str]:
+    """(mô tả medium, câu nhắc phong cách) cho prompt người dùng."""
+    if _is_photoreal(style):
+        return (
+            "CINEMATIC PHOTOREALISTIC SHORT FILM",
+            f'Stay true to "{style}": materials, skin, fabric and fur must look '
+            "REAL like live-action film, cinematic lighting, depth of field. "
+            "ABSOLUTELY NO cartoon/anime/flat 2D/stylised Pixar-like 3D.",
+        )
+    return (
+        "ANIMATED SHORT FILM",
+        f'Stay true to "{style}": animated visual language, NOT photorealistic, '
+        "NOT a real photograph, NO hyperrealism.",
+    )
+
+
+def _instrument_prompt_parts(spec, n: int) -> tuple[str, str, str]:
+    """(khối luật, vế chuyển động cảnh, vế thumbnail) theo nhạc cụ project."""
+    if not spec:
+        return ("", "character micro-motions (fingers pressing flute holes, shoulders "
+                    "breathing very gently, eyelids blinking)", "")
+    name = spec["label"].lower()
+    need = max(1, -(-n * int(MIN_INSTRUMENT_SCENE_RATIO * 10) // 10))
+    block = (f"\n{music_spec.visual_instrument_rules(spec)}\n"
+             f"The project NAME and DESCRIPTION define the mood, setting and story; "
+             f"the {spec['label']} defines what the character does: they PLAY it.\n")
+    scene = (f"the character PLAYING the {name} — {spec['motion']}; eyelids "
+             f"softly blinking. In AT LEAST {need} of the {n} "
+             f"scenes the character is actively playing the {name} ({spec['pose']}) and "
+             f"the word \"{name}\" appears in the prompt; in the others the {name} is "
+             f"clearly visible beside them")
+    thumb = f" The character is playing the {name} ({spec['pose']})."
+    return block, scene, thumb
+
+
+# ── Bạn đồng hành (ảnh 2): thú cưng thật hay linh thú — theo BỐI CẢNH ─────
+# Lofi (phòng học, quán cà phê, thành phố đêm…) chỉ đi cùng THÚ CƯNG thật; trước
+# đây prompt luôn gợi ý linh thú (qilin…) → project lofi ra "qilin phát sáng".
+_SPIRIT_WORDS = re.compile(
+    r"\b(?:spirits?|spiritual|qilin|kirin|dragons?|phoenix|unicorns?|griffins?|"
+    r"kitsune|nine[- ]tailed|myth\w*|legendary|magic\w*|fairy|fae|ethereal|"
+    r"celestial|divine|deity|glow\w*|luminous|luminescent|bioluminescent|aura|"
+    r"enchanted|supernatural|horns?|antlers?)\b", re.I)
+
+
+def _companion_mode(idea: str) -> str:
+    """'pet' (bắt buộc thú cưng thật) khi thể loại nhạc project là lofi; còn lại
+    'auto' — AI chọn thú cưng hay linh thú theo bối cảnh."""
+    try:
+        ctx = json.loads(idea or "")
+    except (ValueError, TypeError):
+        ctx = None
+    if not isinstance(ctx, dict):
+        return "auto"
+    styles = ctx.get("music_styles")
+    if isinstance(styles, (list, tuple)):
+        styles = " ".join(str(x) for x in styles)
+    probe = " ".join(str(x) for x in (ctx.get("purpose"), styles) if x)
+    return "pet" if music_spec.find_genre(probe)["key"] == "lofi" else "auto"
+
+
+def _companion_rule(mode: str) -> str:
+    if mode == "pet":
+        return (
+            "   This is LOFI content: the companion MUST be an ordinary real-world PET that\n"
+            "   plausibly lives with the character in this setting (e.g. a cat, a small dog,\n"
+            "   a rabbit, a hamster, a parakeet, a turtle). Natural real anatomy, natural\n"
+            "   fur/feather colours, natural animal behaviour. ABSOLUTELY NO spirit, mythical,\n"
+            "   magical or fantasy creature: no glow, no aura, no horns, no wings on mammals,\n"
+            "   no supernatural traits. If the idea already names a pet → use exactly it.\n"
+            '   "pet_kind" MUST be "pet". It ACCOMPANIES the main character in the scenes.')
+    return (
+        "   Choose from the CONTEXT (setting, era, culture, realism of the idea):\n"
+        "   • If the idea already names a companion → use exactly that one.\n"
+        "   • A modern / urban / everyday / realistic world → an ordinary real PET (cat,\n"
+        "     dog, rabbit, bird…) with natural anatomy and NO magical traits.\n"
+        "   • Only an explicitly mythical, legendary, ancient-fantasy world → a spirit\n"
+        "     creature that fits the culture (e.g. East Asian legend → qilin / crane /\n"
+        "     nine-tailed fox; temperate forest → owl / deer / snow fox).\n"
+        "   • When unsure, prefer a real animal (pet or local wildlife).\n"
+        '   Set "pet_kind" to "pet" or "spirit creature". It must be plausible, cute or\n'
+        "   calm, and ACCOMPANY the main character in the scenes.")
+
+
+def _is_spirit(pet_kind: str, pet_text: str) -> bool:
+    kind = (pet_kind or "").lower()
+    if kind:
+        return any(w in kind for w in ("spirit", "myth", "creature", "legend", "magic"))
+    return bool(_SPIRIT_WORDS.search(pet_text or ""))
 
 
 def _build_user_prompt(idea: str, title: str, keywords: str,
-                       image_count: int, aspect_ratio: str,
-                       style: str) -> str:
-    n = image_count
-    photoreal = _is_photoreal(style)
+                       scene_count: int, aspect_ratio: str,
+                       style: str, instrument_spec=None,
+                       companion_mode: str = "auto") -> str:
+    """Lời nhắc chính: yêu cầu AI trả hồ sơ nhân vật + bạn đồng hành + N bối cảnh."""
+    n = scene_count
+    medium, style_note = _style_notes(style)
+    inst = instrument_spec
+    inst_block, inst_scene, inst_thumb = _instrument_prompt_parts(inst, n)
+    inst_line = (f"EXACTLY the {inst['label']} above (never another instrument)"
+                 if inst else "the specific instrument (flute, piano…)")
+    companion_rule = _companion_rule(companion_mode)
+    return f"""USER IDEA: "{idea}"
+{inst_block}
+Project title (for the thumbnail): "{title}"
+Suggested healing keywords for the thumbnail: {keywords}
 
-    if photoreal:
-        film_kind = "phim ngắn điện ảnh TẢ THỰC (cinematic photorealistic)"
-        texture_layer = (
-            'd) TEXTURE TẢ THỰC ĐIỆN ẢNH: tả chất liệu CHÂN THỰC như ảnh chụp / '
-            'phim thật theo phong cách "{style}" — bề mặt/vải/đá/nước/lá/da/tóc/'
-            'lông với chi tiết thật (grain, sợi vải, vân gỗ, lỗ chân lông, phản '
-            'xạ, đổ bóng vật lý), độ phân giải cao, ánh sáng điện ảnh, chiều sâu '
-            'trường ảnh (bokeh). TRÁNH mọi từ gợi hoạt hình (cel-shading, tô màu '
-            'phẳng, nét vẽ tay, Pixar/Disney stylized).'
-        ).format(style=style)
-        style_rules = (
-            "   - PHONG CÁCH BẮT BUỘC (nhắc lại trong TỪNG prompt, đặt ở ĐẦU mỗi "
-            f"prompt):\n     {style}. Đây là ẢNH TẢ THỰC như CHỤP/PHIM ĐIỆN ẢNH "
-            "THẬT, KHÔNG phải\n     hoạt hình. TUYỆT ĐỐI KHÔNG cartoon/anime/2D "
-            "phẳng/3D cách điệu Pixar.\n"
-            "   - Bảng màu ghi hex là tông màu chủ đạo của khung hình điện ảnh — "
-            "chi tiết\n     và ánh sáng CHÂN THỰC như đời thật."
-        )
-        motion_style_note = (
-            f'GẮN đúng phong cách "{style}" (giữ nét tả thực điện ảnh, chân thực '
-            "như phim thật)."
-        )
-    else:
-        film_kind = "phim hoạt hình ngắn"
-        texture_layer = (
-            'd) TEXTURE KIỂU HOẠT HÌNH: tả chất liệu theo ĐÚNG phong cách '
-            '"{style}", KHÔNG\n      phải ảnh thật — mô tả bề mặt/vải/đá/nước/lá '
-            'bằng ngôn ngữ tranh hoạt hình\n      của phong cách đó (nét vẽ/tô '
-            'màu phẳng nếu 2D; khối cách điệu đổ bóng dịu\n      nếu 3D). TRÁNH '
-            'mọi từ gợi ảnh thật (photoreal texture, lỗ chân lông, sợi\n      '
-            'vải thật, 4K photograph...)'
-        ).format(style=style)
-        style_rules = (
-            "   - PHONG CÁCH BẮT BUỘC (nhắc lại trong TỪNG prompt, đặt ở ĐẦU mỗi "
-            f"prompt):\n     {style}. Đây là ẢNH HOẠT HÌNH, KHÔNG phải ảnh chụp. "
-            "TUYỆT ĐỐI KHÔNG\n     photorealistic / photo thật.\n"
-            "   - Bảng màu ghi hex là màu chủ đạo tô theo phong cách hoạt hình "
-            "đã chọn —\n     KHÔNG phải chi tiết chân thực như đời thật."
-        )
-        motion_style_note = (
-            f'GẮN đúng phong cách "{style}" (giữ nét hoạt hình, không làm thật '
-            "hoá)."
-        )
+═══ TASK ═══
+Design a chill / relaxing / meditation "{medium}" consisting of:
+  (A) TWO CHARACTER MODEL SHEETS — the main character and the companion
+      (a real pet or a spirit creature, chosen by context). Both sheets will be fed to the video model as
+      INGREDIENTS for all {n} clips, so they are the single "source of truth"
+      for how the characters look. You do NOT write the drawing prompt directly —
+      you supply the CONTENT (descriptions, detail lists, palette); the system
+      already has the layout template.
+  (B) ONE thumbnail image.
+  (C) EXACTLY {n} SCENE PROMPTS for {n} 8-second clips — the SAME character +
+      the SAME companion, but {n} COMPLETELY DIFFERENT SETTINGS.
 
-    return f"""Ý TƯỞNG NGƯỜI DÙNG: "{idea}"
+═══ MANDATORY RULES ═══
 
-Tiêu đề dự án (dùng cho thumbnail): "{title}"
-Từ khoá healing gợi ý cho thumbnail: {keywords}
+1. STAY ABSOLUTELY FAITHFUL TO THE IDEA
+   The exact character (gender, age, ethnicity, outfit, props, instrument,
+   appearance) and the exact world the idea describes. NEVER invent characters
+   or settings that are not in the idea (in particular do NOT default to "young
+   person in a sage hoodie + wooden cabin + calico cat" — that is an old template).
 
-═══ NHIỆM VỤ ═══
-Thiết kế một "{film_kind}" chill/relaxing gồm ĐÚNG {n} shot (0..{n - 1}).
-Mỗi shot = 1 prompt tạo ảnh CỰC KÌ CHI TIẾT.
+2. MAIN CHARACTER — you MUST cover ALL of these groups (explicit user request):
+   • APPEARANCE: hands, legs, eyes, nose, mouth, hair, ears, height, eyebrows, skin tone
+   • OUTFIT: trousers, top, shoes/sandals, headband/scarf/hat… (material + colour + hex)
+     — every piece is ALSO drawn on its own in an OUTFIT REFERENCE box ("main_outfit")
+   • INSTRUMENT: {inst_line} — described SEPARATELY in "instrument_detail"
+     (realistic material, colour, real-world size and construction). It is drawn
+     ONLY in its own INSTRUMENT REFERENCE box and a PLAYING POSE box.
+   • WORN ACCESSORIES only (glasses, hat, scarf, hair pin, jewellery…; a weapon
+     — sword, bow, spear, staff… — ONLY when the idea/description includes one,
+     worn sheathed on the back or at the belt on the sheet)
+   • THE CHARACTER SHEET SHOWS THE PERSON ONLY: the 360° turnaround is EMPTY-HANDED —
+     NO instrument, NO hand-held object or device (laptop, phone, book, cup, bag,
+     lantern…), NO furniture. Objects of the story belong ONLY in the scene prompts.
+     So "character_sheet", "main_subject", "main_insets" and "main_outfit" must never
+     mention the instrument or any object.
+   • REAL-WORLD LOGIC: large instruments stay where they really stand (a piano,
+     harp or cello on the floor, a guzheng on its own low stand) — the character
+     SITS at them to play and never holds, lifts or carries them; a piano is never
+     on a desk, a table or a lap and is never miniature.
 
-═══ NGUYÊN TẮC BẮT BUỘC ═══
+3. COMPANION (image 2)
+{companion_rule}
 
-1. BÁM SÁT Ý TƯỞNG TUYỆT ĐỐI
-   Đúng nhân vật (giới tính, tuổi, dân tộc, trang phục, đạo cụ, ngoại hình), đúng
-   bối cảnh (địa điểm, thời tiết, thiên nhiên), đúng hành trình/diễn tiến mà
-   ý tưởng mô tả. VÍ DỤ: "cậu bé đội nón lá cầm sáo trúc trèo đèo lội suối"
-   → nhân vật PHẢI là cậu bé + nón lá + sáo trúc; chọn MỘT điểm nghỉ phù hợp
-   trên hành trình làm bối cảnh chung. Không chuyển địa điểm qua các shot.
-   NGHIÊM CẤM bịa nhân vật/bối cảnh không có trong ý tưởng (đặc biệt KHÔNG được
-   mặc định thành "người trẻ hoodie sage + cabin gỗ + mèo tam thể" — đó là mẫu cũ).
+4. {n} DIFFERENT SETTINGS — SHUFFLE-SAFE
+   • The clips will be RANDOMLY SHUFFLED when assembled ⇒ NO continuing story,
+     NO morning→noon→night progression, NO scene that depends on another.
+     Every scene must stand alone and end in a peaceful state.
+   • {n} CLEARLY DISTINCT locations/landscapes (different terrain, weather,
+     time of day, altitude/camera distance). Never repeat a location.
+   • KEEP the character, outfit, instrument, companion and main palette unchanged.
 
-2. CHARACTER BIBLE + CHARACTER SHEET (khoá danh tính nhân vật)
-   Trước khi viết bất kì prompt nào, bạn PHẢI khoá hồ sơ nhân vật chính, GHI VÀO
-   HAI trường riêng:
+5. SCENE PROMPTS (80–140 words each) — prompts for a VIDEO model (image-to-
+   video, 8 seconds, ingredients = the 2 character sheets). Each prompt MUST have:
+   a) An opening CHARACTER LOCK clause: use the character from ingredient image 1
+      and the companion from ingredient image 2, KEEP face/outfit/colours unchanged.
+   b) A concrete SETTING: place, time of day, weather, 3 layers foreground /
+      midground / background.
+   c) LIGHTING: light source, direction, colour temperature, shadows.
+   d) ATMOSPHERE & PARTICLES: mist, pollen, sun rays, rain, fireflies, snow…
+   e) ACTION & MOTION that is physically plausible and anatomically correct:
+      {inst_scene}; companion reactions (tail swaying, ears
+      folding, soft sniffing), environmental motion. The head only tilts VERY
+      SLIGHTLY, never turns backwards; correct number of hands/fingers.
+   f) CAMERA: state it and keep it SIMPLE (locked camera, or an EXTREMELY slow
+      pan/push-in).
+   g) PACING: slow, meditative, smooth, loopable (seamless loop). No cuts, no
+      fade-in/fade-out, no text.
+   {style_note}
 
-   (A) "character_bible" — hồ sơ ĐẦY ĐỦ để tham chiếu:
-   • Ngoại hình CỤ THỂ: tuổi, tóc (kiểu/dài/ngắn/màu), mắt (màu/hình dáng),
-     da, vóc dáng, biểu cảm mặc định
-   • Trang phục CỐ ĐỊNH: mô tả TỪNG MÓN (chất liệu, màu chính xác, hoạ tiết nếu
-     có, cách mặc/đội/cầm), phụ kiện + đạo cụ
-   • Bối cảnh & hành trình: các mốc chính của câu chuyện (mở – diễn biến – cao
-     trào – lắng)
-   • BẢNG MÀU CHÍNH: 5–7 màu chủ đạo (ghi tên cụ thể, VD "xanh ngọc bích #6EC4A7"
-     thay vì chỉ "xanh"), kèm vai trò (màu chính nhân vật / màu nền / màu accent)
+6. THUMBNAIL — 70–120 words: the same character + companion, eye-catching,
+   emotionally rich composition.{inst_thumb} ABSOLUTELY NO text/title/typography/logo/
+   watermark in the image (the title "{title}" will be added later by software).
+   Place the characters off-centre to the RIGHT, leaving clean negative space on
+   the LEFT HALF. Aspect ratio {aspect_ratio}.
 
-   (B) "character_sheet" — KHỐI DANH TÍNH CÔ ĐỌNG (40–70 từ) để COPY NGUYÊN VĂN
-   vào MỌI shot. ĐÂY LÀ CHÌA KHOÁ ĐỒNG BỘ NHÂN VẬT — hệ thống sẽ TỰ ĐỘNG dán
-   khối này (y hệt, không đổi một chữ) vào đầu TỪNG prompt ảnh. Vì vậy nó phải:
-   • CHỈ chứa danh tính CỐ ĐỊNH, không đổi giữa các shot: giới tính/tuổi/dân tộc,
-     khuôn mặt + tóc + mắt + da + vóc dáng, TỪNG món trang phục kèm MÀU CHÍNH XÁC
-     (+ hex), đạo cụ cố định, và 3–5 hex bảng màu chủ đạo.
-   • TUYỆT ĐỐI KHÔNG chứa: bối cảnh, hành động, tư thế, cảm xúc, góc máy, ánh sáng,
-     thời điểm trong ngày (những thứ đó thay đổi theo shot → viết trong từng prompt).
-   • Viết thành 1 khối liền mạch, dày token danh tính, có thể dán lặp lại y nguyên.
-   Mọi shot dùng CHÍNH XÁC danh tính này — một nhân vật, một phim.
+7. CONTENT SAFETY (the video model's safety filter rejects the whole clip
+   otherwise): the main character is a peaceful ADULT (25+), never a child or
+   teenager, never a real or famous person; NO blood, injury, fire or smoke;
+   no brand, studio or artist names.
+   WEAPONS follow the idea/description: if it describes a warrior, guardian,
+   archer, samurai… with a weapon, KEEP that weapon exactly as described
+   (sword, bow, spear, staff…), consistent in every scene; if it describes
+   none, do not invent one. Keep the overall mood calm and meditative.
 
-3. MỖI PROMPT MÔ TẢ CẢNH (KHÔNG tự bịa lại ngoại hình) — 70–120 từ
-   QUAN TRỌNG: KHÔNG mô tả lại / diễn giải lại ngoại hình, trang phục, màu sắc
-   nhân vật trong prompt (danh tính đã được khối "character_sheet" dán tự động
-   vào đầu prompt — mô tả lại chỉ gây LỆCH hình dáng giữa các shot). Chỉ gọi
-   "nhân vật chính". TUYỆT ĐỐI không đổi màu/trang phục/kiểu tóc/đạo cụ so với
-   character_sheet. Prompt của bạn tập trung vào phần THAY ĐỔI theo shot và PHẢI
-   bao gồm các lớp sau:
-   a) GÓC MÁY & BỐ CỤC KHÓA: cùng một wide/medium-wide shot ngang tầm mắt,
-      nhân vật ở một phần ba PHẢI, giữ nguyên vị trí máy, đường chân trời,
-      tỷ lệ nhân vật và vị trí đồ vật. Không đổi góc máy hoặc cắt cận cảnh.
-   b) ÁNH SÁNG CỤ THỂ: nguồn sáng (golden hour / rim light / volumetric fog /
-      dappled sunlight xuyên tán lá / backlit / soft diffused...), hướng chiếu
-      (trước/sau/bên), nhiệt độ màu (ấm/lạnh), shadow (mềm/sắc/dài), highlight
-   c) ATMOSPHERE & PARTICLES: sương mù (độ dày, vị trí), bụi phấn, tia nắng,
-      hạt mưa, đom đóm, phấn hoa, tuyết... — tuỳ bối cảnh
-   {texture_layer}
-   e) FOREGROUND / MIDGROUND / BACKGROUND: 3 lớp riêng biệt (VD: foreground =
-      cành hoa mờ bokeh, midground = nhân vật, background = núi xa mây cuộn)
-   f) CẢM XÚC & HÀNH ĐỘNG: biểu cảm cụ thể của nhân vật (mắt lim dim, miệng hé
-      mỉm cười, trán hơi nhíu...), tư thế cơ thể, hành động chính
-   g) ÂM THANH THỊ GIÁC: gợi ý thính giác qua hình ảnh (gợn sóng = tiếng suối,
-      lá rung = gió thổi, sáo đưa lên môi = giai điệu...)
-
-4. CÁC TRẠNG THÁI NHỎ CỦA MỘT THẾ GIỚI — SHUFFLE-SAFE
-   - Shot 0 mở đầu; shot 1..{n - 1} sẽ RANDOM MIX, nên không có hành trình,
-     không diễn tiến sáng-trưa-tối, không sự kiện phụ thuộc thứ tự trước/sau.
-   - Giữ CÙNG địa điểm, bố cục, góc máy, ánh sáng, trang phục, bảng màu.
-   - Chỉ thay đổi vi trạng thái: gợn nước, lá, mây, biểu cảm rất nhẹ; phải có
-     sẵn các yếu tố đó trong scene_sheet. Không thêm vật thể để tạo khác biệt.
-   - Viết scene_sheet 60–100 từ: địa điểm, vị trí từng vật thể, camera,
-     đường chân trời, ánh sáng, thời điểm và bảng màu cố định. Khối này được
-     dán NGUYÊN VĂN vào mọi prompt, cùng character_sheet.
-
-5. PHONG CÁCH & QUY TẮC HÌNH ẢNH
-{style_rules}
-   - Tỉ lệ: {aspect_ratio}
-   - Shot 0 = THUMBNAIL: cùng nhân vật, bố cục hút mắt, giàu cảm xúc. TUYỆT ĐỐI KHÔNG vẽ chữ/tiêu đề/typography/logo/watermark trong ảnh (tiêu đề "{title}"
-     sẽ được chèn bằng phần mềm sau — model sinh ảnh không đánh vần được nên
-     KHÔNG được tự vẽ chữ). Đặt nhân vật lệch sang PHẢI và CHỪA khoảng trống
-     thoáng (negative space, nền dịu ít chi tiết) ở NỬA TRÁI khung để chèn tiêu
-     đề — tránh chi tiết rối ở vùng đó.
-   - Shot 1..{n - 1}: TUYỆT ĐỐI KHÔNG chữ/typography trong ảnh
-   - Viết prompt bằng tiếng Việt, giàu chi tiết thị giác
-
-6. PROMPT CHUYỂN ĐỘNG (MOTION) CHO TỪNG CLIP — CỰC KÌ QUAN TRỌNG & CHẶT CHẼ
-   Mỗi ảnh k sẽ được model video (Veo, image-to-video) làm động thành 1 clip
-   8 GIÂY. Bạn PHẢI viết cho MỖI ảnh k một prompt chuyển động ("motions"[k])
-   50–100 từ, RIÊNG cho nội dung ảnh đó. Đây là phần HAY BỊ LỖI NHẤT (model
-   video rất dễ "ảo giác": bốc khói từ sáo, đầu quay ngược, tay méo mó) nên
-   phải viết CỰC KÌ CHÍNH XÁC, RÀNG BUỘC VẬT LÝ và CHỦ ĐỘNG CẤM các lỗi đó.
-
-   a) BÁM ĐÚNG KHUNG HÌNH: mở đầu motion bằng 1 mệnh đề khoá bối cảnh — nêu lại
-      NGẮN GỌN nhân vật đang làm gì trong ảnh (VD "cậu bé ngồi thổi sáo trên
-      mỏm đá"), để model KHÔNG tự bịa hành động mới.
-   b) HỢP LOGIC & THỰC TẾ VẬT LÝ (bắt buộc): chỉ mô tả chuyển động CÓ THỂ xảy ra
-      tự nhiên, đúng giải phẫu, trong đúng khung hình đó. Nhân vật giữ NGUYÊN
-      danh tính, khuôn mặt, trang phục, đạo cụ và vị trí. Đầu chỉ nghiêng/quay
-      RẤT NHẸ trong biên độ tự nhiên (KHÔNG quay ngược/180°). Bàn tay & ngón tay
-      giữ đúng số lượng và hình dạng. KHÔNG biến hình, KHÔNG xuất hiện/biến mất
-      người-vật, KHÔNG đổi bối cảnh, KHÔNG cắt cảnh, KHÔNG chữ; camera KHÔNG
-      xuyên qua vật thể.
-   c) 3 TẦNG CHUYỂN ĐỘNG cụ thể: (1) VI CHUYỂN ĐỘNG nhân vật hợp hành động (VD
-      đang thổi sáo: các ngón tay bấm lỗ sáo nhấp nhẹ theo nhịp, vai và lồng
-      ngực nhô lên hạ xuống RẤT KHẼ và TỰ NHIÊN — KHÔNG có hơi/khói thoát ra,
-      mi mắt khẽ chớp, vài sợi tóc mai và vạt áo lay theo gió); (2) MÔI TRƯỜNG
-      (lá đung đưa, sương/mây trôi ngang chậm, mặt nước gợn lăn tăn, nắng lung
-      linh, bụi phấn/đom đóm bay chậm), chỉ nếu có sẵn trong ảnh;
-      (3) CAMERA cố định (locked camera),
-      không push-in, orbit, zoom hoặc lia máy để giữ nguyên bố cục.
-   d) CHỦ ĐỘNG CẤM (viết luôn 1 cụm phủ định NGẮN ở cuối mỗi motion): không khói
-      /hơi/lửa từ miệng hay nhạc cụ, không đầu quay ngược, không méo tay/mặt,
-      không thừa ngón/chi, không biến hình, không nhân bản nhân vật, không cắt
-      cảnh (no smoke, no vapor, no fire, no head spinning, no distorted hands).
-   e) NHỊP & KHÔNG KHÍ: chậm, thiền, thư giãn, liền mạch, lặp được (loop-friendly),
-      không giật cục, không chuyển động mạnh/đột ngột. Ăn khớp thời điểm trong
-      ngày & cảm xúc của ảnh (VD hoàng hôn → chuyển động lắng, gió nhẹ hơn).
-   f) TÔNG: mô tả bằng tiếng Việt, thêm vài từ khoá tiếng Anh cho Veo khi cần
-      (slow motion, subtle, cinematic, seamless loop, anatomically correct).
-      {motion_style_note}
-   Motion[0] (thumbnail) cũng cần 1 chuyển động nền tinh tế (ambient) hợp cảnh,
-   tuân thủ đủ các quy tắc trên.
-   KHÔNG fade-in/fade-out trong clip nguồn; fade chỉ áp dụng lúc ghép.
-   Không yêu cầu chuyển động của vật không có trong ảnh tương ứng.
+8. LANGUAGE: every value you return must be written in ENGLISH only — no other
+   language, no Vietnamese, no diacritics. Transliterate proper names into plain
+   unaccented Latin letters.
 
 ═══ OUTPUT FORMAT ═══
-CHỈ trả về JSON (không giải thích, không markdown):
+Return ONLY valid JSON (no explanation, no markdown):
 {{
-  "character_bible": "hồ sơ nhân vật cố định ĐẦY ĐỦ (ngoại hình + trang phục + đạo cụ + bảng màu 5-7 màu + bối cảnh + hành trình)",
-  "character_sheet": "KHỐI danh tính CÔ ĐỌNG 40-70 từ, chỉ danh tính cố định (giới tính/tuổi/dân tộc + mặt/tóc/mắt/da/vóc dáng + từng món trang phục kèm hex + đạo cụ + 3-5 hex palette), KHÔNG bối cảnh/hành động/góc máy/ánh sáng — sẽ được dán y nguyên vào đầu mọi shot",
-  "scene_sheet": "KHỐI bối cảnh và bố cục cố định 60–100 từ, dùng nguyên văn cho mọi ảnh; camera cố định, nhân vật bên phải, vùng chữ bên trái, cùng thời điểm và ánh sáng",
-  "prompts": {{
-    "0": "prompt thumbnail 70-120 từ, KHÔNG chữ, chừa negative space nửa trái, KHÔNG tả lại ngoại hình (gọi 'nhân vật chính')",
-    "1": "prompt shot 1 (70-120 từ, không chữ, đủ các lớp cảnh, KHÔNG tả lại ngoại hình)",
-    "...": "...",
-    "{n - 1}": "prompt shot cuối (70-120 từ, không chữ)"
-  }},
-  "motions": {{
-    "0": "prompt chuyển động clip từ ảnh 0 (50-100 từ, hợp logic vật lý, 3 tầng + cụm phủ định cuối)",
-    "1": "prompt chuyển động clip từ ảnh 1 (50-100 từ)",
-    "...": "...",
-    "{n - 1}": "prompt chuyển động clip cuối (50-100 từ)"
-  }}
+  "character_bible": "full profile of the main character + companion + world",
+  "character_sheet": "CONDENSED 60-100 word identity block of the MAIN CHARACTER ONLY: gender/age/ethnicity + face/hair/eyes/skin/height + EVERY outfit item with hex + worn accessories. NO instrument, NO hand-held object/prop/device, NO furniture, NO setting/action/lighting (the system adds the instrument separately)",
+  "main_subject": "2-4 sentences so an artist can draw the main character turnaround (build, head-to-body ratio, EMPTY-HANDED relaxed standing pose with arms at the sides, demeanour) — no objects",
+  "main_expressions": ["NEUTRAL — short description", "CALM — ...", "DETERMINED — ...", "JOYFUL — ..."],
+  "main_insets": ["UPPERCASE ENGLISH LABEL — detailed English description (5-8 items: hair & head accessories, face/eyes, hands (empty), upper-body outfit, lower-body outfit, footwear, worn accessories) — NO instrument, NO props"],
+  "main_outfit": ["UPPERCASE PIECE NAME — material, colour + hex (3-7 items: every clothing piece and worn accessory, for the OUTFIT REFERENCE flat-lay)"],
+  "instrument_detail": "1-2 sentences describing ONLY the instrument realistically (material, colour, real-world size, construction, ornament) — no person",
+  "main_scale": "height & proportion note for the main character, e.g. 'HEIGHT 1.62 m — 6.5 heads tall'",
+  "pet_kind": "pet | spirit creature",
+  "pet_name": "short English name of the companion",
+  "pet_sheet": "CONDENSED 60-100 word identity block of the COMPANION: species/breed, size, fur/feathers (scales/horns only for a spirit creature), colours + hex, identifying marks, collar if any. NO setting/action",
+  "pet_subject": "2-4 sentences to draw the companion turnaround",
+  "pet_expressions": ["NEUTRAL — ...", "CALM — ...", "ALERT — ...", "PLAYFUL — ..."],
+  "pet_insets": ["UPPERCASE ENGLISH LABEL — description (5-8 items: head & senses, eyes, ears, legs & paws/claws, fur/feathers, tail, markings, collar if any)"],
+  "pet_scale": "SIZE MAP comparing scale: human {{height}} versus companion {{height/length}}, described in one sentence",
+  "pet_traits": ["3-5 personality traits (symbolic meanings only for a spirit creature), each 'UPPERCASE LABEL — short description'"],
+  "palette": ["#RRGGBB — English colour name — role (character colour / companion colour / background colour / accent colour)"],
+  "thumbnail": "70-120 word thumbnail prompt, NO text, negative space on the left half",
+  "scenes": [
+    {{"setting": "short setting name", "prompt": "80-140 word scene prompt covering all 7 layers a–g"}}
+  ]
 }}
-Bắt buộc: có trường "character_sheet"; "prompts" VÀ "motions" đều đủ {n} khoá
-"0".."{n - 1}". Mỗi prompt ảnh 70–120 từ (KHÔNG tả lại ngoại hình nhân vật —
-danh tính do character_sheet lo); mỗi prompt motion 50–100 từ, hợp logic vật lý,
-có cụm phủ định."""
-
+Required: "scenes" has EXACTLY {n} items, each with non-empty "setting" and
+"prompt", {n} DIFFERENT "setting" values. "palette" has 5–7 items. "main_insets"
+and "pet_insets" have 5–8 items each. Do not leave any key above empty. All
+values in ENGLISH."""
 
 def _motion_system(style_brief: str) -> str:
-    medium = ("phim điện ảnh tả thực" if _is_photoreal(style_brief)
-              else "phim hoạt hình")
+    medium = ("photorealistic cinematic film" if _is_photoreal(style_brief)
+              else "animated film")
     return (
-        f"Bạn là ĐẠO DIỄN CHUYỂN ĐỘNG cấp cao cho {medium} "
-        f"({style_brief}) chill/thiền. Nhiệm vụ: với MỖI ảnh tĩnh cho sẵn, viết "
-        "một prompt chuyển động (image-to-video, clip 8 giây) để model video "
-        "(Veo) làm động ảnh đó. Đây là khâu DỄ LỖI NHẤT: model video hay 'ảo "
-        "giác' (bốc khói/hơi từ sáo hay miệng, đầu quay ngược, tay/ngón méo mó, "
-        "thừa chi, biến hình). Vì vậy prompt của bạn phải CỰC KÌ CHÍNH XÁC, "
-        "RÀNG BUỘC VẬT LÝ, và CHỦ ĐỘNG CẤM các lỗi đó. CHỈ trả về JSON hợp lệ."
+        f"You are a senior MOTION DIRECTOR for a chill / meditation {medium} "
+        f"({style_brief}). Task: write scene + motion prompts (image-to-video, "
+        "8-second clips) for the video model (Veo). This is the MOST ERROR-PRONE "
+        "step: video models often 'hallucinate' (smoke/vapour from the flute or "
+        "mouth, heads turning backwards, distorted hands/fingers, extra limbs, "
+        "morphing). So your prompts must be EXTREMELY PRECISE and PHYSICALLY "
+        "CONSTRAINED — describe the correct calm motion POSITIVELY instead of "
+        "listing forbidden things (the model's safety filter rejects prompts that "
+        "mention fire, smoke, distortion or injuries, even negated). "
+        "Write in ENGLISH ONLY. "
+        "Return ONLY valid JSON."
     )
 
 
-def _build_motions_user_prompt(idea: str, style: str,
-                               prompts: dict[str, str]) -> str:
-    n = len(prompts)
-    lines = []
-    for i in range(n):
-        p = (prompts.get(str(i)) or "").strip()
-        lines.append(f'ẢNH {i}: "{p}"')
-    joined = "\n\n".join(lines)
-    motion_style_note = (
-        f'Giữ đúng nét tả thực điện ảnh "{style}", CHÂN THỰC như phim thật.'
-        if _is_photoreal(style)
-        else f'Giữ đúng nét hoạt hình "{style}", KHÔNG làm thật hoá.'
-    )
-    return f"""Ý TƯỞNG TỔNG THỂ: "{idea}"
-Phong cách: {style}
+def _build_scenes_user_prompt(idea: str, style: str, character_sheet: str,
+                              pet_sheet: str, scene_count: int,
+                              avoid: list[str] | None = None,
+                              instrument_spec=None) -> str:
+    n = scene_count
+    _, style_note = _style_notes(style)
+    inst_block, inst_scene, _ = _instrument_prompt_parts(instrument_spec, n)
+    if instrument_spec:
+        inst_scene = inst_scene.replace("the character PLAYING", "(a) the character PLAYING")
+    else:
+        inst_scene = ("(a) character micro-motion matching the action (e.g.\n"
+                      "   playing the flute: fingertips lightly pressing the holes, shoulders and chest\n"
+                      "   rising and falling VERY GENTLY, clear air around the flute, eyelids\n"
+                      "   softly blinking)")
+    avoid_block = ""
+    if avoid:
+        joined = "; ".join(str(a).strip() for a in avoid if str(a).strip())
+        if joined:
+            avoid_block = ("\nSETTINGS ALREADY USED (do NOT repeat them, invent "
+                           f"completely different ones): {joined}\n")
+    return f"""OVERALL IDEA: "{idea}"
+Style: {style}
 
-Dưới đây là {n} ẢNH TĨNH (đã tạo xong) của cùng một phim. Với MỖI ảnh, viết một
-prompt CHUYỂN ĐỘNG 50–100 từ để làm động ĐÚNG ảnh đó thành clip 8 giây.
+MAIN CHARACTER (ingredient image 1 — KEEP ABSOLUTELY UNCHANGED):
+{character_sheet}
 
-QUY TẮC BẮT BUỘC cho mỗi motion:
-1. BÁM ĐÚNG ẢNH: mở đầu bằng mệnh đề khoá bối cảnh nêu lại NGẮN GỌN nhân vật
-   đang làm gì trong ảnh đó (để model không bịa hành động mới). Chuyển động phải
-   khớp CHÍNH XÁC nội dung/không gian của ảnh.
-2. HỢP LOGIC & ĐÚNG GIẢI PHẪU: chỉ chuyển động tự nhiên, khả thi. Nhân vật giữ
-   nguyên danh tính, mặt, trang phục, đạo cụ, vị trí. Đầu chỉ nghiêng/quay RẤT
-   NHẸ trong biên độ tự nhiên (KHÔNG quay ngược/180°). Tay & ngón giữ đúng số
-   lượng, hình dạng. KHÔNG biến hình, KHÔNG thêm/bớt người-vật, KHÔNG đổi bối
-   cảnh, KHÔNG cắt cảnh, camera KHÔNG xuyên vật thể.
-3. 3 TẦNG: (a) vi-chuyển-động nhân vật hợp hành động (VD thổi sáo: ngón tay bấm
-   lỗ sáo nhấp nhẹ theo nhịp, vai & lồng ngực nhô lên hạ xuống RẤT KHẼ TỰ NHIÊN
-   — KHÔNG có hơi/khói thoát ra, mi mắt khẽ chớp, vài sợi tóc & vạt áo lay theo
-   gió); (b) môi trường (lá đung đưa, sương/mây trôi ngang chậm, nước gợn, nắng
-   lung linh, đom đóm/bụi phấn bay chậm), CHỈ nếu có sẵn trong ảnh;
-   (c) camera CỐ ĐỊNH, locked camera, không zoom, lia hoặc orbit.
-   Không fade-in/fade-out: fade thuộc bước ghép, không có trong clip nguồn.
-4. NHỊP thiền, chậm, mượt, liền mạch, lặp được (seamless loop); không giật cục,
-   không đột ngột. Ăn khớp thời điểm trong ngày & cảm xúc của ảnh.
-5. KẾT MỖI MOTION bằng 1 cụm phủ định ngắn: "no smoke, no vapor, no fire, no
-   breath vapor, no smoke from flute or mouth, no head spinning, no reversed
-   head, no distorted or extra fingers, no morphing, no scene cut."
-6. Viết tiếng Việt, thêm vài từ khoá tiếng Anh cho Veo (slow motion, subtle,
-   cinematic, seamless loop, anatomically correct). {motion_style_note}
+COMPANION (ingredient image 2 — KEEP ABSOLUTELY UNCHANGED):
+{pet_sheet}
+{avoid_block}{inst_block}
+The two sheets above are character model sheets that will be loaded as
+INGREDIENTS for the video model. Write EXACTLY {n} scene prompts, each creating
+one 8-second clip: the SAME character + the SAME companion, {n} COMPLETELY
+DIFFERENT SETTINGS.
 
-CÁC ẢNH:
-{joined}
+MANDATORY RULES for every prompt (80–140 words):
+1. START with a lock clause: use the character from ingredient image 1 and the
+   companion from ingredient image 2, keeping face, hair, outfit, colours,
+   instrument and props UNCHANGED. This is NOT a design sheet — place the
+   characters in a real FILM SCENE; never redraw the turnaround, labels or palette.
+2. Its own SETTING: place, time of day, weather, and 3 clear layers
+   foreground / midground / background.
+3. Concrete LIGHTING (source, direction, colour temperature, shadows) +
+   ATMOSPHERE & PARTICLES (mist, pollen, sun rays, rain, fireflies, snow…).
+4. LOGICAL & ANATOMICALLY CORRECT: natural, feasible motion. The head only tilts
+   VERY SLIGHTLY (NEVER turns backwards/180°); correct number and shape of hands
+   and fingers. NO morphing, NO duplicated characters, NO added/removed people
+   or objects, NO scene cuts.
+5. 3 LAYERS OF MOTION: {inst_scene}; (b) companion reactions (tail swaying, ears folding, soft
+   breathing, nuzzling); (c) environment + SIMPLE camera (locked camera, or an
+   EXTREMELY slow pan/push-in). No fade-in/fade-out.
+6. SHUFFLE-SAFE: the clips will be randomly shuffled ⇒ every scene must stand
+   alone, never continue another scene, no order-dependent events.
+7. PHRASE EVERYTHING POSITIVELY and keep it SAFE: describe what should happen
+   (calm steady pose, natural hands on the instrument, one continuous shot). NEVER write negative lists and NEVER mention smoke, steam, vapour,
+   fire, distortion, extra limbs, head spinning, blood or injuries —
+   the safety filter rejects the clip on those words even when negated.
+   Weapons are allowed when the character sheet / idea includes them — keep
+   them exactly as described.
+8. Write in ENGLISH ONLY (no other language, no diacritics); include Veo-friendly
+   keywords (slow motion, subtle, cinematic, seamless loop, anatomically
+   correct). {style_note}
 
-═══ OUTPUT ═══ CHỈ trả JSON (không giải thích, không markdown):
+═══ OUTPUT ═══ Return ONLY JSON (no explanation, no markdown):
 {{
-  "motions": {{
-    "0": "motion cho ảnh 0 (50-100 từ)",
-    "...": "...",
-    "{n - 1}": "motion cho ảnh {n - 1} (50-100 từ)"
-  }}
+  "scenes": [
+    {{"setting": "short setting name", "prompt": "80-140 word scene prompt"}}
+  ]
 }}
-Bắt buộc đủ {n} khoá "0".."{n - 1}"."""
+Required: "scenes" has EXACTLY {n} items, {n} DIFFERENT "setting" values, no empty item."""
 
 
-def generate_motions_for_prompts(
-    prompts: dict[str, str],
+def generate_scene_prompts(
+    character_sheet: str,
+    pet_sheet: str,
     idea: str,
     style: str,
     api_config,
+    scene_count: int = DEFAULT_SCENE_COUNT,
     log=None,
+    avoid: list[str] | None = None,
+    instrument: str = "",
 ) -> Optional[dict[str, str]]:
-    """Sinh LẠI bộ motion (khớp với các ảnh ĐÃ có) từ chính prompt ảnh hiện tại
-    — dùng khi muốn cải thiện chuyển động mà KHÔNG tạo lại ảnh. Trả dict motions
-    đủ N khoá, hoặc None nếu lỗi/không đủ."""
+    """Sinh (hoặc sinh LẠI) bộ prompt cảnh cho các clip từ HAI character sheet.
+
+    Dùng khi muốn đổi bối cảnh mà KHÔNG tạo lại ảnh. Trả dict đủ `scene_count`
+    khoá "0".."N-1", hoặc None nếu lỗi/không đủ."""
     def _log(m: str):
         if log:
             try:
@@ -376,10 +758,11 @@ def generate_motions_for_prompts(
             except Exception:
                 pass
 
-    if not prompts:
+    if not (character_sheet or "").strip() or not (pet_sheet or "").strip():
+        _log("Thiếu character_sheet/pet_sheet — không sinh được prompt cảnh.")
         return None
     if not api_config or not getattr(api_config, "api_key", None):
-        _log("Chưa cấu hình API key — không sinh lại motion được.")
+        _log("Chưa cấu hình API key — không sinh prompt cảnh được.")
         return None
     try:
         from openai import OpenAI
@@ -390,42 +773,128 @@ def generate_motions_for_prompts(
     model = api_config.model
     if not model or model.lower().startswith("claude"):
         model = _FALLBACK_MODEL
-    n = len(prompts)
+    n = int(scene_count)
+    spec = _resolve_instrument(instrument, idea, api_config, _log)
+    # Prompt gửi Veo phải 100% tiếng Anh: ý tưởng người dùng (thường tiếng
+    # Việt) được dịch trước khi đưa vào lời nhắc.
+    try:
+        idea = to_english(idea, api_config, _log)
+        avoid = to_english(list(avoid), api_config, _log) if avoid else avoid
+    except TranslationError as e:
+        _log(f"{e} — dừng sinh prompt cảnh.")
+        return None
     try:
         client = OpenAI(**api_config.to_client_kwargs())
-        resp = client.chat.completions.create(
-            model=model,
-            max_tokens=16000,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": _motion_system(style)},
-                {"role": "user",
-                 "content": _build_motions_user_prompt(idea, style, prompts)},
-            ],
-        )
-        text = resp.choices[0].message.content or ""
     except Exception as e:
-        _log(f"Gọi OpenAI (motion) thất bại ({type(e).__name__}: {e}).")
+        _log(f"Không khởi tạo được client OpenAI ({type(e).__name__}: {e}).")
         return None
+    # Khối danh tính (khoá continuity) chỉ có cơ thể + trang phục; dòng NHẠC CỤ
+    # đúng thực tế (piano: ngồi ghế đàn, đàn đứng trên sàn) do code nối thêm.
+    ident = _identity_with_instrument(character_sheet, spec)
+    user_msg = _build_scenes_user_prompt(idea, style, ident, pet_sheet, n, avoid,
+                                         instrument_spec=spec)
+    last_reason = "không rõ"
+    best = None
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                max_tokens=32000,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": _motion_system(style)},
+                    {"role": "user", "content": user_msg},
+                ],
+            )
+            text = resp.choices[0].message.content or ""
+        except Exception as e:
+            last_reason = f"gọi OpenAI (prompt cảnh) thất bại ({type(e).__name__}: {e})"
+            _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — thử lại…")
+            continue
 
-    data = _extract_json(text)
-    if not isinstance(data, dict):
-        _log("OpenAI (motion) trả về không phải JSON.")
-        return None
-    raw = data.get("motions")
-    if not isinstance(raw, dict):
-        _log("JSON (motion) thiếu 'motions'.")
-        return None
-    out: dict[str, str] = {}
-    for i in range(n):
-        mv = raw.get(str(i)) or raw.get(i)
-        if not isinstance(mv, str) or not mv.strip():
-            _log(f"Thiếu motion cho ảnh {i}.")
-            return None
-        out[str(i)] = mv.strip()
-    _log(f"Đã sinh lại {n} prompt chuyển động khớp ảnh hiện tại ({model}).")
-    return out
+        data = _extract_json(text)
+        if not isinstance(data, dict):
+            last_reason = "OpenAI (prompt cảnh) trả về không phải JSON"
+            _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — thử lại…")
+            continue
+        bad = non_english_fields(data.get("scenes"))
+        if bad:
+            last_reason = f"prompt cảnh còn chữ không phải tiếng Anh ({', '.join(bad[:4])})"
+            _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — thử lại…")
+            continue
+        scenes = _scene_dict(data.get("scenes"), n, ident, pet_sheet)
+        if scenes is None:
+            last_reason = f"JSON prompt cảnh thiếu/không đủ {n} mục hợp lệ"
+            _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — thử lại…")
+            continue
+        bodies = _scene_bodies(data.get("scenes"))
+        cover = _instrument_coverage(bodies, spec)
+        misuse = _misuse_count(bodies, spec)
+        if cover < MIN_INSTRUMENT_SCENE_RATIO or misuse:
+            if best is None or (misuse, -cover) < (best[2], -best[1]):
+                best = (data.get("scenes"), cover, misuse)
+            last_reason = (f"{misuse} cảnh tả {spec['label']} sai thực tế (cầm/bê/đặt "
+                           "trên bàn)" if misuse else
+                           f"chỉ {cover:.0%} cảnh có nhân vật chơi {spec['label']} "
+                           f"(cần ≥{MIN_INSTRUMENT_SCENE_RATIO:.0%})")
+            _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — viết lại…")
+            continue
+        _log(f"Đã sinh {n} prompt cảnh (tiếng Anh) từ hai character sheet ({model}"
+             f"{f', {cover:.0%} cảnh chơi ' + spec['label'] if spec else ''}).")
+        return scenes
+    if best is not None:
+        scenes = _scene_dict(_without_misuse(best[0], spec), n, ident, pet_sheet)
+        if scenes:
+            _log(f"Dùng bộ cảnh tốt nhất ({best[1]:.0%} cảnh chơi {spec['label']}"
+                 f"{f', đã bỏ câu tả sai ở {best[2]} cảnh' if best[2] else ''}); khối "
+                 "danh tính đầu mỗi prompt vẫn khoá đúng nhạc cụ.")
+            return scenes
+    _log(f"Không sinh được prompt cảnh sau {_MAX_ATTEMPTS} lần (lý do cuối: {last_reason}).")
+    return None
 
+
+def _scene_dict(raw, n: int, character_sheet: str,
+                pet_sheet: str) -> Optional[dict[str, str]]:
+    """Chuẩn hoá 'scenes' (list hoặc dict) thành {"0":prompt, ...} đủ n mục.
+
+    Mỗi prompt được gắn thêm MỆNH ĐỀ KHOÁ nguyên liệu ở đầu để model video
+    không vẽ lại bảng thiết kế mà đặt đúng nhân vật vào cảnh."""
+    items: list[str] = []
+    if isinstance(raw, list):
+        for it in raw:
+            if isinstance(it, dict):
+                v = it.get("prompt")
+            else:
+                v = it
+            items.append(v.strip() if isinstance(v, str) else "")
+    elif isinstance(raw, dict):
+        for i in range(n):
+            v = raw.get(str(i)) or raw.get(i)
+            if isinstance(v, dict):
+                v = v.get("prompt")
+            items.append(v.strip() if isinstance(v, str) else "")
+    else:
+        return None
+    if len(items) < n or any(not v for v in items[:n]):
+        return None
+    return {str(i): _with_ingredient_lock(items[i], character_sheet, pet_sheet)
+            for i in range(n)}
+
+
+def _with_ingredient_lock(scene: str, character_sheet: str,
+                          pet_sheet: str) -> str:
+    """Dán mệnh đề khoá nguyên liệu vào ĐẦU prompt cảnh gửi cho Flow/Veo.
+
+    Model video nhận 2 ảnh nguyên liệu là BẢNG THIẾT KẾ (nhiều góc nhìn, có nhãn
+    chữ). Không nói rõ, nó dễ dựng lại chính bảng thiết kế đó thành clip. Câu
+    khoá này buộc nó chỉ LẤY DANH TÍNH từ nguyên liệu rồi đặt vào cảnh thật."""
+    scene = (scene or "").strip()
+    from .config import INGREDIENT_LOCK_FULL
+    head = INGREDIENT_LOCK_FULL
+    ident = " ".join(x.strip() for x in (character_sheet, pet_sheet) if x and x.strip())
+    if ident:
+        head += f"\nIDENTITY TO KEEP: {ident}"
+    return f"{head}\n\nSCENE: {scene}"
 
 def _with_character_lock(sheet: str, scene: str) -> str:
     """Ghép KHỐI danh tính cố định (sheet) vào ĐẦU prompt cảnh (scene) — y nguyên
@@ -434,9 +903,9 @@ def _with_character_lock(sheet: str, scene: str) -> str:
     scene = (scene or "").strip()
     if not sheet:
         return scene
-    return (f"NHÂN VẬT (GIỮ CỐ ĐỊNH TUYỆT ĐỐI Ở MỌI SHOT — không đổi khuôn mặt, "
-            f"tóc, trang phục, màu sắc, đạo cụ): {sheet}\n\n"
-            f"BỐI CẢNH & DIỄN XUẤT SHOT NÀY: {scene}")
+    return (f"CHARACTERS (KEEP ABSOLUTELY FIXED IN EVERY SHOT — never change face, "
+            f"hair, outfit, colours or props): {sheet}\n\n"
+            f"SETTING & ACTION OF THIS SHOT: {scene}")
 
 
 def _extract_json(text: str) -> Optional[dict]:
@@ -464,18 +933,23 @@ def generate_prompts(
     idea: str,
     title: str,
     keywords: str,
-    image_count: int,
+    scene_count: int,
     aspect_ratio: str,
     style: str,
     api_config,
     log=None,
     creative_brief: str = "",
     metadata_out: Optional[dict] = None,
+    instrument: str = "",
 ) -> Optional[tuple[dict[str, str], dict[str, str]]]:
     """
-    Trả về (prompts, motions) — mỗi cái là dict {"0":..., ..., "N-1":...} —
-    hoặc None nếu không dùng được AI. `prompts` là prompt ảnh (bắt buộc đủ N);
-    `motions` là prompt chuyển động clip (best-effort, có thể rỗng nếu AI thiếu).
+    Trả về (prompts, motions) hoặc None nếu không dùng được AI.
+      prompts: ĐÚNG 3 prompt ảnh — "1" main character sheet, "2" pet character
+               sheet, "0" thumbnail.
+      motions: `scene_count` prompt cảnh cho Flow (best-effort; thiếu thì caller
+               gọi generate_scene_prompts bổ sung).
+    `metadata_out` (nếu truyền) nhận character_sheet / pet_sheet / palette /
+    settings để caller lưu vào prompts.json làm khoá continuity.
     `api_config` là instance APIConfig (có api_key/base_url/model).
     `log` (tùy chọn): callable(msg) để ghi log tiến trình.
     """
@@ -511,10 +985,31 @@ def generate_prompts(
         _log(f"Không khởi tạo được client OpenAI ({type(e).__name__}: {e}) — "
              f"dừng chuẩn bị prompt.")
         return None
-    user_msg = _build_user_prompt(idea, title, keywords, image_count,
-                                  aspect_ratio, style)
-    user_msg += ("\nCREATIVE BRIEF CHUNG (dữ liệu tham khảo; yêu cầu cụ thể của người dùng "
-                 "ưu tiên hơn các gợi ý palette/ánh sáng):\n" + creative_brief)
+    # Mọi prompt gửi Gemini/Flow phải 100% tiếng Anh ⇒ dịch ý tưởng / tiêu đề /
+    # từ khoá / brief của người dùng TRƯỚC khi đưa vào lời nhắc (JSON hồ sơ được
+    # dịch từng trường, giữ nguyên khoá).
+    try:
+        idea = to_english(idea, api_config, _log)
+        title = to_english(title or "", api_config, _log)
+        keywords = to_english(keywords or "", api_config, _log)
+        creative_brief = to_english(creative_brief or "", api_config, _log)
+    except TranslationError as e:
+        _log(f"{e} — dừng chuẩn bị prompt (không gửi prompt lẫn tiếng Việt).")
+        return None
+    spec = _resolve_instrument(instrument, idea, api_config, _log)
+    if spec:
+        _log(f"Khoá nhạc cụ project: {spec['label']} — bảng nhân vật, ảnh bìa và các "
+             "cảnh đều phải chơi đúng nhạc cụ này.")
+    companion_mode = _companion_mode(idea)
+    if companion_mode == "pet":
+        _log("Thể loại lofi → bạn đồng hành (ảnh 2) bắt buộc là thú cưng thật, "
+             "không linh thú.")
+    user_msg = _build_user_prompt(idea, title, keywords, scene_count,
+                                  aspect_ratio, style, instrument_spec=spec,
+                                  companion_mode=companion_mode)
+    user_msg += ("\nSHARED CREATIVE BRIEF (reference data; the user's specific "
+                 "requirements take priority over these palette/lighting "
+                 "suggestions):\n" + creative_brief)
     sys_msg = _system_for(style)
 
     # Thử lại _MAX_ATTEMPTS lần: model thỉnh thoảng trả JSON hỏng/cắt cụt/thiếu
@@ -525,10 +1020,10 @@ def generate_prompts(
         try:
             resp = client.chat.completions.create(
                 model=model,
-                # Đủ rộng cho 41 prompt ảnh chi tiết (90-140 từ tiếng Việt) +
-                # 41 prompt chuyển động + character_bible; tránh JSON bị cắt cụt
-                # (finish_reason=length) → thiếu key. Cần model có giới hạn
-                # output lớn (vd gpt-4.1: 32768) khi tạo đủ 41 shot.
+                # Đủ rộng cho hồ sơ 2 nhân vật + 40 prompt cảnh (90-140 từ tiếng
+                # Việt mỗi cảnh); tránh JSON bị cắt cụt (finish_reason=length)
+                # → thiếu key. Cần model có giới hạn output lớn (vd gpt-4.1:
+                # 32768) khi sinh đủ 40 cảnh trong một lượt.
                 max_tokens=32000,
                 # BẮT model trả JSON hợp lệ (không prose/markdown). Không có cờ
                 # này, gpt-4.1 qua proxy THỈNH THOẢNG trả kèm văn xuôi → parse
@@ -556,65 +1051,130 @@ def generate_prompts(
             last_reason = "trả về không phải JSON hợp lệ"
             _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — thử lại…")
             continue
-
-        prompts = data.get("prompts")
-        if not isinstance(prompts, dict):
-            last_reason = "JSON thiếu 'prompts'"
+        bad = non_english_fields(data)
+        if bad:
+            last_reason = f"còn chữ không phải tiếng Anh ở {', '.join(bad[:4])}"
             _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — thử lại…")
             continue
 
-        # ĐỒNG BỘ NHÂN VẬT: dán KHỐI danh tính (character_sheet) y NGUYÊN vào đầu
-        # MỌI prompt. Không dựa vào việc model tự tả lại ngoại hình ở mỗi shot
-        # (nó paraphrase khác nhau → Gemini vẽ nhân vật lệch). Cùng một chuỗi
-        # danh tính cho tất cả shot → hình dáng/trang phục/màu giống hệt.
-        sheet = data.get("character_sheet")
-        if not isinstance(sheet, str) or len(sheet.strip()) < 20:
-            # Model quên viết sheet cô đọng → lấy tạm character_bible làm chốt.
-            sheet = data.get("character_bible")
-        sheet = sheet.strip() if isinstance(sheet, str) else ""
-        scene_sheet = data.get("scene_sheet")
-        if not sheet or not isinstance(scene_sheet, str) or len(scene_sheet.strip()) < 20:
-            last_reason = "thiếu khối khoá nhân vật hoặc scene_sheet/bố cục"
+        # HAI KHỐI DANH TÍNH là "nguồn sự thật" cho cả bộ: character_sheet dán
+        # vào ảnh 0/1, pet_sheet dán vào ảnh 0/2, và cả hai dán vào MỌI prompt
+        # cảnh. Không để model tự paraphrase ngoại hình ở từng cảnh (paraphrase
+        # khác nhau → nhân vật lệch giữa các clip).
+        raw_sheet = _text(data.get("character_sheet")) or _text(data.get("character_bible"))
+        pet_sheet = _text(data.get("pet_sheet"))
+        # Bảng nhân vật CHỈ vẽ người: bỏ mọi câu nhắc nhạc cụ / đồ vật khỏi khối
+        # danh tính (đây cũng là khoá continuity dán vào ảnh 0/1 + mọi cảnh).
+        sheet = _strip_objects(raw_sheet, spec)
+        if len(sheet) < 20 or len(pet_sheet) < 20:
+            last_reason = "thiếu character_sheet hoặc pet_sheet"
             _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — thử lại…")
             continue
-        scene_sheet = scene_sheet.strip()
-        if sheet:
-            _log(f"Khoá danh tính nhân vật ({len(sheet)} ký tự) — dán vào mọi shot.")
+
+        palette = _str_list(data.get("palette"), 3, 8)
+        main_insets, inst_from_insets = _split_main_insets(
+            _str_list(data.get("main_insets"), 4, 10), spec)
+        pet_insets = _str_list(data.get("pet_insets"), 4, 10)
+        if not palette or len(main_insets) < 3 or not pet_insets:
+            last_reason = "thiếu palette / main_insets / pet_insets"
+            _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — thử lại…")
+            continue
+        main_outfit = [x for x in (_strip_objects(o, spec) for o in
+                                   _str_list(data.get("main_outfit"), 2, 8)) if x]
+        inst_detail = _strip_objects(_text(data.get("instrument_detail")) or inst_from_insets,
+                                     spec, instruments=False)
+        if spec and inst_detail and not music_spec.mentions_instrument(inst_detail, spec):
+            inst_detail = ""        # AI tả nhầm nhạc cụ khác → chỉ dùng mô tả chuẩn
+        main_expr = (_str_list(data.get("main_expressions"), 2, 6)
+                     or ["NEUTRAL — serene, composed look",
+                         "CALM — half-closed eyes, faint smile",
+                         "DETERMINED — steady, resolute gaze",
+                         "JOYFUL — gentle smile, crescent eyes"])
+        pet_expr = (_str_list(data.get("pet_expressions"), 2, 6)
+                    or ["NEUTRAL — relaxed", "CALM — eyes half closed",
+                        "ALERT — ears up, eyes wide", "PLAYFUL — cheerful"])
+
+        thumb = _text(data.get("thumbnail"))
+        if len(thumb) < 30:
+            last_reason = "thiếu prompt ảnh bìa (thumbnail)"
+            _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — thử lại…")
+            continue
+        if _instrument_misuse(thumb, spec):
+            last_reason = (f"ảnh bìa tả {spec['label']} sai thực tế (cầm/bê/đặt trên "
+                           "bàn) — phải ngồi chơi")
+            _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — viết lại…")
+            continue
+
+        pet_name = _text(data.get("pet_name"))
+        pet_traits = _str_list(data.get("pet_traits"), 1, 6)
+        pet_subject = _text(data.get("pet_subject"))
+        pet_text = " ".join([pet_name, pet_sheet, pet_subject, *pet_insets, *pet_traits])
+        spirit = _is_spirit(_text(data.get("pet_kind")), pet_text)
+        if companion_mode == "pet" and (spirit or _SPIRIT_WORDS.search(pet_text)):
+            hit = _SPIRIT_WORDS.search(pet_text)
+            last_reason = ("lofi: bạn đồng hành phải là thú cưng thật, AI lại tả "
+                           f"linh thú{f' ({hit.group(0)})' if hit else ''}")
+            _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — viết lại…")
+            continue
+        companion = "CREATURE" if spirit else "PET"
+        pet_name = pet_name or f"companion {companion.lower()}"
+        # Khối ĐỐI TƯỢNG = mô tả tạo hình chi tiết + khối danh tính cô đọng
+        # (character_sheet) — khối này cũng đứng đầu MỌI prompt cảnh, nên ảnh và
+        # clip tả cùng một nhân vật bằng cùng một câu chữ.
+        main_subject = _strip_objects(_text(data.get("main_subject")), spec)
+        # Ảnh bìa + mọi cảnh: khối danh tính + dòng NHẠC CỤ đúng thực tế (code viết).
+        ident = (_identity_with_instrument(sheet, spec) if spec else
+                 f"{sheet}\nINSTRUMENT: {inst_detail}" if inst_detail else sheet)
+        out = {
+            "1": _model_sheet_prompt(
+                title_en="MAIN CHARACTER SHEET",
+                subject=f"{main_subject}\n{sheet}" if main_subject else sheet,
+                insets=main_insets, palette=palette,
+                scale_note=(_text(data.get("main_scale"))
+                            or "state the character's height and head-count proportion"),
+                expressions=main_expr, aspect_ratio=aspect_ratio,
+                instrument_spec=spec, kind="main", outfit_items=main_outfit,
+                instrument_detail=inst_detail),
+            "2": _model_sheet_prompt(
+                title_en=f"COMPANION {companion} SHEET",
+                subject=f"{pet_subject}\n{pet_sheet}" if pet_subject else pet_sheet,
+                insets=pet_insets, palette=palette,
+                scale_note=(_text(data.get("pet_scale"))
+                            or "SIZE MAP: compare the human's height with the companion"),
+                expressions=pet_expr, aspect_ratio=aspect_ratio, kind="companion",
+                extra_sections=([
+                    "CHARACTER TRAITS — a separate small box, uppercase labels, short list: "
+                    + "; ".join(pet_traits)
+                ] if pet_traits else None)),
+            "0": _with_character_lock(f"{ident}\nCOMPANION {companion} ({pet_name}): {pet_sheet}",
+                                      thumb),
+        }
+
+        # Caller bổ sung prompt cảnh riêng nếu thiếu; chưa đủ thì không chạy media.
+        motions = _scene_dict(data.get("scenes"), scene_count, ident, pet_sheet) or {}
+        bodies = _scene_bodies(data.get("scenes"))
+        cover = _instrument_coverage(bodies, spec)
+        misuse = _misuse_count(bodies, spec)
+        if motions and (cover < MIN_INSTRUMENT_SCENE_RATIO or misuse):
+            # Hồ sơ nhân vật dùng được; chỉ bộ cảnh chưa đạt → để workflow viết
+            # lại bộ cảnh (generate_scene_prompts có cùng kiểm tra).
+            _log(f"{misuse} cảnh tả {spec['label']} sai thực tế — sẽ viết lại bộ cảnh."
+                 if misuse else
+                 f"Chỉ {cover:.0%} cảnh có nhân vật chơi {spec['label']} — sẽ viết "
+                 "lại bộ cảnh.")
+            motions = {}
+        if len(motions) == scene_count:
+            _log(f"Đã sinh 3 prompt ảnh (2 bảng phân tích nhân vật + ảnh bìa) "
+                 f"và {scene_count} prompt cảnh ({model}, lần {attempt}).")
         else:
-            _log("Cảnh báo: thiếu character_sheet — nhân vật có thể lệch giữa shot.")
-
-        # Chuẩn hoá key về str và kiểm tra đủ 0..N-1
-        out: dict[str, str] = {}
-        missing = None
-        for i in range(image_count):
-            val = prompts.get(str(i)) or prompts.get(i)
-            if not isinstance(val, str) or not val.strip():
-                missing = i
-                break
-            out[str(i)] = _with_character_lock(sheet, scene_sheet + "\n" + val.strip())
-        if missing is not None:
-            last_reason = (f"thiếu prompt cho ảnh {missing} "
-                           f"({len(out)}/{image_count})")
-            _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — thử lại…")
-            continue
-
-        # Caller bổ sung motion riêng nếu thiếu; chưa đủ thì không chạy media.
-        motions_raw = data.get("motions")
-        motions: dict[str, str] = {}
-        if isinstance(motions_raw, dict):
-            for i in range(image_count):
-                mv = motions_raw.get(str(i)) or motions_raw.get(i)
-                if isinstance(mv, str) and mv.strip():
-                    motions[str(i)] = mv.strip()
-        if len(motions) == image_count:
-            _log(f"Đã sinh {image_count} prompt ảnh + {len(motions)} prompt "
-                 f"chuyển động từ ý tưởng bằng OpenAI ({model}, lần {attempt}).")
-        else:
-            _log(f"Đã sinh {image_count} prompt ảnh ({model}, lần {attempt}); "
-                 f"motion {len(motions)}/{image_count} — workflow sẽ sinh bổ sung.")
+            _log(f"Đã sinh 3 prompt ảnh ({model}, lần {attempt}); prompt cảnh "
+                 f"{len(motions)}/{scene_count} — workflow sẽ sinh bổ sung.")
         if metadata_out is not None:
-            metadata_out.update(character_sheet=sheet, scene_sheet=scene_sheet,
-                                character_bible=data.get("character_bible", ""))
+            metadata_out.update(
+                character_sheet=sheet, pet_sheet=pet_sheet, pet_name=pet_name,
+                pet_kind="spirit creature" if spirit else "pet", palette=palette,
+                character_bible=_text(data.get("character_bible")),
+                settings=_settings_of(data.get("scenes")))
         return out, motions
 
     _log(f"AI không sinh được prompt sau {_MAX_ATTEMPTS} lần thử "

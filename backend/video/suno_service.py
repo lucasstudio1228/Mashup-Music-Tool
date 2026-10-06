@@ -21,6 +21,7 @@ AN TOÀN:
 from __future__ import annotations
 
 import json
+import random
 import shutil
 import time
 import uuid
@@ -33,7 +34,8 @@ from sqlmodel import Session, select
 from backend.database import engine, DB_PATH
 from backend.models import Project, SunoBatch, SunoCandidate, Track
 from backend.video import config as vconfig
-from backend.video.browser_base import BrowserSession
+from backend.video.browser_base import (BrowserSession, OperationCancelled,
+                                        cancellable_sleep, set_cancel_check)
 from backend.video.suno_driver import (
     SunoDriver, SunoLoginRequired, SunoUIChanged, SunoSubmissionUncertain,
     SunoBudgetError, SunoError, NewSong,
@@ -135,6 +137,8 @@ def resolve_batch_config(overrides: Optional[dict] = None) -> dict:
                                             base.max_generation_credits)),
         "max_new_song_downloads": int(ov.get("max_new_song_downloads",
                                             base.max_new_song_downloads)),
+        "max_replacement_creates": int(ov.get("max_replacement_creates",
+                                              base.max_replacement_creates)),
         "auto_continue_workflow": bool(ov.get("auto_continue_workflow",
                                              base.auto_continue_workflow)),
     }
@@ -167,7 +171,9 @@ def prepare_batch_prompts(project: Project, cfg: dict, log=None) -> dict:
             styles, cfg["exclusions"] = result["styles"], result["exclusions"]
         cfg["styles"] = compose_project_styles(styles, brief["music"])
         cfg["prompt_plan"] = build_suno_prompt_plan(cfg["styles"], cfg["exclusions"],
-                                                   int(cfg["max_create_actions"]))
+                                                   int(cfg["max_create_actions"]),
+                                                   music_style=context.get("purpose", ""),
+                                                   instrument=context.get("instrument", ""))
         cfg["creative_brief"] = brief
         cfg["creative_context"] = context
         cfg["prompt_workflow_version"] = 1
@@ -347,7 +353,21 @@ def run_suno_step0(project_id: int, progress_cb: Callable,
         report(msg)
 
     _cancel_requested.discard(project_id)   # bắt đầu lượt chạy mới
+    # Huỷ/Tạm dừng có hiệu lực NGAY trong các vòng chờ Playwright/sleep dài
+    # (trước đây phải đợi tới checkpoint progress_cb kế tiếp → vài phút).
+    set_cancel_check(getattr(progress_cb, "is_cancelled", None))
+    try:
+        return _run_step0(project_id, report, log, dry_run=dry_run,
+                          overrides=overrides, resume=resume)
+    except OperationCancelled:
+        from backend.video.job_manager import JobCancelled
+        raise JobCancelled() from None
+    finally:
+        set_cancel_check(None)
 
+
+def _run_step0(project_id: int, report: Callable, log: Callable, *, dry_run: bool,
+               overrides: Optional[dict], resume: bool) -> dict:
     with Session(engine) as session:
         project = session.get(Project, project_id)
         if project is None:
@@ -401,9 +421,10 @@ def run_suno_step0(project_id: int, progress_cb: Callable,
         except SunoBudgetError as e:
             _touch(session, batch, INSUFFICIENT_GENERATION_CREDITS, str(e), str(e))
             raise
-        except Exception as e:
-            # JobCancelled (pause/cancel) hoặc lỗi khác — giữ state resume được.
-            if type(e).__name__ == "JobCancelled":
+        except (Exception, OperationCancelled) as e:
+            # JobCancelled/OperationCancelled (pause/cancel) hoặc lỗi khác — giữ
+            # state resume được.
+            if type(e).__name__ in ("JobCancelled", "OperationCancelled"):
                 if project_id in _cancel_requested:
                     _touch(session, batch, CANCELLED, "Đã huỷ batch Suno.", None)
                 else:
@@ -417,6 +438,114 @@ def run_suno_step0(project_id: int, progress_cb: Callable,
             _release_lock(session, batch)
 
 
+_CLOSED_MARKERS = ("has been closed", "targetclosederror", "target closed",
+                   "browser has disconnected", "connection closed")
+
+
+def _is_browser_closed(e: BaseException) -> bool:
+    """Lỗi do trình duyệt/tab đã chết (crash, bị đóng) — KHÔNG phải lỗi của bài."""
+    txt = f"{type(e).__name__}: {e}".lower()
+    return any(m in txt for m in _CLOSED_MARKERS)
+
+
+class _BrowserClosed(Exception):
+    """Trình duyệt Suno đã chết giữa chừng → cần mở lại phiên mới."""
+
+
+class _BrowserGaveUp(SunoError):
+    """Mở lại quá số lần cho phép — dừng ở WAITING_FOR_HUMAN (resume được)."""
+
+
+def _file_logger(path: Path, log: _LOG) -> _LOG:
+    """Ghi thêm log ra file trong staging (để chẩn đoán sau) rồi chuyển tiếp."""
+    def _log(msg: str) -> None:
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+        except Exception:
+            pass
+        log(msg)
+    return _log
+
+
+class _SunoBrowser:
+    """Giữ 1 BrowserSession Suno và cho phép MỞ LẠI khi trình duyệt sập.
+    Playwright sync chỉ chạy 1 instance/thread → đóng hẳn phiên cũ trước khi mở."""
+
+    def __init__(self, dry_run: bool, log: _LOG):
+        self.dry_run = dry_run
+        self.log = log
+        self.bs: Optional[BrowserSession] = None
+
+    def open(self) -> SunoDriver:
+        self.close()
+        bs = BrowserSession(profile_dir=vconfig.SUNO_PROFILE_DIR)
+        bs.__enter__()
+        self.bs = bs
+        return SunoDriver(bs.new_page(), dry_run=self.dry_run,
+                          selectors=vconfig.get_selectors("suno"), log=self.log)
+
+    def reopen(self) -> SunoDriver:
+        """Mở lại sau khi sập. Ngay sau crash, tiến trình Cốc Cốc cũ có thể chưa
+        thoát hẳn khỏi profile → phiên mới vừa mở đã chết theo (đã gặp LIVE:
+        'sẵn sàng' rồi sập lại cùng giây). Nên xác nhận phiên SỐNG ỔN ĐỊNH vài
+        giây rồi mới trả về; chết thì chờ lâu hơn và tự thử lại tại chỗ."""
+        self.log("Trình duyệt Suno đã đóng/sập — mở lại phiên mới…")
+        last: Optional[BaseException] = None
+        for i in range(3):
+            self.close()
+            cancellable_sleep(10 + 10 * i)
+            try:
+                driver = self.open()
+                driver.open_create_page()          # xác nhận vẫn đăng nhập
+                driver.page.wait_for_timeout(4000)
+                driver.page.evaluate("1")          # còn sống sau 4s?
+                self.log("Đã mở lại trình duyệt Suno (ổn định).")
+                return driver
+            except Exception as e:                 # noqa: BLE001
+                if not _is_browser_closed(e):
+                    raise
+                last = e
+        raise _BrowserClosed(f"Không mở lại được trình duyệt Suno: {last}")
+
+    def close(self) -> None:
+        if self.bs is not None:
+            try:
+                self.bs.__exit__(None, None, None)
+            except Exception:
+                pass
+            self.bs = None
+
+    def __enter__(self) -> "_SunoBrowser":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+def _configure_create_form(driver: SunoDriver, cfg: dict, dry_run: bool) -> None:
+    """Advanced / model / instrumental / Exclude / Duration / Max Mode trên trang
+    /create. Dùng cho preflight VÀ cho lượt Create thay thế (driver lúc đó đang
+    đứng ở trang bài nên phải cấu hình lại form)."""
+    driver.select_advanced_mode()
+    driver.open_more_options()
+    # Người dùng chốt: Duration LUÔN Auto. Độ dài được lọc SAU khi tải (≥120 s
+    # bắt buộc, ưu tiên 3–5 phút — _prefer_duration / _replace_dead_creates).
+    # Kiểm TRƯỚC các bước khác: nếu phải tải lại trang thì không mất gì đã điền.
+    driver.ensure_duration_auto()
+    driver.select_model(cfg.get("preferred_model", "v6"),
+                        allow_fallback=cfg.get("allow_model_fallback", False))
+    if cfg.get("instrumental", True):
+        driver.assert_instrumental()
+    # LIVE: Styles được điền riêng cho từng lượt Create (prompt_plan) ngay trước
+    # khi bấm → điền Styles chung ở đây chỉ là thao tác thừa bị ghi đè. Dry-run
+    # vẫn điền để kiểm tra form.
+    if dry_run:
+        driver.fill_styles(cfg["styles"])
+    driver.fill_exclusions(cfg["exclusions"])
+    driver.set_max_mode(cfg.get("max_mode", False))
+
+
 def _drive_batch(session: Session, batch: SunoBatch, cfg: dict,
                  dry_run: bool, report: Callable, log: _LOG) -> dict:
     """Thân điều phối. Mỗi phase lưu state trước khi sang phase kế → resume an toàn."""
@@ -425,10 +554,10 @@ def _drive_batch(session: Session, batch: SunoBatch, cfg: dict,
         (vconfig.SUNO_STAGING_ROOT / f"project_{batch.project_id}")
     staging.mkdir(parents=True, exist_ok=True)
 
-    with BrowserSession(profile_dir=vconfig.SUNO_PROFILE_DIR) as bs:
-        page = bs.new_page()
-        driver = SunoDriver(page, dry_run=dry_run,
-                            selectors=vconfig.get_selectors("suno"), log=log)
+    log = _file_logger(staging / "_suno.log", log)
+
+    with _SunoBrowser(dry_run, log) as sb:
+        driver = sb.open()
 
         # ── PREFLIGHT ──
         report("Mở Suno, kiểm tra đăng nhập…", 5)
@@ -443,17 +572,7 @@ def _drive_batch(session: Session, batch: SunoBatch, cfg: dict,
 
         # ── Cấu hình form (an toàn cho dry-run) ──
         report("Cấu hình Advanced / model / styles…", 12)
-        driver.select_advanced_mode()
-        driver.select_model(cfg.get("preferred_model", "v6"),
-                            allow_fallback=cfg.get("allow_model_fallback", False))
-        if cfg.get("instrumental", True):
-            driver.assert_instrumental()
-        driver.fill_styles(cfg["styles"])
-        driver.open_more_options()
-        driver.fill_exclusions(cfg["exclusions"])
-        dur = cfg.get("preferred_duration_seconds_min") or None
-        driver.set_duration(dur)
-        driver.set_max_mode(cfg.get("max_mode", False))
+        _configure_create_form(driver, cfg, dry_run)
 
         if dry_run:
             report("DRY-RUN xong: đã điền form & đọc trạng thái, KHÔNG tạo/tải.",
@@ -468,14 +587,21 @@ def _drive_batch(session: Session, batch: SunoBatch, cfg: dict,
                                report, log)
 
         # ── DOWNLOADING + VALIDATING ──
-        _download_and_validate(session, batch, cfg, driver, target,
-                               staging, report, log)
+        try:
+            _download_and_validate(session, batch, cfg, driver, target,
+                                   staging, report, log, reopen=sb.reopen)
+        except _BrowserGaveUp as e:
+            log(f"DỪNG: {e}")
+            _touch(session, batch, WAITING_FOR_HUMAN, str(e))
+            return _summary(session, batch, dry_run=False, credits=credits)
 
         # Đủ 15 hợp lệ chưa?
         valid = _count(session, batch, validation_status="valid", selected=True)
         if valid < target:
-            _touch(session, batch, WAITING_FOR_HUMAN,
-                   f"Mới có {valid}/{target} WAV hợp lệ — cần thêm/kiểm tra thủ công.")
+            msg = (f"Mới có {valid}/{target} WAV hợp lệ — bấm Resume để tải lại "
+                   f"bài lỗi (miễn phí) hoặc kiểm tra thủ công.")
+            log(f"DỪNG: {msg}")
+            _touch(session, batch, WAITING_FOR_HUMAN, msg)
             return _summary(session, batch, dry_run=False, credits=credits)
 
         # ── READY_FOR_IMPORT → IMPORTED (publish cả batch 1 lần) ──
@@ -503,25 +629,117 @@ def _drive_batch(session: Session, batch: SunoBatch, cfg: dict,
     return _summary(session, batch, dry_run=False, credits=None)
 
 
+# Suno chỉ nhận ~10 lượt Create đang render cùng lúc: 2026-09-28 bấm 11 lượt
+# trong 45 giây → lượt 11 không được nhận (không bài mới, không trừ credit) mà
+# vẫn bị tính vào ngân sách → lô dừng ở 14/15 bài. Giữ tối đa N lượt trong cửa
+# sổ render (một bài Suno render ~2–4 phút).
+# 2026-10-02 người dùng chốt: mỗi quãng nghỉ CHỈ 60s (240s làm 1 lô chờ ~15'
+# trông như treo). Lượt nào Suno bỏ qua vẫn được bù bằng _lost_requests.
+_MAX_INFLIGHT_CREATES = 8
+_INFLIGHT_WINDOW_SEC = 60
+
+
+def _as_utc(dt: datetime) -> datetime:
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _recent_create_times(session, batch) -> list[datetime]:
+    """Thời điểm của các lượt Create gần đây (theo candidate đầu tiên của lượt)."""
+    first: dict[str, datetime] = {}
+    for c in session.exec(select(SunoCandidate)
+                          .where(SunoCandidate.batch_id == batch.id)).all():
+        t = _as_utc(c.created_at)
+        if c.request_id not in first or t < first[c.request_id]:
+            first[c.request_id] = t
+    return sorted(first.values())
+
+
+def _countdown(seconds: float, label: str, report=None, step: float = 15.0) -> None:
+    """Ngủ (huỷ được) nhưng cập nhật thanh tiến độ mỗi `step` giây với số giây
+    còn lại — chờ có chủ đích vài phút mà dòng trạng thái đứng yên thì người
+    dùng tưởng tool bị treo. Chỉ gửi lên thanh tiến độ, không ghi _suno.log."""
+    end = time.time() + max(0.0, seconds)
+    while True:
+        left = end - time.time()
+        if left <= 0:
+            return
+        if report is not None:
+            report(f"{label} — còn ~{int(left)}s (đang chờ có chủ đích, không phải treo).")
+        cancellable_sleep(min(step, left))
+
+
+def _throttle_inflight(session, batch, run_times: list[datetime], report, log) -> None:
+    """Chờ tới khi số lượt Create trong cửa sổ render < _MAX_INFLIGHT_CREATES."""
+    announced = False
+    while True:
+        now = _now()
+        times = [t for t in (run_times + _recent_create_times(session, batch))
+                 if (now - t).total_seconds() < _INFLIGHT_WINDOW_SEC]
+        # run_times và candidate trùng nhau cho cùng 1 lượt → gộp theo giây.
+        uniq = sorted({int(t.timestamp()) for t in times})
+        if len(uniq) < _MAX_INFLIGHT_CREATES:
+            return
+        wait = _INFLIGHT_WINDOW_SEC - (now.timestamp() - uniq[0]) + 2
+        if not announced:
+            log(f"Đã có {len(uniq)} lượt Create đang render — chờ ~{int(wait)}s cho "
+                f"Suno render bớt rồi mới Create tiếp (tránh lượt bị Suno bỏ qua).")
+            announced = True
+        report(f"Chờ Suno render bớt ({len(uniq)} lượt đang chạy) — còn ~{int(wait)}s "
+               f"(đang chờ có chủ đích, không phải treo).")
+        cancellable_sleep(min(15.0, max(1.0, wait)))
+
+
+def _lost_requests(session, batch, max_creates: int) -> list[str]:
+    """Lượt Create cơ bản (req1..reqN) đã tính vào ngân sách nhưng KHÔNG có bài
+    nào được ghi nhận (Suno không nhận lượt đó / tool bị ngắt giữa chừng) và
+    chưa được bù bằng lượt 'reqX:pK'."""
+    rows = session.exec(select(SunoCandidate)
+                        .where(SunoCandidate.batch_id == batch.id)).all()
+    have = {c.request_id for c in rows}
+    compensated = {int(r.rsplit(":p", 1)[1]) for r in have if ":p" in r}
+    used = min(batch.create_actions_used, max_creates)
+    return [f"req{i}" for i in range(1, used + 1)
+            if f"req{i}" not in have and i not in compensated]
+
+
 def _generate_until_target(session, batch, cfg, driver: SunoDriver, target,
                            report, log) -> None:
     _touch(session, batch, GENERATING, "Đang tạo bài trên Suno…")
     max_creates = int(cfg.get("max_create_actions", 15))
+    max_extra = int(cfg.get("max_replacement_creates", 5))
+    plan = cfg.get("prompt_plan") or []
     songs_per_req = _ASSUMED_SONGS_PER_REQUEST
+    run_times: list[datetime] = []
     # Mỗi Create chỉ lấy 1 bài (2 bài na ná) → đếm theo bài ĐÃ CHỌN, không đếm
     # tổng candidate. Cần đủ `target` lượt Create khác nhau mới đủ `target` bài.
     while _count(session, batch, selected=True) < target:
-        if batch.create_actions_used >= max_creates:
-            raise SunoBudgetError(
-                f"Chạm trần max_create_actions={max_creates} nhưng mới chọn được "
-                f"{_count(session, batch, selected=True)}/{target} bài. "
-                f"Dừng để không tốn thêm.")
+        if batch.create_actions_used < max_creates:
+            plan_idx = batch.create_actions_used
+            req_id = f"req{batch.create_actions_used + 1}"
+        else:
+            # Hết lượt cơ bản: bù các lượt "mất" (không có bài) bằng CHÍNH prompt
+            # của lượt đó, tính vào hạn mức lượt thay thế (không đốt vô hạn).
+            lost = _lost_requests(session, batch, max_creates)
+            extra_used = batch.create_actions_used - max_creates
+            if not lost or extra_used >= max_extra:
+                raise SunoBudgetError(
+                    f"Chạm trần max_create_actions={max_creates} (+{extra_used}/"
+                    f"{max_extra} lượt bù) nhưng mới chọn được "
+                    f"{_count(session, batch, selected=True)}/{target} bài. "
+                    f"Dừng để không tốn thêm.")
+            plan_idx = _plan_index(lost[0])
+            req_id = f"req{batch.create_actions_used + 1}:p{plan_idx + 1}"
+            log(f"Lượt Create {lost[0]} không có bài nào (Suno không nhận) — "
+                f"Create bù {req_id} ({extra_used + 1}/{max_extra}).")
+        if not 0 <= plan_idx < len(plan):
+            raise SunoBudgetError(f"Không có prompt cho lượt {req_id} — dừng.")
         credits = driver.read_credits()
         if credits is not None and credits <= 0:
             raise SunoBudgetError("Hết credit giữa chừng — dừng, resume sau khi nạp.")
 
+        _throttle_inflight(session, batch, run_times, report, log)
         before = driver.snapshot_song_ids()
-        item = cfg["prompt_plan"][batch.create_actions_used]
+        item = plan[plan_idx]
         driver.fill_styles(item["styles"])
         driver.fill_exclusions(item["exclusions"])
         # LƯU submit-intent TRƯỚC khi Create (chống re-click khi timeout).
@@ -531,6 +749,7 @@ def _generate_until_target(session, batch, cfg, driver: SunoDriver, target,
                f"(đã chọn {_count(session, batch, selected=True)}/{target})…")
 
         driver.click_create()
+        run_times.append(_now())
         new_songs = driver.wait_for_new_songs(
             before, expected=songs_per_req, timeout_sec=300)
         # Đo số bài/req thật ở lần đầu.
@@ -538,7 +757,6 @@ def _generate_until_target(session, batch, cfg, driver: SunoDriver, target,
             songs_per_req = max(1, len(new_songs))
             log(f"Đo được: 1 request trả {songs_per_req} bài.")
 
-        req_id = f"req{batch.create_actions_used}"
         for ns in new_songs:
             _record_candidate(session, batch, ns, req_id)
         _mark_selection(session, batch, target)
@@ -548,40 +766,104 @@ def _generate_until_target(session, batch, cfg, driver: SunoDriver, target,
 
 
 def _download_and_validate(session, batch, cfg, driver: SunoDriver, target,
-                           staging: Path, report, log) -> None:
+                           staging: Path, report, log,
+                           reopen: Optional[Callable[[], SunoDriver]] = None) -> None:
+    """Tải + xác thực WAV cho các bài đã chọn.
+
+    Chạy NHIỀU LƯỢT: ngay sau khi Create xong, phần lớn bài vẫn đang render nên
+    lượt đầu có thể hỏng vài bài; nghỉ rồi thử lại thay vì bỏ cuộc (trước đây 1
+    bài hỏng là coi như mất luôn → cả lô dừng ở WAITING_FOR_HUMAN). Hết các lượt
+    mà vẫn thiếu thì ĐÔN bài dự phòng (spare) của chính request đó — spare đã
+    được tạo sẵn cùng lượt Create nên KHÔNG tốn thêm credit."""
     _touch(session, batch, DOWNLOADING, "Tải WAV các bài đã chọn…")
     minimum = float(cfg.get("minimum_duration_seconds", 120))
     max_dl = int(cfg.get("max_new_song_downloads", 15))
+    passes = max(1, int(cfg.get("download_passes", 3)))
+    retry_wait = float(cfg.get("download_retry_wait_sec", 60))
 
-    selected = session.exec(
-        select(SunoCandidate).where(
-            SunoCandidate.batch_id == batch.id,
-            SunoCandidate.selected == True)).all()      # noqa: E712
     known_hashes = {c.sha256 for c in
                     session.exec(select(SunoCandidate).where(
                         SunoCandidate.sha256 != None)).all() if c.sha256}  # noqa: E711
+    # max_dl: trần tải cho bài ĐÃ CHỌN. Bài dự phòng/bài của lượt Create thay
+    # thế được cộng thêm trần riêng khi dùng tới (trước đây 15 bài chọn tải xong
+    # là chạm trần 15 → bài dự phòng không bao giờ tải được).
+    # Chỉ đếm bài ĐANG ĐƯỢC CHỌN đã tải. Trước đây đếm MỌI candidate đã tải
+    # (cả bản probe so độ dài, bản dự phòng, bài lỗi ngắn) → resume project 9
+    # (17 file/15 bài chọn) chạm trần ngay, không tải thêm được bài nào.
+    state = {"downloaded": _count(session, batch, download_status="downloaded",
+                                  selected=True),
+             "driver": driver, "reopens": 0, "probes": 0, "max_dl": max_dl,
+             "tried": set()}
+    max_reopens = int(cfg.get("max_browser_reopens", 5))
+    gap = cfg.get("download_gap_sec", (8.0, 20.0))
 
-    downloaded = _count(session, batch, download_status="downloaded")
-    for c in selected:
-        if c.validation_status == "valid" and c.wav_path and Path(c.wav_path).exists():
-            continue   # resume: đã xong bài này
-        if downloaded >= max_dl:
-            raise SunoError(
-                f"Chạm trần max_new_song_downloads={max_dl}. Dừng tải để an toàn.")
+    # Bài vừa Create xong vẫn đang render — tải ngay thì Studio chưa có
+    # 'Open in Studio' / bản đầy đủ. Chờ tới khi bài MỚI NHẤT đủ tuổi.
+    _wait_newest_song_age(session, batch, cfg, log, report)
 
-        safe = "".join(ch for ch in (c.title or c.song_id) if ch.isalnum() or ch in " _-")[:60].strip()
+    def _too_short(c: SunoCandidate) -> bool:
+        """WAV đã tải đủ (bài render xong) mà vẫn < minimum → tải lại vô ích."""
+        return (c.validation_status == "invalid"
+                and c.verified_duration_seconds is not None
+                and c.verified_duration_seconds < minimum)
+
+    def _pending(retryable_only: bool = False) -> list[SunoCandidate]:
+        sel = session.exec(
+            select(SunoCandidate).where(
+                SunoCandidate.batch_id == batch.id,
+                SunoCandidate.selected == True)).all()      # noqa: E712
+        out = []
+        for c in sel:
+            done = (c.validation_status == "valid" and c.wav_path
+                    and Path(c.wav_path).exists())
+            if not done and not (retryable_only and _too_short(c)):
+                out.append(c)
+        return out
+
+    def _try_one(c: SunoCandidate, probe: bool = False) -> bool:
+        """True nếu bài này đã có WAV hợp lệ sau lần thử này.
+        probe=True: tải bản thứ 2 của cùng lượt Create chỉ để so độ dài — tính
+        vào trần riêng (tối đa 1 bản/lượt Create), không ăn vào max_dl."""
+        if probe:
+            if state["probes"] >= target:
+                return False
+            state["probes"] += 1
+        elif state["downloaded"] >= state["max_dl"]:
+            log(f"Chạm trần max_new_song_downloads={state['max_dl']} — dừng tải thêm.")
+            return False
+        safe = "".join(ch for ch in (c.title or c.song_id)
+                       if ch.isalnum() or ch in " _-")[:60].strip()
         dest = staging / f"{safe or c.song_id}_{c.song_id[:8]}.wav"
+        state["tried"].add(c.song_id)
         c.download_status = "downloading"
         session.add(c); session.commit()
+        drv: SunoDriver = state["driver"]
         try:
-            path = driver.download_wav(c.song_id, dest, timeout_sec=240)
-            downloaded += 1
-        except Exception as e:
+            path = drv.download_wav(c.song_id, dest, timeout_sec=240)
+            if not probe:
+                state["downloaded"] += 1
+        except OperationCancelled:
+            c.download_status = "pending"
+            session.add(c); session.commit()
+            raise
+        except Exception as e:      # noqa: BLE001 — lỗi 1 bài không được giết cả lô
+            if type(e).__name__ == "JobCancelled":
+                c.download_status = "pending"
+                session.add(c); session.commit()
+                raise
+            if _is_browser_closed(e):
+                # Lỗi của TRÌNH DUYỆT, không phải của bài → không tính là hỏng.
+                c.download_status = "pending"
+                c.download_error = None
+                session.add(c); session.commit()
+                raise _BrowserClosed(str(e)) from e
             c.download_status = "failed"
             c.download_error = str(e)
             session.add(c); session.commit()
             log(f"Tải WAV lỗi ({c.song_id}): {e}")
-            continue
+            return False
+        finally:
+            drv.close_extra_tabs()
 
         # Xác thực kỹ thuật (KHÔNG tiêu credit) — WAV thật, đủ dài, không im lặng.
         res = suno_verify.verify_wav(path, minimum_duration_seconds=minimum,
@@ -604,11 +886,281 @@ def _download_and_validate(session, batch, cfg, driver: SunoDriver, target,
             log(f"WAV không hợp lệ ({c.song_id}): {res.reason}")
         session.add(c); session.commit()
         _sync_counters(session, batch)
-        report(f"Tải+kiểm {downloaded} WAV "
+        report(f"Tải+kiểm {state['downloaded']} WAV "
                f"(hợp lệ {_count(session, batch, validation_status='valid')}).",
-               min(88, 62 + downloaded * 2))
+               min(88, 62 + state["downloaded"] * 2))
+        return res.valid
 
+    def _attempt(c: SunoCandidate, probe: bool = False) -> bool:
+        """_try_one + tự mở lại trình duyệt nếu nó sập giữa chừng (rồi thử lại
+        đúng bài đó). Hết lượt mở lại → dừng ở WAITING_FOR_HUMAN (không đốt bài)."""
+        while True:
+            try:
+                ok = _try_one(c, probe=probe)
+            except _BrowserClosed as e:
+                state["reopens"] += 1
+                if reopen is None or state["reopens"] > max_reopens:
+                    raise _BrowserGaveUp(
+                        f"Trình duyệt Suno sập {state['reopens']} lần khi tải WAV "
+                        f"— dừng để kiểm tra. ({e})") from e
+                log(f"Trình duyệt sập khi tải {c.song_id[:8]} "
+                    f"(lần {state['reopens']}/{max_reopens}): {e}")
+                try:
+                    state["driver"] = reopen()
+                except _BrowserClosed as e2:
+                    raise _BrowserGaveUp(f"{e2} — dừng để kiểm tra.") from e2
+                continue
+            # Giãn nhịp giữa các bài như người thao tác.
+            cancellable_sleep(random.uniform(*gap))
+            return ok
+
+    for attempt in range(1, passes + 1):
+        todo = _pending(retryable_only=True)
+        if not todo:
+            break
+        if attempt > 1:
+            log(f"Lượt tải lại #{attempt}: còn {len(todo)} bài chưa có WAV hợp lệ "
+                f"— nghỉ {int(retry_wait)}s cho Suno render xong.")
+            _touch(session, batch, DOWNLOADING,
+                   f"Chờ render rồi tải lại {len(todo)} bài (lượt {attempt}/{passes})…")
+            _countdown(retry_wait, f"Chờ render rồi tải lại {len(todo)} bài "
+                                   f"(lượt {attempt}/{passes})", report)
+        for c in todo:
+            _attempt(c)
+
+    # ── Vẫn thiếu → đôn spare cùng request (đã tạo sẵn, không tốn credit) ──
+    still = _pending()
+    if still:
+        for c in still:
+            spare = session.exec(
+                select(SunoCandidate).where(
+                    SunoCandidate.batch_id == batch.id,
+                    SunoCandidate.request_id == c.request_id,
+                    SunoCandidate.selected == False)).first()   # noqa: E712
+            if _skip_spare(spare, state["tried"]):
+                continue
+            log(f"Đôn bài dự phòng {spare.song_id[:8]} thay cho "
+                f"{c.song_id[:8]} (cùng lượt Create {c.request_id}).")
+            c.selected, c.is_spare = False, True
+            spare.selected, spare.is_spare = True, False
+            session.add(c); session.add(spare); session.commit()
+            if spare.download_status != "downloaded":
+                state["max_dl"] += 1
+            _attempt(spare)
+
+    _prefer_duration(session, batch, cfg, _attempt, log, tried=state["tried"])
+
+    # ── Cả 2 bài của 1 lượt Create đều lỗi → bỏ lượt đó, Create bài thay thế ──
+    _replace_dead_creates(session, batch, cfg, state, _attempt, report, log)
+
+    _sync_counters(session, batch)
     _touch(session, batch, VALIDATING, "Đã tải/kiểm tra xong đợt này.")
+
+
+def _wait_newest_song_age(session, batch, cfg, log, report=None) -> None:
+    """Chờ tới khi bài MỚI NHẤT của batch đủ `download_min_song_age_sec` tuổi —
+    bài vừa Create còn đang render, tải sớm thì Studio chưa có bản đầy đủ."""
+    min_age = float(cfg.get("download_min_song_age_sec", 60))
+    newest = session.exec(
+        select(SunoCandidate).where(SunoCandidate.batch_id == batch.id)
+        .order_by(SunoCandidate.created_at.desc())).first()
+    if newest is None or newest.created_at is None:
+        return
+    created = newest.created_at
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    wait = min_age - (datetime.now(timezone.utc) - created).total_seconds()
+    if wait > 0:
+        log(f"Chờ {int(wait)}s cho Suno render xong các bài vừa tạo rồi mới tải.")
+        _touch(session, batch, DOWNLOADING,
+               f"Chờ {int(wait)}s cho Suno render xong rồi tải…")
+        _countdown(wait, "Chờ Suno render xong các bài vừa tạo rồi mới tải", report)
+
+
+def _plan_index(request_id: str) -> int:
+    """'req7' → 6; lượt thay thế 'req16:p7' → 6 (dùng lại prompt của bài số 7)."""
+    rid = request_id or ""
+    if ":p" in rid:
+        return int(rid.rsplit(":p", 1)[1]) - 1
+    return int(rid.removeprefix("req")) - 1
+
+
+def _request_groups(session, batch) -> dict[str, list[SunoCandidate]]:
+    """Candidate theo lượt Create (bỏ qua lượt đã loại), giữ thứ tự tạo."""
+    groups: dict[str, list[SunoCandidate]] = {}
+    for c in session.exec(
+            select(SunoCandidate).where(SunoCandidate.batch_id == batch.id)
+            .order_by(SunoCandidate.created_at)).all():
+        groups.setdefault(c.request_id, []).append(c)
+    return {r: g for r, g in groups.items()
+            if not any(c.download_status == "discarded" for c in g)}
+
+
+def _dead_requests(session, batch) -> list[str]:
+    """Lượt Create mà CẢ 2 bài đều đã tải về và KHÔNG hợp lệ (ngắn vài giây/1
+    phút, im lặng, không phải WAV…). Bài chỉ lỗi tải (UI) KHÔNG tính — thử lại
+    tải là đủ, không cần tốn credit Create lại."""
+    return [r for r, g in _request_groups(session, batch).items()
+            if g and all(c.validation_status == "invalid" for c in g)]
+
+
+def _replace_dead_creates(session, batch, cfg, state, attempt, report, log) -> None:
+    """Bỏ hẳn lượt Create hỏng cả 2 bài và Create bài THAY THẾ bằng đúng prompt
+    của lượt đó (giữ vị trí bài trong album). Tối đa `max_replacement_creates`
+    lượt thêm/batch (đếm bền vững = create_actions_used − max_create_actions)
+    để không đốt credit vô hạn nếu Suno lỗi liên tục."""
+    max_extra = int(cfg.get("max_replacement_creates", 5))
+    base_budget = int(cfg.get("max_create_actions", 15))
+    plan = cfg.get("prompt_plan") or []
+    while True:
+        dead = _dead_requests(session, batch)
+        if not dead:
+            return
+        req = dead[0]
+        used = max(0, batch.create_actions_used - base_budget)
+        if used >= max_extra:
+            log(f"Đã dùng hết {max_extra} lượt Create thay thế — còn "
+                f"{len(dead)} lượt Create lỗi cả 2 bài, cần kiểm tra thủ công.")
+            return
+        group = _request_groups(session, batch)[req]
+        reasons = "; ".join(
+            f"{c.song_id[:8]} {c.verified_duration_seconds or 0:.0f}s "
+            f"({c.validation_error or 'không hợp lệ'})" for c in group)
+        log(f"Lượt Create {req}: cả {len(group)} bài đều lỗi [{reasons}] — "
+            f"loại lượt này, Create bài thay thế ({used + 1}/{max_extra}).")
+        for c in group:
+            c.selected, c.is_spare = False, False
+            c.download_status = "discarded"
+            session.add(c)
+        session.commit()
+
+        idx = _plan_index(req)
+        if not 0 <= idx < len(plan):
+            log(f"Không tìm thấy prompt cho {req} — bỏ qua Create thay thế.")
+            return
+        drv: SunoDriver = state["driver"]
+        try:
+            credits = drv.read_credits()
+            if credits is not None and credits <= 0:
+                log("Hết credit Suno — không Create thay thế (không tự mua thêm).")
+                return
+            drv.open_create_page()
+            _configure_create_form(drv, cfg, dry_run=False)
+            before = drv.snapshot_song_ids()
+            drv.fill_styles(plan[idx]["styles"])
+            drv.fill_exclusions(plan[idx]["exclusions"])
+            batch.create_actions_used += 1
+            new_req = f"req{batch.create_actions_used}:p{idx + 1}"
+            _touch(session, batch, GENERATING,
+                   f"Create thay thế cho {req} ({new_req})…")
+            drv.click_create()
+            new_songs = drv.wait_for_new_songs(
+                before, expected=_ASSUMED_SONGS_PER_REQUEST, timeout_sec=300)
+        except Exception as e:      # noqa: BLE001
+            if type(e).__name__ == "JobCancelled":
+                raise
+            if _is_browser_closed(e):
+                raise _BrowserGaveUp(
+                    f"Trình duyệt Suno sập khi Create thay thế — dừng để kiểm tra. ({e})"
+                ) from e
+            log(f"Create thay thế cho {req} lỗi: {e}")
+            return
+        if not new_songs:
+            log(f"Create thay thế {new_req}: chưa thấy bài mới sau 300s.")
+            return
+        cands = [_record_candidate(session, batch, ns, new_req) for ns in new_songs]
+        for i, c in enumerate(cands):
+            c.selected, c.is_spare = (i == 0), (i != 0)
+            session.add(c)
+        session.commit()
+        _sync_counters(session, batch)
+        report(f"Create thay thế {new_req}: {len(cands)} bài mới, chờ render…", 80)
+
+        _touch(session, batch, DOWNLOADING, f"Tải bài thay thế {new_req}…")
+        _wait_newest_song_age(session, batch, cfg, log, report)
+        # Vẫn chỉ lấy 1/2: thử bài đầu, lỗi thì bài còn lại; cả 2 hợp lệ thì
+        # _prefer_duration chọn bản gần 3–5 phút hơn.
+        first, rest = cands[0], cands[1:]
+        state["max_dl"] += 1
+        if not attempt(first) and rest:
+            spare = rest[0]
+            first.selected, first.is_spare = False, True
+            spare.selected, spare.is_spare = True, False
+            session.add(first); session.add(spare); session.commit()
+            state["max_dl"] += 1
+            attempt(spare)
+        _prefer_duration(session, batch, cfg, attempt, log, requests={new_req})
+        # Nếu cả 2 bài thay thế cũng lỗi → vòng lặp tự thấy lượt chết mới.
+
+
+def _duration_off(d: float, lo: float, hi: float, tol: float = 5.0) -> float:
+    """0 nếu d nằm trong [lo, hi] (±tol), ngược lại = số giây lệch khỏi khoảng."""
+    if lo - tol <= d <= hi + tol:
+        return 0.0
+    return (lo - d) if d < lo else (d - hi)
+
+
+def _skip_spare(spare: Optional[SunoCandidate], tried: Optional[set] = None) -> bool:
+    """Không dùng bản còn lại nếu: không có / đã loại / đã tải mà KHÔNG hợp lệ /
+    lỗi tải NGAY TRONG lượt chạy này. Lỗi tải ở lượt chạy TRƯỚC (thường do menu
+    Suno chập chờn, không phải lỗi bài) → cho thử lại 1 lần (miễn phí)."""
+    if spare is None or spare.download_status == "discarded" \
+            or spare.validation_status == "invalid":
+        return True
+    if spare.download_status == "failed":
+        return tried is None or spare.song_id in tried
+    return False
+
+
+def _prefer_duration(session, batch, cfg, attempt, log,
+                     requests: Optional[set[str]] = None,
+                     tried: Optional[set] = None) -> None:
+    """Chọn 1 trong 2 bản của mỗi lượt Create theo độ dài THẬT của WAV: bắt
+    buộc ≥ minimum (đã lọc ở verify), ưu tiên [preferred_min, preferred_max]
+    (mặc định 3–5 phút). Bản đã chọn lệch khoảng ưu tiên → tải bản còn lại của
+    cùng lượt (không tốn credit) và giữ bản nào gần khoảng ưu tiên hơn."""
+    lo = float(cfg.get("preferred_duration_seconds_min") or 0)
+    hi = float(cfg.get("preferred_duration_seconds_max") or 0)
+    if not (lo and hi and hi >= lo):
+        return
+    chosen = session.exec(
+        select(SunoCandidate).where(
+            SunoCandidate.batch_id == batch.id,
+            SunoCandidate.selected == True,                  # noqa: E712
+            SunoCandidate.validation_status == "valid")).all()
+    for c in chosen:
+        if requests is not None and c.request_id not in requests:
+            continue
+        d = c.verified_duration_seconds or 0.0
+        if _duration_off(d, lo, hi) == 0:
+            continue
+        spare = session.exec(
+            select(SunoCandidate).where(
+                SunoCandidate.batch_id == batch.id,
+                SunoCandidate.request_id == c.request_id,
+                SunoCandidate.selected == False)).first()    # noqa: E712
+        # Bản còn lại đã tải mà lỗi → không tải lại lần nữa.
+        if _skip_spare(spare, tried):
+            continue
+        have = (spare.validation_status == "valid" and spare.wav_path
+                and Path(spare.wav_path).exists())
+        if not have:
+            log(f"Bản {c.song_id[:8]} dài {d:.0f}s (ngoài {lo:.0f}-{hi:.0f}s) "
+                f"— tải bản còn lại {spare.song_id[:8]} để so.")
+            if not attempt(spare, probe=True):
+                continue
+            session.refresh(spare)
+        sd = spare.verified_duration_seconds or 0.0
+        if (spare.validation_status == "valid"
+                and _duration_off(sd, lo, hi) < _duration_off(d, lo, hi)):
+            log(f"Đổi sang bản {spare.song_id[:8]} ({sd:.0f}s) thay "
+                f"{c.song_id[:8]} ({d:.0f}s) — gần khoảng {lo:.0f}-{hi:.0f}s hơn.")
+            c.selected, c.is_spare = False, True
+            spare.selected, spare.is_spare = True, False
+            session.add(c); session.add(spare); session.commit()
+        else:
+            log(f"Giữ bản {c.song_id[:8]} ({d:.0f}s); bản còn lại {sd:.0f}s "
+                f"không tốt hơn.")
 
 
 # ── helpers manifest ──────────────────────────────────────────────
@@ -635,21 +1187,27 @@ def _mark_selection(session, batch, target: int) -> None:
     """Mỗi lượt Create (request) CHỈ chọn 1 bài — 2 bài cùng 1 Create thường na
     ná nhau nên chỉ lấy bài đầu, bài còn lại là spare (không tải/import). Do đó
     cần đủ `target` lượt Create để có `target` bài khác nhau."""
-    cands = session.exec(
-        select(SunoCandidate).where(SunoCandidate.batch_id == batch.id)
-        .order_by(SunoCandidate.created_at)).all()
-    seen_requests: set[str] = set()
+    groups: dict[str, list[SunoCandidate]] = {}
+    for c in session.exec(
+            select(SunoCandidate).where(SunoCandidate.batch_id == batch.id)
+            .order_by(SunoCandidate.created_at)).all():
+        groups.setdefault(c.request_id, []).append(c)
     selected_count = 0
-    for c in cands:
-        # Chọn bài ĐẦU của mỗi request, tối đa `target` bài.
-        want = (selected_count < target and c.request_id not in seen_requests)
-        if want:
-            seen_requests.add(c.request_id)
+    for group in groups.values():
+        if any(c.download_status == "discarded" for c in group):
+            continue                     # lượt Create đã loại (cả 2 bài lỗi)
+        keep = None
+        if selected_count < target:
+            # Giữ lựa chọn đã có (đôn dự phòng / ưu tiên độ dài) — chỉ bài
+            # chưa chọn gì mới mặc định lấy bài ĐẦU.
+            keep = next((c for c in group if c.selected), group[0])
             selected_count += 1
-        if c.selected != want or c.is_spare == want:
-            c.selected = want
-            c.is_spare = not want
-            session.add(c)
+        for c in group:
+            want = c is keep
+            if c.selected != want or c.is_spare == want:
+                c.selected = want
+                c.is_spare = not want
+                session.add(c)
     session.commit()
     _sync_counters(session, batch)
 

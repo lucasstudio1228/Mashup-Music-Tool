@@ -1,21 +1,54 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import AppShell from '../components/layout/AppShell';
+import BatchProgressBar from '../components/projects/BatchProgressBar';
 import ProjectCard from '../components/projects/ProjectCard';
 import ProjectFormModal from '../components/projects/ProjectFormModal';
 import ConfirmDialog from '../components/shared/ConfirmDialog';
 import {
+  useActiveBatch,
+  useCreateBatch,
   useCreateProject,
   useDeleteProject,
   useProjects,
 } from '../api/projects';
 import type { Project } from '../types';
 
+// Lô chạy rất lâu (hàng giờ) → nhớ key qua reload để vẫn theo dõi được tiến độ.
+const BATCH_KEY_STORAGE = 'activeBatchKey';
+
 export default function ProjectsPage() {
   const { data: projects, isLoading } = useProjects();
   const createProject = useCreateProject();
+  const navigate = useNavigate();
+  const createBatch = useCreateBatch();
   const deleteProject = useDeleteProject();
   const [showForm, setShowForm] = useState(false);
   const [toDelete, setToDelete] = useState<Project | null>(null);
+  const [batchKey, setBatchKey] = useState<string | null>(() =>
+    localStorage.getItem(BATCH_KEY_STORAGE)
+  );
+
+  // Server đang chạy lô khác lô đang hiện (vd request tạo lô timeout nên chưa lưu
+  // key) → tự chuyển thanh tiến độ sang lô đang chạy thật.
+  const { data: active } = useActiveBatch();
+  const activeKey = active?.batch_key ?? null;
+  useEffect(() => {
+    if (activeKey && activeKey !== batchKey) {
+      localStorage.setItem(BATCH_KEY_STORAGE, activeKey);
+      setBatchKey(activeKey);
+    }
+  }, [activeKey, batchKey]);
+
+  function dismissBatch() {
+    localStorage.removeItem(BATCH_KEY_STORAGE);
+    setBatchKey(null);
+  }
+
+  const batchError =
+    (createBatch.error as any)?.response?.data?.detail ??
+    (createBatch.error as Error | null)?.message ??
+    null;
 
   return (
     <AppShell
@@ -29,6 +62,9 @@ export default function ProjectsPage() {
         </button>
       }
     >
+      {batchKey && (
+        <BatchProgressBar batchKey={batchKey} onDismiss={dismissBatch} />
+      )}
       {deleteProject.error && <p role="alert" className="mb-4 text-red-300">
         {(deleteProject.error as any)?.response?.data?.detail ?? deleteProject.error.message}
       </p>}
@@ -54,10 +90,30 @@ export default function ProjectsPage() {
       <ProjectFormModal
         open={showForm}
         saving={createProject.isPending}
-        onSubmit={(data) =>
-          createProject.mutate(data, { onSuccess: () => setShowForm(false) })
+        batchSaving={createBatch.isPending}
+        batchError={batchError}
+        onSubmit={(data, { autoRun }) =>
+          createProject.mutate(data, {
+            onSuccess: (p) => {
+              setShowForm(false);
+              // Tự bấm «✨ AI viết prompt & CHẠY TỰ ĐỘNG» ở tab Suno của project mới.
+              if (autoRun) navigate(`/projects/${p.id}?tab=suno&autorun=1`);
+            },
+          })
         }
-        onClose={() => setShowForm(false)}
+        onSubmitBatch={(data) =>
+          createBatch.mutate(data, {
+            onSuccess: (run) => {
+              localStorage.setItem(BATCH_KEY_STORAGE, run.batch_key);
+              setBatchKey(run.batch_key);
+              setShowForm(false);
+            },
+          })
+        }
+        onClose={() => {
+          createBatch.reset();
+          setShowForm(false);
+        }}
       />
 
       <ConfirmDialog

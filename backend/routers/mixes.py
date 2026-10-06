@@ -87,9 +87,11 @@ def _on_success(mix_id: int, result: dict, force_video: bool = False) -> None:
     """force_video=True: luôn auto-dựng video sau mix (dùng cho chuỗi Suno →
     Mix → Video), bỏ qua công tắc auto_video của project."""
     auto_ctx: dict | None = None
+    qc_pid: int | None = None
     with Session(engine) as session:
         mix = session.get(Mix, mix_id)
         if mix:
+            qc_pid = mix.project_id
             mix.status = "completed"
             mix.completed_at = datetime.now(timezone.utc)
             mix.total_duration_seconds = result.get("total_duration_seconds")
@@ -116,6 +118,17 @@ def _on_success(mix_id: int, result: dict, force_video: bool = False) -> None:
                         "audio_path": str(wav),
                         "style_key": project.video_style,
                     }
+
+    # Rà soát từng track lẻ (nền, ~0.6 s/bài) TRƯỚC khi dựng video: có bài
+    # Suno lỗi → tự tạo lại + vá mix rồi mới dựng video bằng bản đã vá
+    # (qc_autofix lo luôn phần nối chuỗi video).
+    if qc_pid is not None:
+        try:
+            from backend.video import qc_autofix
+            qc_autofix.after_mix(qc_pid, mix_id, auto_ctx)
+            return
+        except Exception:
+            pass
 
     # Submit NGOÀI session (job chạy trong worker thread khác của video manager).
     if auto_ctx:
@@ -207,11 +220,16 @@ def start_mix_for_project(project_id: int, *, force_video: bool = False,
     """Khởi động 1 mix cho project theo cách lập trình (auto-continue từ Suno).
     Mở session riêng, validate, submit. Trả mix_id. Raise RuntimeError nếu không
     đủ điều kiện (để caller log, không làm sập job Suno)."""
-    data = data or MixCreate()
     with Session(engine) as session:
         project = session.get(Project, project_id)
         if project is None:
             raise RuntimeError(f"Project {project_id} không tồn tại")
+        # Thời lượng/crossfade theo cài đặt đã lưu của project (tab Audio) —
+        # KHÔNG dùng mặc định cứng của MixCreate.
+        data = data or MixCreate(
+            duration_minutes=project.mix_duration_minutes or 120.0,
+            crossfade_seconds=project.mix_crossfade_seconds or 5.0,
+        )
         tracks = session.exec(
             select(Track).where(Track.project_id == project_id)).all()
         if len(tracks) < MIN_TRACKS:

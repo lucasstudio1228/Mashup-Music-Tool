@@ -2,11 +2,13 @@ import { useEffect, useState } from "react";
 import {
   useVideoStatus, useGenImages, useGenClips, useAssemble, useRunAll, useRebuild,
   useRegenImage, useRegenClip, useRegenMotions, useVideoStyles,
+  useThumbnailFonts, useSetThumbnailFont, thumbnailFontPreviewUrl, useSetClipEngine,
   usePreparePrompts, usePromptManifest,
-  useUploadYoutube, useYoutubeHistory,
+  useUploadYoutube, useYoutubeHistory, useOpenVideoBrowser, useCloseVideoBrowser,
   videoDownloadUrl, videoThumbnailUrl, videoImageUrl, videoClipUrl,
 } from "../../api/video";
 import { useProject, useUpdateProject } from "../../api/projects";
+import ManualClipsPanel from "./ManualClipsPanel";
 
 function fmtDur(sec?: number | null): string {
   if (!sec || sec <= 0) return "—";
@@ -45,6 +47,9 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
   const { data: st, isLoading } = useVideoStatus(projectId);
   const { data: project } = useProject(projectId);
   const { data: styleData } = useVideoStyles(projectId);
+  const { data: fontData } = useThumbnailFonts(projectId);
+  const setFont = useSetThumbnailFont(projectId);
+  const setEngine = useSetClipEngine(projectId);
   const updateProject = useUpdateProject(projectId);
   const genImages = useGenImages(projectId);
   const preparePrompts = usePreparePrompts(projectId);
@@ -58,6 +63,8 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
   const regenMotions = useRegenMotions(projectId);
   const uploadYoutube = useUploadYoutube(projectId);
   const { data: ytHistory, refetch: refetchYtHistory } = useYoutubeHistory(projectId);
+  const openBrowser  = useOpenVideoBrowser(projectId);
+  const closeBrowser = useCloseVideoBrowser(projectId);
   const [idea, setIdea] = useState("");
   // Nạp ý tưởng đã lưu của project vào ô nhập (khi tải xong / đổi project).
   const savedIdea = project?.video_idea ?? "";
@@ -98,6 +105,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
   const p = st.params;
   const job = st.job;
   const busy = job?.status === "running" || job?.status === "pending";
+  const browserOpen = busy && !!job?.kind?.startsWith("browser-");
   const imagesDone = st.image_count >= p.image_count;
   const clipsDone  = st.clip_count >= p.total_clips;
   const hasAudio   = !!st.audio_path;
@@ -112,18 +120,27 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
     images: "Đang tạo ảnh", clips: "Đang tạo clip",
     assemble: "Đang ghép video", full: "Đang chạy toàn bộ",
     rebuild: "Đang tạo lại video từ ảnh",
-    motions: "Đang sinh lại prompt chuyển động",
+    motions: "Đang sinh lại prompt cảnh (clip)",
     upload: "Đang đăng nháp lên YouTube",
+    "browser-flow": "Cửa sổ Flow đang mở",
+    "browser-gemini": "Cửa sổ Gemini đang mở",
+    "clips-manual": "Chế độ thủ công — chờ bạn tạo clip trên Flow",
   };
 
   const imageIndices = st.image_indices ?? [];
   const clipIndices  = st.clip_indices ?? [];
+  // Nhãn vai trò của 3 ảnh — backend trả về trong params.image_roles.
+  const roleOf = (i: number) =>
+    p.image_roles?.[String(i)] ??
+    (i === 0 ? "Ảnh bìa (thumbnail)" : i === 1 ? "Bảng nhân vật chính" : "Bảng linh thú");
 
   return (
     <div className="space-y-6">
     <Section title="Hồ sơ sáng tạo và bộ prompt">
       <p className="mb-3 text-sm text-gray-400">
-        Một hồ sơ chung cho nhạc, nhân vật và bối cảnh. Tool khoá bố cục, viết đủ cặp ảnh–motion,
+        Một hồ sơ chung cho nhạc, nhân vật và bối cảnh. Tool viết <b>{p.image_count} prompt ảnh</b>
+        {" "}(bìa · bảng phân tích nhân vật chính · bảng phân tích linh thú) và
+        {" "}<b>{p.total_clips} prompt cảnh</b> khác bối cảnh nhưng khoá chung hai bảng nhân vật,
         kiểm tra trùng prompt giữa project và lưu lại để chạy tiếp. Bước này chỉ dùng AI viết chữ,
         chưa tạo nhạc, ảnh hoặc video. Khi bấm tạo ảnh, Tool cũng tự thực hiện bước này.
       </p>
@@ -137,20 +154,37 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
       </p>}
       {promptData?.manifest && <details className="mt-3 text-sm">
         <summary className="cursor-pointer text-accent">
-          Xem bộ đã lưu: {Object.keys(promptData.manifest.prompts ?? {}).length} ảnh / {Object.keys(promptData.manifest.motions ?? {}).length} motion
-          {!promptData.manifest.workflow_version && " (bộ cũ)"}
+          Xem bộ đã lưu: {Object.keys(promptData.manifest.prompts ?? {}).length} ảnh / {Object.keys(promptData.manifest.motions ?? {}).length} prompt cảnh
+          {(promptData.manifest.workflow_version ?? 0) < 2 && " (bộ cũ — hãy chuẩn bị lại)"}
         </summary>
         <p className="my-2 text-xs text-amber-200">Kiểm tra đủ cấu trúc không bảo đảm đầu ra giống tuyệt đối; duyệt ảnh và nhạc mẫu trước khi chạy cả bộ.</p>
         {promptData.manifest.continuity && <div className="my-3 whitespace-pre-wrap text-gray-300">
           <p>{promptData.manifest.continuity.character_sheet}</p>
-          <p className="mt-2">{promptData.manifest.continuity.scene_sheet}</p>
+          {promptData.manifest.continuity.pet_sheet && <p className="mt-2">
+            Linh thú{promptData.manifest.continuity.pet_name
+              ? ` (${promptData.manifest.continuity.pet_name})` : ""}: {promptData.manifest.continuity.pet_sheet}
+          </p>}
+          {promptData.manifest.continuity.scene_sheet && <p className="mt-2">{promptData.manifest.continuity.scene_sheet}</p>}
         </div>}
-        <div className="max-h-96 space-y-3 overflow-y-auto">
+        <div className="mb-1 mt-3 text-xs font-semibold uppercase tracking-wide text-gray-400">
+          Prompt ảnh ({Object.keys(promptData.manifest.prompts ?? {}).length})
+        </div>
+        <div className="max-h-72 space-y-3 overflow-y-auto">
           {Object.entries(promptData.manifest.prompts ?? {}).map(([key, value]) => <details key={key}>
-            <summary className="cursor-pointer">Ảnh {key} / motion tương ứng{key === "0" ? " — mở đầu duy nhất" : ""}</summary>
+            <summary className="cursor-pointer">Ảnh {key} — {roleOf(Number(key))}</summary>
             <p className="whitespace-pre-wrap text-gray-400">{value}</p>
-            <p className="mt-2 whitespace-pre-wrap text-blue-200">{promptData.manifest?.motions?.[key] ?? "Thiếu motion"}</p>
           </details>)}
+        </div>
+        <div className="mb-1 mt-4 text-xs font-semibold uppercase tracking-wide text-gray-400">
+          Prompt cảnh ({Object.keys(promptData.manifest.motions ?? {}).length}) — mỗi clip dùng chung 2 bảng nhân vật, chỉ khác bối cảnh
+        </div>
+        <div className="max-h-72 space-y-3 overflow-y-auto">
+          {Object.entries(promptData.manifest.motions ?? {})
+            .sort((a, b) => Number(a[0]) - Number(b[0]))
+            .map(([key, value]) => <details key={key}>
+              <summary className="cursor-pointer">Clip {String(key).padStart(2, "0")}{key === "0" ? " — mở đầu duy nhất" : ""}</summary>
+              <p className="whitespace-pre-wrap text-blue-200">{value}</p>
+            </details>)}
         </div>
       </details>}
     </Section>
@@ -159,7 +193,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
       <div className="space-y-4">
         <Section title="Trạng thái media">
           <div className="grid grid-cols-2 gap-2">
-            <Stat label="Ảnh" value={`${st.image_count}/${p.image_count}`} ok={imagesDone} />
+            <Stat label="Ảnh (bìa + 2 bảng)" value={`${st.image_count}/${p.image_count}`} ok={imagesDone} />
             <Stat label="Clip" value={`${st.clip_count}/${p.total_clips}`} ok={st.clip_count >= p.total_clips} />
             <Stat label="Nhạc (audio)" value={hasAudio ? fmtDur(st.audio_duration) : "Chưa có"} ok={hasAudio} />
             <Stat label="Video final" value={st.final_exists ? "Đã có" : "Chưa"} ok={st.final_exists} />
@@ -209,6 +243,41 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
           )}
         </Section>
 
+        <Section title="Theo dõi trình duyệt (Flow / Gemini)">
+          <p className="mb-3 text-xs text-gray-400">
+            Mở đúng cửa sổ + profile tool dùng để tạo clip (Flow) / ảnh (Gemini) — xem tài khoản,
+            tự đăng nhập hoặc kiểm tra cảnh báo. Tool không tự nhập mật khẩu.
+          </p>
+          {browserOpen ? (
+            <button className={`${btn} border border-red-500/30 bg-red-950/30 text-red-300 hover:bg-red-950/50`}
+                    disabled={closeBrowser.isPending}
+                    onClick={() => closeBrowser.mutate(undefined)}>
+              ✕ Đóng trình duyệt {job?.kind === "browser-gemini" ? "Gemini" : "Flow"}
+            </button>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              <button className={ghost} disabled={busy || openBrowser.isPending}
+                      onClick={() => openBrowser.mutate("flow")}>
+                🌐 Mở UI Flow
+              </button>
+              <button className={ghost} disabled={busy || openBrowser.isPending}
+                      onClick={() => openBrowser.mutate("gemini")}>
+                🌐 Mở UI Gemini
+              </button>
+            </div>
+          )}
+          {busy && !browserOpen && (
+            <p className="mt-2 text-xs text-amber-300">
+              Đang có tác vụ video chạy — khoá nút để tránh 2 cửa sổ tranh cùng 1 profile.
+            </p>
+          )}
+          {openBrowser.isError && (
+            <p className="mt-2 text-xs text-red-400">
+              {(openBrowser.error as any)?.response?.data?.detail ?? "Không mở được trình duyệt."}
+            </p>
+          )}
+        </Section>
+
         {(st.final_exists || st.thumbnail_path) && (
           <Section title="Video hoàn chỉnh">
             {st.thumbnail_path && (
@@ -248,7 +317,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
               `Model: ${p.model}`,
               `Tỉ lệ ${p.aspect_ratio}`,
               `${p.clip_seconds}s/clip`,
-              `${p.image_count} ảnh → ${p.total_clips} clip`,
+              `${p.image_count} ảnh (bìa + 2 bảng nhân vật) → ${p.total_clips} clip`,
               `Shuffle T+${p.t_window}`,
               `Fade ${p.blend_seconds}s · slow ${p.slow_speed}x`,
             ].map((t) => (
@@ -291,9 +360,55 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
           </div>
           <p className="mt-2 text-xs text-gray-500">
             Cuộn để chọn phong cách. Lựa chọn này ép thẳng vào prompt tạo <b>ảnh</b> (Gemini)
-            và <b>video</b> (Flow/Veo). Đổi phong cách rồi bấm <b>Tạo lại từ đầu</b> để áp dụng
+            và <b>video</b> ({p.clip_engine_label ?? "Flow/Veo"}). Đổi phong cách rồi bấm <b>Tạo lại từ đầu</b> để áp dụng
             cho toàn bộ.
           </p>
+        </Section>
+
+        <Section title="Font chữ thumbnail">
+          <p className="mb-2 text-xs text-gray-500">
+            Font của tiêu đề trên <b>thumbnail</b> và <b>đoạn intro</b> video. Ảnh mẫu dùng
+            chính tên và ảnh bìa của project này. Lựa chọn áp dụng cho <b>mọi project</b>{" "}
+            ở lần ghép video kế tiếp.
+          </p>
+          <div className="grid max-h-[28rem] grid-cols-2 gap-2 overflow-y-auto pr-1">
+            {(fontData?.fonts ?? []).map((f) => {
+              const active = fontData?.selected === f.key;
+              return (
+                <button
+                  key={f.key}
+                  disabled={setFont.isPending}
+                  onClick={() => setFont.mutate(f.key)}
+                  className={`overflow-hidden rounded-lg border text-left transition-colors disabled:opacity-60 ${
+                    active
+                      ? "border-accent ring-2 ring-accent"
+                      : "border-white/10 hover:border-white/30"
+                  }`}
+                >
+                  <img
+                    src={thumbnailFontPreviewUrl(projectId, f.key, bust)}
+                    alt={`Mẫu font ${f.label}`}
+                    loading="lazy"
+                    className="aspect-video w-full bg-background object-cover"
+                  />
+                  <span className="block bg-background px-2 py-1.5">
+                    <span className="flex items-center gap-1 text-xs font-semibold text-gray-200">
+                      <span>{active ? "●" : "○"}</span>
+                      {f.label}
+                      {f.key === fontData?.default && (
+                        <span className="text-[10px] font-normal text-gray-500">(mặc định)</span>
+                      )}
+                    </span>
+                    <span className="block text-[11px] text-gray-500">{f.note}</span>
+                  </span>
+                </button>
+              );
+            })}
+            {!fontData && <p className="text-xs text-gray-500">Đang tải danh sách font…</p>}
+          </div>
+          {setFont.error && (
+            <p className="mt-2 text-xs text-red-300">{String(setFont.error as Error)}</p>
+          )}
         </Section>
 
         <Section title="Ý tưởng của bạn">
@@ -309,7 +424,11 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
             AI sẽ bám theo ý tưởng để viết prompt cho từng cảnh — mặc định tỉ lệ
             <b> 16:9</b>, phong cách <b>{currentStyle?.label ?? videoStyle}</b>,
             nhân vật <b>đồng bộ xuyên suốt</b> như một bộ phim ngắn chill/relaxing.
-            Các ảnh không chứa chữ; tiêu đề được ghép vào đầu video và xuất thumbnail riêng khi ghép.
+            AI vẽ <b>bảng phân tích nhân vật chính</b> và <b>bảng linh thú</b> (có nhãn chữ tiếng Anh,
+            turnaround trước/nghiêng/sau, biểu cảm, chú thích chi tiết, dải màu) rồi đưa cả hai vào
+            {p.clip_engine_label ?? "Flow/Veo"} làm nguyên liệu cho {p.total_clips} clip khác bối cảnh. Nếu ý tưởng chưa có linh thú,
+            AI tự nghĩ một con hợp bối cảnh. Riêng ảnh bìa không chứa chữ; tiêu đề được ghép vào đầu
+            video và xuất thumbnail riêng khi ghép.
           </p>
           <p className="mt-1 text-xs text-gray-600">
             Để trống → dùng bộ prompt mặc định. Cần cấu hình API key ở
@@ -333,7 +452,8 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
           </div>
           <p className="mt-1 text-xs text-gray-600">
             Ý tưởng được lưu theo project — dùng cho cả nút tạo ảnh/clip và khi
-            tự động dựng video sau mix.
+            tự động dựng video sau mix. Có thể gõ tiếng Việt — khi lưu, tool
+            <b> tự dịch sang tiếng Anh</b> (mọi prompt gửi AI/Flow đều 100% tiếng Anh).
           </p>
 
           <label className="mt-3 flex cursor-pointer items-start gap-2 rounded-lg border border-white/5 bg-background px-3 py-2">
@@ -369,7 +489,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
             </button>
             <button className={`${ghost} w-full`} disabled={busy || !imagesDone || !hasAudio}
                     onClick={() => {
-                      if (confirm(`Giữ nguyên ${p.image_count} ảnh đã có, tạo lại toàn bộ clip rồi ghép video?`)) {
+                      if (confirm(`Giữ nguyên ${p.image_count} ảnh đã có (bìa + 2 bảng nhân vật), tạo lại toàn bộ ${p.total_clips} clip rồi ghép video?`)) {
                         rebuild.mutate({ mode: "restart" });
                       }
                     }}>
@@ -393,7 +513,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
             {/* Bước 1 — Ảnh */}
             <div>
               <div className="mb-1.5 text-xs font-semibold text-gray-300">
-                ① Ảnh — {st.image_count}/{p.image_count} (không chứa chữ)
+                ① Ảnh — {st.image_count}/{p.image_count} (0 bìa không chữ · 1 bảng nhân vật chính · 2 bảng linh thú)
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <button className={`${ghost} w-full`} disabled={busy}
@@ -402,7 +522,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
                 </button>
                 <button className={`${warn} w-full`} disabled={busy}
                         onClick={() => {
-                          if (confirm(`Xoá toàn bộ ảnh cũ và tạo lại ${p.image_count} ảnh từ đầu theo ý tưởng?`)) {
+                          if (confirm(`Xoá toàn bộ ảnh cũ và tạo lại ${p.image_count} ảnh (bìa + 2 bảng nhân vật) từ đầu theo ý tưởng?`)) {
                             genImages.mutate({ idea: idea.trim() || undefined, mode: "restart" });
                           }
                         }}>
@@ -413,8 +533,26 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
             {/* Bước 2 — Clip */}
             <div>
               <div className="mb-1.5 text-xs font-semibold text-gray-300">
-                ② Clip — {st.clip_count}/{p.total_clips} (Flow · {p.model})
+                ② Clip — {st.clip_count}/{p.total_clips} ({(p.clip_engine ?? "muse") === "flow" ? `Flow · ${p.model}` : `${p.clip_engine_label ?? "Gemini Video"} · 1080p · 8s · không tiếng`})
               </div>
+              {(p.clip_engines?.length ?? 0) > 1 && (
+                <div className="mb-2 flex items-center gap-2 text-xs text-gray-400">
+                  <span>Máy tạo clip:</span>
+                  <select className="rounded border border-gray-600 bg-gray-800 px-2 py-1 text-xs text-gray-200"
+                          value={p.clip_engine ?? "muse"} disabled={busy || setEngine.isPending}
+                          title="Áp dụng cho mọi project. Bảng nhân vật + phân tích nhân vật vẫn do Gemini làm."
+                          onChange={(e) => setEngine.mutate(e.target.value, {
+                            onError: (err: any) => alert(err?.response?.data?.detail ?? String(err)),
+                          })}>
+                    {p.clip_engines!.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
+                  </select>
+                  {(p.clip_engine ?? "muse") === "muse" && (
+                    <span className="text-[11px] text-violet-300">
+                      qua GPM profile kênh · thông số ghi trong prompt · ~2 phút/clip
+                    </span>
+                  )}
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-2">
                 <button className={`${ghost} w-full`} disabled={busy || !imagesDone}
                         onClick={() => genClips.mutate({ mode: "resume" })}>
@@ -431,12 +569,15 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
               </div>
               <button className={`${ghost} mt-2 w-full`} disabled={busy}
                       onClick={() => {
-                        if (confirm("Sinh lại CHỈ prompt chuyển động (motion) từ prompt ảnh đã lưu?\n\nKhông tạo lại ảnh/clip — lần tạo clip kế tiếp sẽ dùng motion mới.")) {
+                        if (confirm(`Sinh lại CHỈ ${p.total_clips} prompt cảnh từ hai bảng nhân vật đã khoá?\n\nKhông tạo lại ảnh/clip — lần tạo clip kế tiếp sẽ dùng bối cảnh mới.`)) {
                           regenMotions.mutate(undefined);
                         }
                       }}>
-                🔄 Sinh lại chỉ Motion (giữ ảnh/clip)
+                🔄 Sinh lại chỉ prompt cảnh (giữ ảnh/clip)
               </button>
+              <div className="mt-2">
+                <ManualClipsPanel projectId={projectId} st={st} busy={busy} imagesDone={imagesDone} />
+              </div>
             </div>
             {/* Bước 3 — Ghép nhạc */}
             <div>
@@ -621,25 +762,30 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
       {/* Gallery: xem trước + tạo lại từng ảnh/clip lẻ */}
       {imageIndices.length > 0 && (
         <Section title={`Ảnh đã tạo — ${imageIndices.length}/${p.image_count} (bấm 🔄 để tạo lại 1 ảnh)`}>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-5">
+          <p className="mb-3 text-xs text-gray-500">
+            Ảnh <b>0</b> chỉ dùng làm thumbnail (tạo một lần). Ảnh <b>1</b> và <b>2</b> là hai bảng
+            phân tích nhân vật — cả hai được nạp làm nguyên liệu cho <b>mọi</b> clip, nên sửa chúng
+            là đổi diện mạo toàn bộ video.
+          </p>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
             {imageIndices.map((i) => (
               <div key={i} className="overflow-hidden rounded-lg border border-white/10 bg-background">
                 <div className="relative">
                   <img
                     src={videoImageUrl(projectId, i, bust)}
-                    alt={`Ảnh ${i}`}
+                    alt={roleOf(i)}
                     loading="lazy"
                     className="aspect-video w-full object-cover"
                   />
                   <span className="absolute left-1 top-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-semibold text-white">
-                    {i === 0 ? "00 · intro" : String(i).padStart(2, "0")}
+                    {i} · {roleOf(i)}
                   </span>
                 </div>
                 <button
                   className={`${ghost} w-full rounded-none rounded-b-lg py-1.5 text-xs`}
                   disabled={busy}
                   onClick={() => {
-                    if (confirm(`Tạo lại ảnh ${i} (ghi đè), giữ nguyên các ảnh khác?\n\nDùng lại prompt đã lưu để nhân vật vẫn khớp cả bộ.`)) {
+                    if (confirm(`Tạo lại ảnh ${i} — ${roleOf(i)} (ghi đè), giữ nguyên các ảnh khác?\n\nDùng lại prompt đã lưu để nhân vật vẫn khớp cả bộ.`)) {
                       regenImage.mutate(i);
                     }
                   }}
@@ -655,8 +801,8 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
       {clipIndices.length > 0 && (
         <Section title={`Clip đã tạo — ${clipIndices.length}/${p.total_clips} (bấm 🔄 để tạo lại 1 clip)`}>
           <p className="mb-3 text-xs text-gray-500">
-            Tạo lại 1 clip cần đã có kế hoạch clip (bấm <b>Làm lại từ đầu</b> ở phần
-            Clip một lần) để giữ đúng ánh xạ ảnh↔clip 1:1.
+            Mỗi clip đều nạp cùng hai bảng nhân vật (ảnh 1 + ảnh 2), chỉ khác prompt bối cảnh —
+            nên tạo lại 1 clip lẻ chạy được ngay, không cần làm lại cả bộ.
           </p>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4">
             {clipIndices.map((i) => (
