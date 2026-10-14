@@ -15,6 +15,15 @@ engine = create_engine(
 )
 
 
+def _install_project_id_guard() -> None:
+    # Project ID không bao giờ dùng lại sau khi xoá (tránh nhận nhầm file sót).
+    from backend.project_cleanup import install_id_guard
+    install_id_guard(engine)
+
+
+_install_project_id_guard()
+
+
 def create_db_and_tables() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     # import models để SQLModel.metadata biết các bảng trước khi create_all

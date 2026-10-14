@@ -25,6 +25,8 @@ _VIDEO_KIND = {
     "suno-fix": ("Tạo lại bài Suno lỗi", "audio"),
     "remux": ("Thay nhạc trong final.mp4", "audio"),
     "upload": ("Đăng nháp YouTube", "video"),
+    "continue": ("Chạy tiếp: thiếu → ghép → nháp YouTube → Short", "video"),
+    "upload_short": ("Tạo & đăng nháp YouTube Short", "video"),
     "full": ("Dựng video (ảnh → clip → ghép)", "video"),
     "rebuild": ("Dựng video từ ảnh có sẵn (clip → ghép)", "video"),
     "prompts": ("Chuẩn bị prompt video", "video"),

@@ -4,7 +4,8 @@ from sqlmodel import Session, select
 
 from backend.database import get_session
 from backend.models import Mix, Project, Track
-from backend.schemas import (BatchCreate, BatchRunResponse, ProjectCreate,
+from backend.schemas import (BatchCreate, BatchRunResponse,
+                             ProjectBulkDelete, ProjectCreate,
                              ProjectDetailResponse, ProjectResponse,
                              ProjectRename, ProjectUpdate, MixResponse,
                              TrackResponse)
@@ -65,15 +66,105 @@ def _canonical_instrument(name: str) -> str:
 
 def get_project_or_404(session: Session, project_id: int) -> Project:
     project = session.get(Project, project_id)
-    if project is None:
+    # Project trong Thùng rác = như đã xoá với mọi thao tác thường.
+    if project is None or project.deleted_at is not None:
         raise HTTPException(404, f"Project {project_id} không tồn tại")
     return project
 
 
 @router.get("", response_model=list[ProjectResponse])
 def list_projects(session: Session = Depends(get_session)):
-    projects = session.exec(select(Project).order_by(Project.created_at.desc())).all()
+    projects = session.exec(select(Project)
+                            .where(Project.deleted_at == None)  # noqa: E711
+                            .order_by(Project.created_at.desc())).all()
     return [to_response(session, p) for p in projects]
+
+
+@router.get("/progress")
+def projects_progress(session: Session = Depends(get_session)):
+    """Tình trạng từng project: đã xong / đang ở giai đoạn nào (Nhạc → Mix → Ảnh →
+    Clip → Video → Nháp YT → Short). Chỉ đọc DB + đĩa + job trong bộ nhớ."""
+    from backend.project_progress import STEPS, all_progress
+    return {"steps": [{"key": k, "label": label} for k, label in STEPS],
+            "projects": all_progress(session)}
+
+
+# ---------- Thùng rác: xoá = giữ 7 ngày rồi mới xoá vĩnh viễn ----------
+def _trashed_or_404(session: Session, project_id: int) -> Project:
+    project = session.get(Project, project_id)
+    if project is None or project.deleted_at is None:
+        raise HTTPException(404, f"Project {project_id} không có trong Thùng rác")
+    return project
+
+
+@router.get("/trash")
+def list_trash(session: Session = Depends(get_session)):
+    from backend import project_trash
+    items = project_trash.list_trash(session)
+    return {"retention_days": project_trash.RETENTION_DAYS, "items": items,
+            "total_bytes": sum(i["size_bytes"] for i in items)}
+
+
+@router.post("/trash/empty")
+def empty_trash():
+    """Xoá vĩnh viễn MỌI project trong Thùng rác (không chờ đủ 7 ngày)."""
+    from sqlmodel import Session as DbSession
+    from backend.database import engine
+    from backend import project_trash
+    with DbSession(engine) as session:
+        ids = [p.id for p in session.exec(
+            select(Project).where(Project.deleted_at != None)).all()]  # noqa: E711
+    results = [_purge_one(pid) for pid in ids]
+    return {"results": results, "deleted": sum(1 for r in results if r["ok"]),
+            "failed": sum(1 for r in results if not r["ok"]),
+            "freed_bytes": sum(r.get("freed_bytes", 0) for r in results),
+            "retention_days": project_trash.RETENTION_DAYS}
+
+
+def _purge_one(project_id: int) -> dict:
+    from sqlmodel import Session as DbSession
+    from backend.database import engine
+    from backend.project_cleanup import ProjectBusyError, ProjectCleanupError
+    from backend import project_trash
+    with DbSession(engine) as session:
+        project = session.get(Project, project_id)
+        if project is None or project.deleted_at is None:
+            return {"id": project_id, "name": f"#{project_id}", "ok": False,
+                    "error": "Không có trong Thùng rác."}
+        name = project.name
+        try:
+            info = project_trash.purge_trashed(session, project)
+            return {"id": project_id, "name": name, "ok": True, **info}
+        except ProjectBusyError as exc:
+            return {"id": project_id, "name": name, "ok": False, "busy": True,
+                    "error": str(exc)}
+        except (ProjectCleanupError, OSError) as exc:
+            session.rollback()
+            return {"id": project_id, "name": name, "ok": False, "error": str(exc)}
+
+
+@router.post("/trash/{project_id}/restore", response_model=ProjectResponse)
+def restore_project(project_id: int, session: Session = Depends(get_session)):
+    from backend.project_cleanup import ProjectCleanupError
+    from backend import project_trash
+    project = _trashed_or_404(session, project_id)
+    try:
+        project_trash.restore_from_trash(session, project)
+    except (ProjectCleanupError, OSError) as exc:
+        session.rollback()
+        raise HTTPException(409, str(exc)) from exc
+    session.refresh(project)
+    return to_response(session, project)
+
+
+@router.delete("/trash/{project_id}")
+def purge_project(project_id: int, session: Session = Depends(get_session)):
+    """Xoá vĩnh viễn ngay 1 project đang ở Thùng rác."""
+    _trashed_or_404(session, project_id)
+    result = _purge_one(project_id)
+    if not result["ok"]:
+        raise HTTPException(409 if result.get("busy") else 500, result["error"])
+    return result
 
 
 @router.post("", response_model=ProjectResponse)
@@ -233,7 +324,7 @@ def rename(project_id: int, data: ProjectRename,
     """Đổi tên project (kèm thư mục media, đường dẫn DB, tiêu đề prompt), rồi
     tuỳ `refresh` cập nhật CHỮ tiêu đề trên thumbnail + intro video:
     none = chỉ đổi tên · text = vẽ lại chữ + ghép lại video ·
-    regen = tạo lại ảnh bìa (Gemini) + clip 00 (Flow) rồi như text."""
+    regen = tạo lại ảnh bìa (máy ảnh mặc định Muse.ai) + clip 00 rồi như text."""
     from backend.video import config as vconfig
     from backend.video import service as vservice
     from backend.video.job_manager import video_job_manager
@@ -259,13 +350,77 @@ def rename(project_id: int, data: ProjectRename,
 
 
 @router.delete("/{project_id}")
-def delete_project(project_id: int, session: Session = Depends(get_session)):
+def delete_project(project_id: int, permanent: bool = False,
+                   session: Session = Depends(get_session)):
+    """Mặc định: chuyển vào Thùng rác (giữ 7 ngày, khôi phục được).
+    `?permanent=true` = xoá vĩnh viễn ngay như trước."""
     project = get_project_or_404(session, project_id)
     from backend.project_cleanup import (ProjectBusyError, ProjectCleanupError,
                                          delete_project_data)
+    from backend import project_trash
     try:
-        return delete_project_data(session, project)
+        if permanent:
+            return delete_project_data(session, project)
+        return project_trash.move_to_trash(session, project)
     except ProjectBusyError as exc:
         raise HTTPException(409, str(exc)) from exc
     except (ProjectCleanupError, OSError) as exc:
+        session.rollback()
         raise HTTPException(500, str(exc)) from exc
+
+
+@router.post("/bulk-delete")
+def bulk_delete_projects(body: ProjectBulkDelete):
+    """Chuyển nhiều project vào Thùng rác (giữ 7 ngày) — LẦN LƯỢT từng cái, mỗi
+    cái 1 session riêng: 1 project lỗi/bận không chặn các project còn lại.
+    `permanent=true` trong body = xoá vĩnh viễn ngay (hành vi cũ)."""
+    from sqlmodel import Session as DbSession
+    from backend.database import engine
+    from backend.project_cleanup import (ProjectBusyError, ProjectCleanupError,
+                                         delete_project_data, sweep_pending)
+    from backend import project_trash
+    permanent = bool(getattr(body, "permanent", False))
+    results = []
+    for project_id in dict.fromkeys(body.ids):      # bỏ trùng, giữ thứ tự
+        with DbSession(engine) as session:
+            project = session.get(Project, project_id)
+            if project is None or project.deleted_at is not None:
+                results.append({"id": project_id, "name": f"#{project_id}",
+                                "ok": False, "error": "Project không tồn tại."})
+                continue
+            name = project.name
+            try:
+                if permanent:
+                    info = delete_project_data(session, project)
+                    results.append({"id": project_id, "name": name, "ok": True,
+                                    "warnings": info["warnings"],
+                                    "cleanup_pending": info["cleanup_pending"],
+                                    "freed_bytes": info["freed_bytes"]})
+                else:
+                    info = project_trash.move_to_trash(session, project)
+                    results.append({"id": project_id, "name": name, "ok": True,
+                                    "trashed": True, "warnings": info["warnings"],
+                                    "freed_bytes": 0})
+            except ProjectBusyError as exc:
+                results.append({"id": project_id, "name": name, "ok": False,
+                                "busy": True, "error": str(exc)})
+            except (ProjectCleanupError, OSError) as exc:
+                session.rollback()
+                results.append({"id": project_id, "name": name, "ok": False,
+                                "error": str(exc)})
+    # Nhân tiện dọn lại phần còn sót (file bị khoá) của các lần xoá trước.
+    swept = {"freed_bytes": 0}
+    try:
+        with DbSession(engine) as session:
+            swept = sweep_pending(session)
+    except Exception as exc:        # noqa: BLE001 — dọn phụ, không làm hỏng kết quả xoá
+        print(f"[bulk-delete] sweep lỗi: {exc}", flush=True)
+    return {
+        "results": results,
+        "deleted": sum(1 for r in results if r["ok"]),
+        "trashed": not permanent,
+        "retention_days": project_trash.RETENTION_DAYS,
+        "failed": sum(1 for r in results if not r["ok"]),
+        "freed_bytes": sum(r.get("freed_bytes", 0) for r in results)
+        + swept.get("freed_bytes", 0),
+    }

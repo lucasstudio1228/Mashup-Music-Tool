@@ -281,12 +281,19 @@ def test_tracklist():
     check("Fallback (không API key) vẫn kèm tracklist",
           ym.TRACKLIST_HEADER in meta["description"])
 
+    # Từ 2026-10-07: mô tả upload KHÔNG kèm tracklist (người dùng yêu cầu bỏ).
+    meta = ym.generate_metadata(thumbnail_path="", channel_name="Bamboo Echoes",
+                                instrument="bamboo flute", music_style="zen",
+                                default_hashtags="#zen", past_titles=[],
+                                api_config=None)
+    check("Mặc định (không truyền tracklist) → mô tả không có tracklist",
+          ym.TRACKLIST_HEADER not in meta["description"])
     body = (Path(__file__).resolve().parents[1]
             / "backend/video/service.py").read_text(encoding="utf-8")
-    check("step_upload_youtube truyền tracklist sang AI meta",
-          "tracklist=tracklist" in body and "load_tracklist(audio)" in body)
-    check("Nhạc nền lệch độ dài video → bỏ tracklist thay vì ghi sai giờ",
-          "Bỏ tracklist" in body)
+    up = body[body.index("def step_upload_youtube"):]
+    up = up[:up.index("\ndef ", 1)]
+    check("step_upload_youtube KHÔNG truyền tracklist sang AI meta",
+          "tracklist=" not in up)
 
 
 def main():

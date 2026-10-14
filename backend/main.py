@@ -7,7 +7,7 @@ import sys
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-from fastapi import FastAPI                       # noqa: E402
+from fastapi import FastAPI, HTTPException        # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
 from backend.database import create_db_and_tables  # noqa: E402
@@ -20,6 +20,7 @@ from backend.routers.youtube import router as youtube_router    # noqa: E402
 from backend.routers.suno import router as suno_router          # noqa: E402
 from backend.routers.track_qc import router as track_qc_router  # noqa: E402
 from backend.routers.tasks import router as tasks_router        # noqa: E402
+from backend.routers.storage import router as storage_router    # noqa: E402
 from backend.stem_job_manager import stem_job_manager           # noqa: E402
 from backend.video.job_manager import video_job_manager         # noqa: E402
 
@@ -46,6 +47,48 @@ async def startup():
     job_manager.bind_loop(loop)
     stem_job_manager.bind_loop(loop)
     video_job_manager.bind_loop(loop)   # ← phần Video
+    _start_deferred_sweep()
+
+
+def _start_deferred_sweep(delay_sec: float = 30.0) -> None:
+    """Sau khi khởi động: dọn file còn sót của các lần xoá project trước (bị
+    khoá lúc xoá) + vỏ quarantine rỗng. Chạy nền, trễ 30s, lỗi thì bỏ qua."""
+    import threading
+    import time
+
+    def run():
+        time.sleep(delay_sec)
+        try:
+            from sqlmodel import Session
+            from backend.database import engine
+            from backend.project_cleanup import sweep_pending
+            with Session(engine) as session:
+                result = sweep_pending(session)
+            if result["cleared"] or result["freed_bytes"]:
+                print(f"[storage] Dọn sót sau xoá project: "
+                      f"{result['freed_bytes'] / 1e9:.2f} GB", flush=True)
+        except Exception as exc:        # noqa: BLE001
+            print(f"[storage] sweep lỗi: {exc}", flush=True)
+        # Thùng rác: project quá 7 ngày → xoá vĩnh viễn. Lúc khởi động rồi mỗi
+        # 6 giờ — CHỈ trong backend (nơi biết job nào đang bận).
+        while True:
+            try:
+                from sqlmodel import Session
+                from backend.database import engine
+                from backend.project_trash import purge_expired
+                with Session(engine) as session:
+                    info = purge_expired(session)
+                if info["purged"] or info["freed_bytes"]:
+                    print(f"[trash] Xoá vĩnh viễn (quá hạn 7 ngày): "
+                          f"{', '.join(info['purged']) or '-'} · "
+                          f"{info['freed_bytes'] / 1e9:.2f} GB", flush=True)
+                for err in info["errors"]:
+                    print(f"[trash] chưa xoá được: {err}", flush=True)
+            except Exception as exc:    # noqa: BLE001
+                print(f"[trash] purge lỗi: {exc}", flush=True)
+            time.sleep(6 * 3600)
+
+    threading.Thread(target=run, name="deletion-sweep", daemon=True).start()
 
 
 app.include_router(projects.router, prefix="/api")
@@ -58,6 +101,7 @@ app.include_router(youtube_router) # đã có prefix="/api/youtube" nội bộ
 app.include_router(suno_router)    # STEP 0 — Suno; prefix nội bộ
 app.include_router(track_qc_router)  # rà soát track lẻ + tạo lại Suno + vá mix
 app.include_router(tasks_router)     # thanh tác vụ toàn cục (chỉ đọc)
+app.include_router(storage_router)   # dung lượng + dọn dữ liệu thừa
 
 
 @app.get("/api/health")
@@ -88,10 +132,13 @@ if (_FRONTEND_DIST / "index.html").exists():
     def _serve_index():
         return _index_response()
 
-    # SPA catch-all: file tĩnh thì trả file, còn lại trả index.html
+    # SPA catch-all: file tĩnh thì trả file, còn lại trả index.html.
+    # /api/* không tồn tại → 404 JSON (không trả HTML 200 khiến frontend hiểu nhầm).
     @app.get("/{full_path:path}")
     def _serve_spa(full_path: str):
-        candidate = _FRONTEND_DIST / full_path
-        if candidate.is_file():
+        if full_path == "api" or full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="API không tồn tại")
+        candidate = (_FRONTEND_DIST / full_path).resolve()
+        if candidate.is_file() and candidate.is_relative_to(_FRONTEND_DIST.resolve()):
             return FileResponse(str(candidate))
         return _index_response()

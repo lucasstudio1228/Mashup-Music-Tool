@@ -20,9 +20,9 @@ export default function AppShell({ title, actions, children }: Props) {
       <div className="flex min-h-0 flex-1">
       <Sidebar />
       <div className="flex flex-1 flex-col overflow-hidden">
-        <header className="flex items-center justify-between border-b border-white/5 px-6 py-4">
+        <header className="flex items-center justify-between gap-4 border-b border-white/5 px-6 py-4">
           <h1 className="text-xl font-semibold text-white">{title}</h1>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center justify-end gap-2">
             {actions}
             <button
               onClick={() => setSettingsOpen(true)}

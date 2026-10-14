@@ -21,13 +21,22 @@ class FakeDriver:
         self.lose = set(lose)          # số thứ tự lượt bấm Create bị Suno bỏ qua
         self.clicks = 0
         self.styles = []
+        self.sliders = []              # thanh trượt được kiểm trước mỗi Create
+        self.max_mode = []             # Max Mode được ép On trước mỗi Create
         self.n = 0
+
+    def set_max_mode(self, on):
+        self.max_mode.append((self.clicks, on))
 
     def read_credits(self):
         return 1000
 
     def snapshot_song_ids(self):
         return set()
+
+    def ensure_creative_sliders(self, v):
+        self.sliders.append((self.clicks, dict(v)))
+        return v
 
     def fill_styles(self, s):
         self.styles.append(s)
@@ -38,7 +47,7 @@ class FakeDriver:
     def click_create(self):
         self.clicks += 1
 
-    def wait_for_new_songs(self, before, expected=2, timeout_sec=300):
+    def wait_for_new_songs(self, before, expected=2, timeout_sec=300, **kw):
         if self.clicks in self.lose:
             return []
         out = []
@@ -99,6 +108,20 @@ class GenerateTests(unittest.TestCase):
         self.run_gen(drv)
         self.assertEqual(drv.clicks, 1)
         self.assertIn("req6:p3", self.reqs())
+
+    def test_sliders_checked_before_every_create(self):
+        drv = FakeDriver()
+        self.cfg["style_influence"] = 90
+        self.run_gen(drv)
+        self.assertEqual([n for n, _ in drv.sliders], list(range(drv.clicks)))
+        self.assertEqual(drv.sliders[0][1], {"variety": 0, "style_influence": 90,
+                                             "weirdness": ss.vconfig.SUNO.weirdness})
+
+    def test_max_mode_forced_on_before_every_create(self):
+        drv = FakeDriver()
+        self.cfg["max_mode"] = False                   # batch cũ lưu Off
+        self.run_gen(drv)
+        self.assertEqual(drv.max_mode, [(n, True) for n in range(drv.clicks)])
 
     def test_compensation_is_capped(self):
         drv = FakeDriver(lose={3, 6, 7})

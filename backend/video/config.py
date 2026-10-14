@@ -809,26 +809,31 @@ CHATGPT_SELECTORS: dict[str, list[str]] = {
 GEMINI_SELECTORS: dict[str, list[str]] = {
     # Dropdown chọn model + option 3.1 Pro (tư duy mở rộng)
     "model_selector": [
-        "button[aria-label*='model']",
-        "button:has-text('Gemini')",
         "[data-test-id='bard-mode-menu-button']",
-        "button:has-text('2.5')",
-        "button:has-text('3.1')",
+        "button[aria-label*='chọn chế độ']",
+        "button[aria-label*='mode picker' i]",
+        "button[aria-label*='model']",
     ],
+    # Mục menu chọn ĐÚNG BẰNG tên (không dùng *:has-text — dò live 2026-10-13: nó
+    # khớp cả mô tả «…suy luận song song mức cao nhất» của Deep Think).
     "model_option_pro": [
+        "gem-menu-item:has(:text-is('3.1 Pro'))",
+        "[role='menuitem']:has(:text-is('3.1 Pro'))",
         "[role='menuitemradio']:has-text('3.1 Pro')",
         "[role='menuitem']:has-text('3.1 Pro')",
-        "[role='option']:has-text('3.1 Pro')",
-        "*:has-text('3.1 Pro')",
     ],
-    # Bước 2: mở lại Model, bật "Tư duy mở rộng" (extended thinking)
+    # Bước 2: mức suy luận. Dò live 2026-10-13: Gemini BỎ mục «Tư duy mở rộng»,
+    # thay bằng mức Thấp / Trung bình / Cao (+ Deep Think) — «Cao» = tư duy mở rộng
+    # cũ (nhãn chế độ thành «Pro Cao»). Không thấy mục → driver đóng menu (Escape):
+    # menu bỏ ngỏ CHE ô nhập (lỗi «không tìm thấy ô nhập prompt» #35).
     "model_option_thinking": [
+        "gem-menu-item:has(:text-is('Cao'))",
+        "[role='menuitem']:has(:text-is('Cao'))",
+        "gem-menu-item:has(:text-is('High'))",
+        "[role='menuitem']:has(:text-is('High'))",
         "[role='menuitemradio']:has-text('Tư duy mở rộng')",
         "[role='menuitem']:has-text('Tư duy mở rộng')",
-        "[role='option']:has-text('Tư duy mở rộng')",
-        "button:has-text('Tư duy mở rộng')",
-        "*:has-text('Tư duy mở rộng')",
-        "*:has-text('Thinking')",
+        "[role='menuitem']:has-text('Extended thinking')",
     ],
     # Ô nhập prompt
     "prompt_box": [
@@ -949,10 +954,13 @@ GEMINI_VIDEO_SELECTORS: dict[str, list[str]] = {
     # Nút chế độ: aria «Mở công cụ chọn chế độ, hiện tại là Pro Mở rộng».
     "mode_button": ["[data-test-id='bard-mode-menu-button']"],
     "mode_pro": [
+        "gem-menu-item:has(:text-is('3.1 Pro'))",
         "gem-menu-item:has-text('3.1 Pro')",
         "[role='menuitem']:has-text('3.1 Pro')",
     ],
     "mode_thinking": [
+        "gem-menu-item:has(:text-is('Cao'))",           # 2026-10-13: thay «Tư duy mở rộng»
+        "gem-menu-item:has(:text-is('High'))",
         "gem-menu-item:has-text('Tư duy mở rộng')",
         "[role='menuitem']:has-text('Tư duy mở rộng')",
         "gem-menu-item:has-text('Extended thinking')",
@@ -1384,8 +1392,18 @@ class SunoConfig:
     allow_bass:          bool = False           # không có UI switch → đưa vào Exclude styles
     allow_drums:         bool = False           # không có UI switch → đưa vào Exclude styles
     generation_strategy: str  = "paired_outputs"  # 2 bài/request nhưng CHỈ chọn 1 (2 bài na ná) → cần 15 request cho 15
-    variety:             int  = 0               # chỉ set nếu UI có control (Suno KHÔNG có)
-    max_mode:            bool = False           # Max Mode = Off theo mặc định
+    # Thanh trượt More Options (LIVE 2026-10-08, chỉ kéo bằng chuột). Variety 0–4
+    # (Off/Normal/…): >0 làm Suno viết lại Styles và tự thêm nhạc cụ → Off. Style
+    # Influence cao + Weirdness thấp = bám sát Styles (nhạc cụ chính). Chốt theo
+    # thí nghiệm A/B data/_suno_ab (project #24 bamboo flute).
+    variety:             int  = 0
+    style_influence:     int  = 75
+    weirdness:           int  = 30
+    # Mỗi Create ra 2 bài: chấm "đúng nhạc cụ chính" (PANNs, 0 credit) rồi giữ bài
+    # sạch hơn (A/B 2026-10-08: bài đầu sạch 47% → chọn 1 trong 2 sạch 73%).
+    instrument_qc:       bool = True
+    # Người dùng chốt 2026-10-08: Max Mode LUÔN bật (tool ép On mỗi lượt Create).
+    max_mode:            bool = True
     concurrency_per_account: int = 1            # 1 worker/profile — lock chống 2 worker
     auto_continue_workflow: bool = True         # sau import → chạy tiếp pipeline hiện có
     preferred_duration_seconds_min: int = 180   # 3:00 (soft — Duration Custom)
@@ -1393,9 +1411,24 @@ class SunoConfig:
     minimum_duration_seconds: int = 120         # WAV ngắn hơn 2:00 bị loại
     # ── Ngân sách / chốt chặn an toàn (không tự mua thêm credit) ──
     max_create_actions:      int = 15           # mỗi Create chọn 1 bài → cần 15 lần Create cho 15 bài
-    max_generation_credits:  int = 100          # trần credit tiêu cho 1 batch
+    max_generation_credits:  int = 400          # tham khảo: (15 + 5 lượt bù) × 20 credit
+    # Đo thật 10 credit/Create; Max Mode LUÔN bật → ×2 (tooltip Suno «Costs 2x credits»).
+    # Trần chi thật = max_create_actions + max_replacement_creates; dưới mức này → dừng.
+    credits_per_create:      int = 20
     max_new_song_downloads:  int = 15           # trần số WAV tải về/batch
     max_replacement_creates: int = 5            # lượt Create THÊM khi cả 2 bài của 1 lượt đều lỗi (ngắn/hỏng)
+    # ── Xác nhận lượt Create được NHẬN (từ 2026-10-12 Suno chặn Create bằng captcha) ──
+    # Bình thường bài mới hiện ~3s sau khi bấm. Quá create_accept_sec mà không bài,
+    # không captcha, không request tạo bài → báo sớm (không mù chờ 300s).
+    create_accept_sec:       int = 90
+    # Captcha hiện → đưa cửa sổ Suno lên trước, chờ NGƯỜI DÙNG tự giải tối đa chừng
+    # này giây (tool KHÔNG tự giải/vượt captcha). Chờ lâu để lô TẠM DỪNG tại chỗ chứ
+    # không gãy: người dùng tích ô lúc nào thì chạy tiếp lúc đó.
+    captcha_wait_sec:        int = 3600
+    captcha_beep_sec:        int = 180          # bíp nhắc lại mỗi chừng này giây khi còn chờ
+    # Giãn nhịp: 2 lượt Create liên tiếp cách nhau tối thiểu chừng này giây
+    # (2026-10-12: 4 lượt trong 21s → Suno bật ô «Verify you are human»).
+    create_min_gap_sec:      int = 30
 
 
 # Preset lưu NGUYÊN VĂN Styles + Exclusions tiếng Anh đã gửi (mục E). KHÔNG
@@ -1450,30 +1483,38 @@ SUNO_SELECTORS: dict[str, list[str]] = {
         "[role=tab]:has-text('Simple')",
     ],
     # Nút hiển thị model hiện tại (góc trên-phải panel, text = version vd 'v6').
+    # Đang ở custom model thì nút chỉ có ẢNH BÌA (không chữ). Driver định vị
+    # CHÍNH bằng hình học (SunoDriver._model_button: nút aria-haspopup cùng hàng,
+    # ngay phải pill credits); list này chỉ là DỰ PHÒNG. LIVE 2026-10-12 nút có
+    # aria-haspopup='dialog' (trước 'menu' — selector 'menu' cũ giờ khớp nhầm
+    # nút ⋯ của danh sách bài nên đã bỏ).
     "model_button": [
+        "button[aria-haspopup='dialog']:right-of(button[aria-label^='Credits remaining'])",
         "button:has-text('v6-mini')",
         "button:has-text('v6-wild')",
         "button:has-text('v6')",
     ],
-    # Mục chọn model 'v6' trong popover ALL MODELS.
+    # Mục chọn model 'v6' trong hộp ALL MODELS (LIVE 2026-10-12: grid/row;
+    # trước đó menu/menuitemradio).
     "model_option_v6": [
+        "[role=grid][aria-label='Model'] [role=row]:has-text('Powerful. Versatile. Refined.')",
+        "[role=menuitemradio]:has-text('Powerful. Versatile. Refined.')",
         "[role=menuitem]:has-text('v6'):not(:has-text('mini')):not(:has-text('wild'))",
         "[role=option]:has-text('v6'):not(:has-text('mini')):not(:has-text('wild'))",
-        "*:has-text('Powerful. Versatile. Refined.')",
     ],
     # Ô tiêu đề bài (tùy chọn) — KHÔNG bắt buộc.
     "song_title": [
         "input[placeholder='Song Title (Optional)']",
         "input[placeholder*='Song Title']",
     ],
-    # Lyrics editor — ĐỂ TRỐNG = instrumental. Chỉ dùng để KIỂM TRA đã trống.
-    # Suno hiện gọi ô này là "Cowriter prompt" (textarea data-cowrite-input);
-    # giữ selector cũ 'Lyrics editor' làm dự phòng cho UI phiên bản khác.
+    # Lyrics editor — ĐỂ TRỐNG = instrumental. LIVE 2026-10-08: ô Lyrics thật là
+    # Lexical contenteditable div[role=textbox][aria-label='Lyrics editor']
+    # (placeholder "leave this empty for instrumental"). TUYỆT ĐỐI không dùng
+    # textarea 'Cowriter prompt' (data-cowrite-input) — đó là ô NHỜ SUNO VIẾT LỜI.
     "lyrics_editor": [
-        "textarea[data-cowrite-input='true']",
-        "textarea[aria-label='Cowriter prompt']",
         "[role=textbox][aria-label='Lyrics editor']",
-        "div[aria-label='Lyrics editor']",
+        "div[contenteditable='true'][aria-label='Lyrics editor']",
+        "div.lyrics-editor-content[contenteditable='true']",
     ],
     # Ô Styles (textarea, 1000 ký tự). Placeholder là VÍ DỤ XOAY VÒNG (đổi liên
     # tục) → KHÔNG match theo placeholder. Neo theo data-testid ổn định của
@@ -1501,6 +1542,10 @@ SUNO_SELECTORS: dict[str, list[str]] = {
     # Max Mode Off/On.
     "max_mode_off": ["button:has-text('Off')"],
     "max_mode_on":  ["button:has-text('On')"],
+    # Thanh trượt sáng tạo trong More Options (LIVE 2026-10-08, role=slider).
+    "slider_weirdness": ["[role=slider][aria-label='Weirdness']"],
+    "slider_style_influence": ["[role=slider][aria-label='Style Influence']"],
+    "slider_variety": ["[role=slider][aria-label='Variety']"],
     # Nút Create.
     "create_button": [
         "button[aria-label='Create song']",
@@ -1647,6 +1692,40 @@ def clip_engine() -> str:
     """'flow' (mặc định) | 'gemini' | 'muse' — máy tạo clip tự động."""
     v = str(load_overrides().get("clip_engine") or DEFAULT_CLIP_ENGINE).strip().lower()
     return v if v in CLIP_ENGINES else DEFAULT_CLIP_ENGINE
+
+
+# Máy tạo ẢNH (bảng nhân vật + ảnh bìa). Muse.ai MẶC ĐỊNH từ 2026-10-08 (yêu cầu
+# người dùng); máy chính hỏng (hết lượt / lỗi máy chủ / bộ lọc / mất đăng nhập) →
+# TỰ chuyển máy còn lại (Gemini) vẽ lại TOÀN BỘ ảnh từ đầu cho cả bộ đồng nhất.
+# Override: image_engine="gemini" (Gemini chính, Muse dự phòng),
+# image_fallback=false (tắt chuyển dự phòng; khoá cũ image_muse_fallback vẫn đọc).
+IMAGE_ENGINES = ("gemini", "muse")
+IMAGE_ENGINE_LABELS = {"gemini": "Gemini", "muse": "Muse.ai"}
+DEFAULT_IMAGE_ENGINE = "muse"
+
+
+def image_engine() -> str:
+    """'muse' (mặc định, dự phòng Gemini) | 'gemini' (dự phòng Muse) — máy tạo ảnh."""
+    v = str(load_overrides().get("image_engine") or DEFAULT_IMAGE_ENGINE).strip().lower()
+    return v if v in IMAGE_ENGINES else DEFAULT_IMAGE_ENGINE
+
+
+def image_fallback_engine() -> str:
+    """Máy dự phòng = máy còn lại."""
+    return "gemini" if image_engine() == "muse" else "muse"
+
+
+def image_fallback() -> bool:
+    """Máy ảnh chính không tạo được → chuyển máy dự phòng (mặc định BẬT)."""
+    ov = load_overrides()
+    v = ov.get("image_fallback", ov.get("image_muse_fallback", True))
+    if isinstance(v, str):
+        return v.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(v)
+
+
+def image_engine_label(engine: str | None = None) -> str:
+    return IMAGE_ENGINE_LABELS.get(engine or image_engine(), "Muse.ai")
 
 
 def clip_prompt_mode() -> str:

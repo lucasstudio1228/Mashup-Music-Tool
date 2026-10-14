@@ -9,9 +9,8 @@ Yêu cầu của người dùng:
   • Description phải "soi tên kênh" → nhắc channel_name.
   • Nếu thiếu API key / không đọc được ảnh → vẫn trả metadata mặc định hợp lý
     (dựa trên tên kênh + nhạc cụ + phong cách) để pipeline không gãy.
-  • Description PHẢI liệt kê từng track lẻ kèm mốc thời gian (tracklist /
-    chapters). Tên track do bước Mix tự đặt (track_namer) và mốc thời gian lấy
-    từ `<mix>_info.json` — KHÔNG để AI bịa giờ.
+  • Description KHÔNG kèm tracklist / mốc thời gian (bỏ từ 2026-10-07, theo
+    yêu cầu người dùng). `tracklist=` chỉ còn là tuỳ chọn; upload không truyền.
 """
 from __future__ import annotations
 
@@ -169,14 +168,11 @@ def generate_metadata(
     lỗi/khuyết cấu hình → dùng _fallback_meta.
 
     `tracklist`: [{'name', 'start_seconds'}] của các track lẻ trong bản mix
-    (xem `load_tracklist`). Luôn được chèn vào description dưới dạng chapters."""
+    (xem `load_tracklist`). Chỉ chèn khi được truyền — upload mặc định KHÔNG truyền."""
     _log = _log_fn(log)
     block = format_tracklist(tracklist or [])
     if block:
         _log(f"YT-meta: chèn tracklist {len(tracklist)} track vào mô tả.")
-    else:
-        _log("YT-meta: KHÔNG có dữ liệu track lẻ (audio không qua bước Mix) — "
-             "mô tả sẽ thiếu tracklist.")
 
     def _finish(meta: dict) -> dict:
         meta["description"] = insert_tracklist(meta["description"], block)
@@ -228,9 +224,8 @@ def generate_metadata(
         "scene. Suggest uses (sleep, study, meditation, spa, stress relief). "
         "End with a subscribe call-to-action and then the hashtags on the last "
         "line.\n"
-        "3b. Do NOT write any tracklist, chapter list or timestamps yourself — "
-        "the real tracklist (track names + exact times) is appended "
-        "automatically after your text. Never invent times.\n"
+        "3b. Do NOT write any tracklist, track names, chapter list or "
+        "timestamps in the description.\n"
         "4. hashtags: a single string of 8-15 space-separated #tags relevant to "
         "the instrument, style and relaxation niche; include the default "
         "hashtags. Lowercase, no spaces inside a tag.\n\n"

@@ -167,7 +167,8 @@ export default function SunoPanel({ projectId }: { projectId: number }) {
   const [preset, setPreset] = useState("");
   const [model, setModel] = useState("");
   const [allowFallback, setAllowFallback] = useState(false);
-  const [maxMode, setMaxMode] = useState(false);
+  // Max Mode LUÔN bật (chốt 2026-10-08) — backend cũng ép True, ô tick chỉ để hiển thị.
+  const maxMode = true;
   const [target, setTarget] = useState(15);
   const [durMin, setDurMin] = useState(180);
   const [durMax, setDurMax] = useState(300);
@@ -184,7 +185,6 @@ export default function SunoPanel({ projectId }: { projectId: number }) {
       setPreset(d.preset);
       setModel(d.preferred_model);
       setAllowFallback(d.allow_model_fallback);
-      setMaxMode(d.max_mode);
       setTarget(d.target_tracks);
       setDurMin(d.preferred_duration_seconds_min);
       setDurMax(d.preferred_duration_seconds_max);
@@ -593,8 +593,8 @@ export default function SunoPanel({ projectId }: { projectId: number }) {
             </label>
             <label className="flex cursor-pointer items-center gap-2 text-xs text-gray-300">
               <input type="checkbox" className="h-4 w-4 accent-accent" checked={maxMode}
-                     disabled={busy} onChange={(e) => setMaxMode(e.target.checked)} />
-              Bật Max mode (chất lượng cao, tốn credit hơn)
+                     disabled readOnly />
+              Max Mode: luôn bật (giữ nhất quán nhạc cụ suốt bài — tốn gấp đôi credit, ~20/lượt Create)
             </label>
             <label className="flex cursor-pointer items-center gap-2 text-xs text-gray-300">
               <input type="checkbox" className="h-4 w-4 accent-accent" checked={autoContinue}
@@ -607,11 +607,13 @@ export default function SunoPanel({ projectId }: { projectId: number }) {
         <Section title="Ngân sách (chốt an toàn — xác nhận trước khi chạy live)">
           <div className="grid grid-cols-3 gap-3">
             {numField("Max lượt Create", maxCreate, setMaxCreate)}
-            {numField("Max credit tạo", maxCredits, setMaxCredits)}
+            {numField("Max credit tạo", maxCredits, setMaxCredits, "tham khảo · 20/lượt Create")}
             {numField("Max lượt tải", maxDownloads, setMaxDownloads)}
           </div>
           <p className="mt-2 text-[11px] text-gray-600">
-            Tool dừng khi chạm bất kỳ hạn mức nào. Không tự mua thêm credit/lượt tải.
+            Tool dừng khi chạm trần lượt Create / lượt tải, khi còn &lt;20 credit hoặc khi
+            Suno báo hết lượt tải. WAV tải qua Studio (Premier: không giới hạn lượt tải).
+            Không tự mua thêm credit/lượt tải.
           </p>
         </Section>
 

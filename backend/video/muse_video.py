@@ -239,8 +239,9 @@ def wait_connected(page, timeout_sec: float, tick: Callable[[float], None]) -> N
 
 
 def _send(page, paths: list[str], prompt: str) -> str:
-    page.locator(_SEL["file_input"]).first.set_input_files(paths)
-    page.wait_for_timeout(5000)          # Muse tải ảnh lên (ô xem trước hiện ra)
+    if paths:                            # ảnh Muse (bảng nhân vật) gửi KHÔNG đính kèm
+        page.locator(_SEL["file_input"]).first.set_input_files(paths)
+        page.wait_for_timeout(5000)      # Muse tải ảnh lên (ô xem trước hiện ra)
     box = page.locator(_SEL["message_box"]).first
     box.click()
     box.fill(prompt)

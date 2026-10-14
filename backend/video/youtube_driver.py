@@ -462,6 +462,42 @@ class _CDPPlaywright:
                 pass
 
 
+def _read_video_url(page) -> str:
+    """Link video trong hộp thoại tải lên (youtu.be/… hoặc /shorts/…). Không raise."""
+    try:
+        url = page.evaluate(r"""() => {
+          const a = [...document.querySelectorAll('ytcp-uploads-dialog a[href]')]
+            .map(x => x.href).find(h => /youtu\.be\/|youtube\.com\/(shorts|watch)/.test(h));
+          return a || '';
+        }""")
+        return str(url or "").strip()
+    except Exception:
+        return ""
+
+
+def _dialog_text(page) -> str:
+    """Chữ đang hiện trong hộp thoại tải lên (để báo đúng lý do YouTube từ chối)."""
+    try:
+        return " ".join(str(page.evaluate("""() => [...document.querySelectorAll(
+            'ytcp-uploads-dialog, tp-yt-paper-dialog, [role=dialog]')]
+            .filter(d => d.offsetParent !== null).map(d => d.innerText).join(' | ')""")
+        ).split())[:400]
+    except Exception:
+        return ""
+
+
+def _no_details_message(page) -> str:
+    """2026-10-07: kênh Zen Meditation chưa BẬT «Intermediate features» (chỉ
+    «Eligible») → YouTube không nhận video >15 phút, form chi tiết không mở."""
+    txt = _dialog_text(page)
+    msg = ("Đã chọn file nhưng YouTube không mở form chi tiết (ô Tiêu đề). Nguyên "
+           "nhân hay gặp: kênh CHƯA bật tính năng trung cấp — video >15 phút & "
+           "thumbnail tự chọn. Mở Studio của kênh → Settings → Channel → Feature "
+           "eligibility → «Intermediate features» phải là Enabled (bạn tự xác minh "
+           "số điện thoại), rồi bấm «Đăng nháp YouTube» lại.")
+    return msg + (f" YouTube hiển thị: «{txt}»" if txt else "")
+
+
 def upload_draft(
     cdp_endpoint: str,
     video_path: str,
@@ -537,8 +573,7 @@ def upload_draft(
         _p("Chờ hộp thoại chi tiết…", 28.0)
         title_loc = _bb.query_first(page, sel["title_box"], timeout_ms=60_000)
         if not title_loc:
-            raise RuntimeError(
-                "Upload rồi nhưng không thấy ô Tiêu đề (giao diện Studio đổi?).")
+            raise RuntimeError(_no_details_message(page))
 
         # 5) Tiêu đề (xoá tên file mặc định trước)
         _p("Điền tiêu đề…", 40.0)
@@ -644,6 +679,9 @@ def upload_draft(
         upload_status = _wait_upload_complete(page, sel, _p, warnings,
                                               timeout_s=wait_s)
 
+        # 13b) Link video (để Short dẫn về bản đầy đủ) — chỉ ĐỌC.
+        video_url = _read_video_url(page)
+
         # 14) ĐÓNG dialog → YouTube TỰ LƯU DRAFT. Không bao giờ bấm Next→Publish.
         _p("Đóng hộp thoại để lưu bản nháp…", 90.0)
         closed = _bb.click_first(page, sel["close_dialog"], timeout_ms=10_000)
@@ -662,4 +700,4 @@ def upload_draft(
             pass
 
     return {"status": "draft", "warnings": warnings,
-            "upload_status": upload_status}
+            "upload_status": upload_status, "video_url": video_url}

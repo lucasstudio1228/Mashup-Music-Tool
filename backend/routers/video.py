@@ -46,7 +46,7 @@ class RebuildBody(BaseModel):
 
 def _project_or_404(db: Session, project_id: int) -> Project:
     p = db.get(Project, project_id)
-    if not p:
+    if not p or getattr(p, "deleted_at", None):
         raise HTTPException(404, f"Project {project_id} không tồn tại")
     return p
 
@@ -152,6 +152,11 @@ def status(project_id: int, db: Session = Depends(get_session)):
         "t_window": p.t_window, "model": p.flow_model,
         # Máy tạo clip: flow (mặc định) | gemini | muse (override clip_engine).
         "clip_engine": config.clip_engine(), "clip_engine_label": service.clip_engine_label(),
+        # Máy tạo ảnh: muse (mặc định, dự phòng gemini) | gemini (override image_engine).
+        "image_engine": config.image_engine(),
+        "image_engine_label": config.image_engine_label(),
+        "image_fallback_label": (config.image_engine_label(config.image_fallback_engine())
+                                 if config.image_fallback() else None),
         "clip_engines": [{"key": k, "label": config.CLIP_ENGINE_LABELS.get(k, k)}
                          for k in config.CLIP_ENGINES],
         "aspect_ratio": p.aspect_ratio, "flow_mode": p.flow_mode,
@@ -193,6 +198,13 @@ def gen_images(project_id: int, body: RunImagesBody,
     topic = (body.topic or project.name or "meditation").strip()
     mode = "resume" if body.mode == "resume" else "restart"
     idea = (body.idea if body.idea is not None else project.video_idea).strip() or None
+    if mode == "resume":
+        # «Tạo tiếp ảnh thiếu» = chạy tiếp CẢ chu trình: ảnh → clip → ghép →
+        # nháp YouTube → nháp Short (bước nào xong rồi thì bỏ qua).
+        video_job_manager.submit(project_id, "continue", service.continue_from_images,
+                                 topic, project.name, idea, project.video_style)
+        return {"status": "submitted", "kind": "continue", "topic": topic,
+                "mode": mode, "has_idea": bool(idea)}
     video_job_manager.submit(project_id, "images", service.step_images,
                              topic, mode, project.name, idea, project.video_style)
     return {"status": "submitted", "kind": "images", "topic": topic,
@@ -205,6 +217,11 @@ def gen_clips(project_id: int, body: RunClipsBody = RunClipsBody(),
     project = _project_or_404(db, project_id)
     _guard_busy()
     mode = "resume" if body.mode == "resume" else "restart"
+    if mode == "resume":
+        # «Tạo tiếp clip thiếu» = clip thiếu → ghép → nháp YouTube → nháp Short.
+        video_job_manager.submit(project_id, "continue", service.continue_from_clips,
+                                 project.name, project.video_style)
+        return {"status": "submitted", "kind": "continue", "mode": mode}
     video_job_manager.submit(project_id, "clips", service.step_clips,
                              mode, project.name, project.video_style)
     return {"status": "submitted", "kind": "clips", "mode": mode}
@@ -375,9 +392,49 @@ def upload_youtube(project_id: int, db: Session = Depends(get_session)):
     if not (project.instrument or "").strip() or not (project.music_style or "").strip():
         raise HTTPException(
             400, "Chưa nhập 'nhạc cụ' và 'phong cách nhạc' cho project.")
-    video_job_manager.submit(project_id, "upload", service.step_upload_youtube,
+    video_job_manager.submit(project_id, "upload", service.step_upload_youtube_and_short,
                              project.name, project.instrument, project.music_style)
     return {"status": "submitted", "kind": "upload"}
+
+
+@router.post("/upload-short")
+def upload_short(project_id: int, db: Session = Depends(get_session)):
+    """Cắt đoạn dọc 9:16 ở GIỮA final.mp4 → YouTube Short, AI viết nội dung ngắn,
+    đăng NHÁP lên cùng kênh với video dài. KHÔNG publish."""
+    project = _project_or_404(db, project_id)
+    _guard_busy()
+    final = config.final_dir(project_id, project.name) / "final.mp4"
+    if not final.exists():
+        raise HTTPException(400, "Chưa có final.mp4 — hãy render video trước.")
+    if not (project.instrument or "").strip() or not (project.music_style or "").strip():
+        raise HTTPException(
+            400, "Chưa nhập 'nhạc cụ' và 'phong cách nhạc' cho project.")
+    video_job_manager.submit(project_id, "upload_short", service.step_upload_short,
+                             project.name, project.instrument, project.music_style)
+    return {"status": "submitted", "kind": "upload_short"}
+
+
+class ShortSettingsBody(BaseModel):
+    auto_short: Optional[bool] = None
+    short_seconds: Optional[float] = None
+
+
+@router.get("/short-settings")
+def get_short_settings(project_id: int):
+    """Cài đặt YouTube Short (toàn cục): tự tạo sau nháp video dài, độ dài đoạn."""
+    from backend.video import shorts
+    return shorts.settings()
+
+
+@router.post("/short-settings")
+def set_short_settings(project_id: int, body: ShortSettingsBody):
+    from backend.video import shorts
+    if body.auto_short is not None:
+        config.save_override("auto_short", bool(body.auto_short))
+    if body.short_seconds is not None:
+        config.save_override("short_seconds", float(
+            min(max(body.short_seconds, shorts.MIN_SECONDS), shorts.MAX_SECONDS)))
+    return shorts.settings()
 
 
 @router.get("/youtube-history")
@@ -392,6 +449,7 @@ def youtube_history(project_id: int, db: Session = Depends(get_session)):
     ).all()
     return [{
         "id": r.id, "channel_name": r.channel_name, "title": r.title,
+        "kind": "short" if (r.video_path or "").endswith("short.mp4") else "long",
         "hashtags": r.hashtags, "status": r.status,
         "error_message": r.error_message,
         "created_at": r.created_at.isoformat() if r.created_at else None,

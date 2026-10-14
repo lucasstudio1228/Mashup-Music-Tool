@@ -164,8 +164,14 @@ def _mode_label(page, vsels) -> str:
     return aria.split("hiện tại là", 1)[-1].strip() if "hiện tại là" in aria else aria
 
 
+# Mức suy luận cao: «Mở rộng/Extended» (cũ) hoặc «Cao/High» (từ 2026-10-13,
+# menu chế độ = 3.1 Pro + mức Thấp/Trung bình/Cao/Deep Think).
+_THINK_RE = re.compile(r"Mở rộng|Extended|\bCao\b|\bHigh\b", re.I)
+
+
 def _ensure_mode(page, vsels) -> str:
-    """Chế độ phải là «Pro Mở rộng» (3.1 Pro + Tư duy mở rộng)."""
+    """Chế độ phải là 3.1 Pro + mức suy luận cao («Pro Cao»; trước 2026-10-13
+    là «Pro Mở rộng»)."""
     label = _mode_label(page, vsels)
     if not re.search(r"\bPro\b", label):
         if click_first(page, vsels["mode_button"], timeout_ms=6000):
@@ -174,15 +180,15 @@ def _ensure_mode(page, vsels) -> str:
             page.wait_for_timeout(1200)
             _close_overlays(page, 2)
         label = _mode_label(page, vsels)
-    if not re.search(r"Mở rộng|Extended", label, re.I):
+    if not _THINK_RE.search(label):
         if click_first(page, vsels["mode_button"], timeout_ms=6000):
             page.wait_for_timeout(900)
             click_first(page, vsels["mode_thinking"], timeout_ms=6000)
             page.wait_for_timeout(1200)
             _close_overlays(page, 2)
         label = _mode_label(page, vsels)
-    if not (re.search(r"\bPro\b", label) and re.search(r"Mở rộng|Extended", label, re.I)):
-        raise RuntimeError(f"Không chọn được chế độ «Pro Mở rộng» (đang: {label!r}).")
+    if not (re.search(r"\bPro\b", label) and _THINK_RE.search(label)):
+        raise RuntimeError(f"Không chọn được chế độ «Pro Cao» (đang: {label!r}).")
     return label
 
 

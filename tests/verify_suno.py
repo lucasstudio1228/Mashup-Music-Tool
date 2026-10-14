@@ -329,11 +329,12 @@ class _FakeCreateDriver(_FakeDlDriver):
     def fill_exclusions(self, v): pass
     def ensure_duration_auto(self): pass
     def set_max_mode(self, v): pass
+    def ensure_creative_sliders(self, v): return v
     def snapshot_song_ids(self): return set()
     def fill_styles(self, v): self.styles.append(v)
     def click_create(self): self.creates += 1
 
-    def wait_for_new_songs(self, before, expected=2, timeout_sec=300):
+    def wait_for_new_songs(self, before, expected=2, timeout_sec=300, **kw):
         from backend.video.suno_driver import NewSong
         p = self.new_prefixes.pop(0)
         return [NewSong(song_id=f"{p}{i}{self.creates:03d}-0000-0000-0000-000000000000")

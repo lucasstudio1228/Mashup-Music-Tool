@@ -118,7 +118,9 @@ class VideoWorkflowTests(unittest.TestCase):
 
         for kind, (lo, hi) in config.FLOW_HUMAN_PACE.items():
             waited.clear()
-            flow_driver._pace(page, kind)
+            # Mặc định — không phụ thuộc data/video_overrides.json của máy chạy test.
+            with patch.object(config, "load_overrides", return_value={}):
+                flow_driver._pace(page, kind)
             self.assertEqual(len(waited), 1)
             self.assertGreaterEqual(waited[0], int(lo * 1000))
             self.assertLessEqual(waited[0], int(hi * 1000) + 1)

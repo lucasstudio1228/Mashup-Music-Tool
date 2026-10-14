@@ -13,6 +13,9 @@ const VIDEO_KIND_LABEL: Record<string, string> = {
   assemble: 'Đang ghép video',
   full: 'Đang dựng toàn bộ video',
   rebuild: 'Đang dựng lại video từ ảnh',
+  upload: 'Đang đăng nháp YouTube',
+  upload_short: 'Đang tạo & đăng nháp YouTube Short',
+  continue: 'Đang chạy tiếp chu trình (→ ghép → nháp YouTube → Short)',
 };
 
 /**

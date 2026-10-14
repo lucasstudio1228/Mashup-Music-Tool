@@ -67,6 +67,7 @@ HEAL_CANDIDATES: dict[str, list[str]] = {
         "[role=button]:has-text('Create')",
     ],
     "model_button": [
+        "button[aria-haspopup='dialog']:right-of(button[aria-label^='Credits remaining'])",
         "button:has-text('v6-mini')", "button:has-text('v6-wild')",
         "button:has-text('v6')", "button:has-text('v5')",
         "button[aria-label*='model' i]",
@@ -85,9 +86,8 @@ HEAL_CANDIDATES: dict[str, list[str]] = {
         "*[aria-label*='credit' i]",
     ],
     "lyrics_editor": [
-        "textarea[data-cowrite-input='true']",
-        "textarea[aria-label='Cowriter prompt']",
-        "textarea[aria-label*='lyric' i]",
+        "[role=textbox][aria-label='Lyrics editor']",
+        "div.lyrics-editor-content[contenteditable='true']",
         "[role=textbox][aria-label*='Lyrics' i]",
     ],
     "more_options": [

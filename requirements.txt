@@ -5,6 +5,9 @@ scipy>=1.11.0
 resampy>=0.4.2
 demucs>=4.0.0
 pyloudnorm>=0.1.1
+# Chấm "đúng nhạc cụ chính" cho bài Suno (video/instrument_qc.py). Trọng số
+#   Cnn14_mAP=0.431.pth (zenodo.org/record/3987831) đặt vào ~/panns_data/
+panns_inference>=0.1.1
 noisereduce>=0.1.0
 # torch: CUDA build cần cài riêng:
 #   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121

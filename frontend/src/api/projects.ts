@@ -1,15 +1,19 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from './client';
+import { newApi } from './storage';
 import type {
   BatchCreate,
   BatchRun,
   BatchStyleOption,
+  BulkDeleteResult,
   GenreOption,
   InstrumentOption,
   Project,
   ProjectCreate,
   ProjectDetail,
   ProjectUpdate,
+  ProjectsProgressResponse,
+  TrashList,
 } from '../types';
 
 export function useProjects() {
@@ -124,12 +128,96 @@ export function useResumeBatch() {
   });
 }
 
+/** Tình trạng mọi project (đã xong / đang ở giai đoạn nào). Poll 4s khi có project
+ *  đang chạy, 15s khi tất cả đứng yên. */
+export function useProjectsProgress() {
+  return useQuery<ProjectsProgressResponse>({
+    queryKey: ['projects-progress'],
+    queryFn: () =>
+      newApi<ProjectsProgressResponse>(() =>
+        api.get('/api/projects/progress', { timeout: 30_000 })),
+    retry: false,
+    refetchInterval: (query) => {
+      const items = query.state.data?.projects ?? [];
+      return items.some((p) => ['running', 'paused', 'queued'].includes(p.state))
+        ? 4000
+        : 15000;
+    },
+  });
+}
+
+function invalidateProjectLists(qc: ReturnType<typeof useQueryClient>) {
+  qc.invalidateQueries({ queryKey: ['projects'] });
+  qc.invalidateQueries({ queryKey: ['projects-progress'] });
+  qc.invalidateQueries({ queryKey: ['project-trash'] });
+  qc.invalidateQueries({ queryKey: ['storage-usage'] });
+}
+
+/** Mặc định: chuyển vào Thùng rác (giữ 7 ngày). */
 export function useDeleteProject() {
   const qc = useQueryClient();
   return useMutation({
+    // Dời thư mục lớn + thử lại khi file bị khoá → có thể quá 30s mặc định.
     mutationFn: async (id: number) =>
-      (await api.delete(`/api/projects/${id}`)).data,
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['projects'] }),
+      (await api.delete(`/api/projects/${id}`, { timeout: 180_000 })).data,
+    onSuccess: () => invalidateProjectLists(qc),
+  });
+}
+
+// ---------- Thùng rác ----------
+export function useTrash(enabled = true) {
+  return useQuery<TrashList>({
+    queryKey: ['project-trash'],
+    enabled,
+    queryFn: () =>
+      newApi<TrashList>(() => api.get('/api/projects/trash', { timeout: 120_000 })),
+    retry: false,
+    refetchInterval: 60_000,
+  });
+}
+
+export function useRestoreProject() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: number) =>
+      (await api.post<Project>(`/api/projects/trash/${id}/restore`, null,
+                               { timeout: 180_000 })).data,
+    onSettled: () => invalidateProjectLists(qc),
+  });
+}
+
+/** Xoá vĩnh viễn NGAY 1 project trong Thùng rác. */
+export function usePurgeProject() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: number) =>
+      (await api.delete(`/api/projects/trash/${id}`, { timeout: 600_000 })).data as
+        { freed_bytes?: number; warnings?: string[] },
+    onSettled: () => invalidateProjectLists(qc),
+  });
+}
+
+export function useEmptyTrash() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      newApi<BulkDeleteResult>(() =>
+        api.post('/api/projects/trash/empty', null, { timeout: 900_000 })),
+    onSettled: () => invalidateProjectLists(qc),
+  });
+}
+
+/** Chuyển nhiều project vào Thùng rác — server xử lý lần lượt từng cái. */
+export function useBulkDeleteProjects() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (ids: number[]) =>
+      newApi<BulkDeleteResult>(() =>
+        api.post('/api/projects/bulk-delete', { ids }, { timeout: 900_000 })),
+    onSettled: () => {
+      invalidateProjectLists(qc);
+      qc.invalidateQueries({ queryKey: ['storage-junk'] });
+    },
   });
 }
 

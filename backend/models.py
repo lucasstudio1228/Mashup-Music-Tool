@@ -57,6 +57,10 @@ class Project(SQLModel, table=True):
     # bấm Start Mix tay LẪN chuỗi tự động Suno→Mix→Video dùng đúng 1 con số.
     mix_duration_minutes: float = 120.0
     mix_crossfade_seconds: float = 5.0
+    # Thùng rác: xoá project = chuyển dữ liệu vào Trash/ + đặt deleted_at; sau
+    # 7 ngày mới xoá vĩnh viễn (backend/project_trash.py). NULL = đang dùng.
+    deleted_at: Optional[datetime] = None
+    trash_dir: Optional[str] = None
 
 
 class BatchRun(SQLModel, table=True):

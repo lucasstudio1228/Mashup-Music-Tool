@@ -3,7 +3,7 @@
 Lỗi SAU khi đã nối YouTube Studio thì KHÔNG thử lại (tránh tải trùng)."""
 import unittest
 
-from backend.video import service
+from backend.video import gpm_client, service
 from backend.video.youtube_driver import CDPConnectError
 
 
@@ -71,6 +71,55 @@ class GpmRetryTest(unittest.TestCase):
         r, c, _, _ = self._run(upload)
         self.assertIn("bị ĐÓNG", str(r))
         self.assertEqual((c.starts, c.closes), (1, 1))
+
+
+    def test_kills_leftover_chrome_before_restarting(self):
+        """GPM «mất dấu» Chrome cũ (giữ khoá profile) → dọn rồi mới bật lại."""
+        class _C(_Client):
+            kills = 0
+
+            def kill_leftover_browsers(self, pid):
+                self.kills += 1
+                return 9 if self.kills == 1 else 0
+        c, msgs, seen = _C(), [], []
+
+        def upload(cdp):
+            seen.append(cdp)
+            if len(seen) < 2:
+                raise CDPConnectError("connect ECONNREFUSED")
+            return {"status": "draft"}
+        r = service._upload_with_gpm_retry(c, "p1", upload, lambda m, p: msgs.append(m),
+                                           sleep=lambda s: None)
+        self.assertEqual(r, {"status": "draft"})
+        self.assertEqual(c.kills, 1)                  # chỉ dọn sau lần nối hỏng
+        self.assertTrue(any("9 tiến trình Chrome sót" in m for m in msgs))
+
+
+class LeftoverBrowserTest(unittest.TestCase):
+    def test_rejects_unsafe_profile_ids(self):
+        for bad in ("", "*", "abc", "x' ; Stop-Process -Name chrome ; '"):
+            self.assertEqual(gpm_client.find_profile_browser_pids(bad), [], bad)
+            self.assertEqual(gpm_client.kill_profile_browsers(bad), 0, bad)
+
+    def test_unknown_profile_has_no_processes(self):
+        self.assertEqual(gpm_client.find_profile_browser_pids(
+            "00000000-0000-0000-0000-000000000000"), [])
+
+    def test_kill_after_wait_only_when_still_alive(self):
+        alive = [[11, 12], [11, 12], [11, 12]]
+        orig = (gpm_client.find_profile_browser_pids, gpm_client.kill_profile_browsers,
+                gpm_client.time.sleep)
+        gpm_client.find_profile_browser_pids = lambda pid: alive[0]
+        gpm_client.kill_profile_browsers = lambda pid: len(alive[0])
+        gpm_client.time.sleep = lambda s: None
+        try:
+            c = gpm_client.GPMClient("http://127.0.0.1:1")
+            self.assertEqual(c.kill_leftover_browsers("p", wait_sec=0), 2)
+            alive[0] = []
+            self.assertEqual(c.kill_leftover_browsers("p", wait_sec=0), 0)
+        finally:
+            (gpm_client.find_profile_browser_pids, gpm_client.kill_profile_browsers,
+             gpm_client.time.sleep) = orig
 
 
 if __name__ == "__main__":

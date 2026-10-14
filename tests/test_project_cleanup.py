@@ -18,7 +18,8 @@ from backend.models import (Mix, Project, SunoBatch, SunoCandidate, Track,
                             TrackStem, YoutubeUpload)
 from backend.project_cleanup import (CleanupRoots, ProjectBusyError,
                                      ProjectCleanupError, _validate,
-                                     delete_project_data)
+                                     delete_project_data, deleted_id_floor,
+                                     install_id_guard, sweep_pending)
 
 
 class ProjectCleanupTests(unittest.TestCase):
@@ -44,6 +45,11 @@ class ProjectCleanupTests(unittest.TestCase):
                               return_value=(self.audio, self.stem, self.video))
         manager_patch.start()
         self.addCleanup(manager_patch.stop)
+        for target, value in (("backend.project_cleanup._sleep", lambda _s: None),
+                              ("backend.win_locks.lockers", lambda *_a, **_k: [])):
+            extra = patch(target, value)
+            extra.start()
+            self.addCleanup(extra.stop)
         self.project = Project(id=7, name="New Name")
         self.other = Project(id=17, name="Other")
         self.session.add_all([self.project, self.other])
@@ -116,12 +122,12 @@ class ProjectCleanupTests(unittest.TestCase):
                          "restored")
         self.assert_untouched()
 
-    def test_rename_failure_restores_prior_moves_without_db_deletion(self):
+    def test_rename_failure_other_than_lock_restores_prior_moves(self):
         original_rename = Path.rename
 
         def fail_one(path, destination):
             if path == self.roots.stems / "7":
-                raise PermissionError("file held open")
+                raise OSError("disk detached")
             return original_rename(path, destination)
 
         with patch.object(Path, "rename", fail_one):
@@ -130,7 +136,87 @@ class ProjectCleanupTests(unittest.TestCase):
         self.assertIsNotNone(self.session.get(Project, 7))
         for folder in self.owned:
             self.assertTrue((folder / "asset.dat").exists())
+        for root in self.roots.owned_roots():
+            self.assertFalse((root / ".project-trash").exists())
         self.assert_untouched()
+
+    def test_locked_folder_is_deleted_in_place_instead_of_failing(self):
+        original_rename = Path.rename
+        attempts = []
+
+        def locked(path, destination):
+            if path == self.roots.media / "New Name (#7)":
+                attempts.append(path)
+                raise PermissionError("[WinError 5] Access is denied")
+            return original_rename(path, destination)
+
+        with patch.object(Path, "rename", locked):
+            result = delete_project_data(self.session, self.project, self.roots)
+        self.assertEqual(len(attempts), 3)  # 1 lần + 2 lần thử lại
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["cleanup_pending"], [])
+        self.assertIsNone(self.session.get(Project, 7))
+        for folder in self.owned:
+            self.assertFalse(folder.exists())
+        self.assertGreater(result["freed_bytes"], 0)
+        self.assert_untouched()
+
+    def test_still_locked_file_is_pending_then_swept_later(self):
+        original_rename = Path.rename
+        locked_dir = self.roots.outputs / "7"
+
+        def locked(path, destination):
+            if path == locked_dir:
+                raise PermissionError("[WinError 5] Access is denied")
+            return original_rename(path, destination)
+
+        with patch.object(Path, "rename", locked),                 patch("backend.project_cleanup._purge_tree", lambda _p: None):
+            result = delete_project_data(self.session, self.project, self.roots)
+        self.assertEqual(result["cleanup_pending"], [str(locked_dir)])
+        self.assertTrue((locked_dir / "asset.dat").exists())
+        self.assertTrue(any("bị khoá" in w for w in result["warnings"]))
+        manifest = json.loads(Path(result["cleanup_journal"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["phase"], "cleanup_pending")
+
+        swept = sweep_pending(self.session, self.roots)
+        self.assertEqual(swept["cleared"], [str(locked_dir)])
+        self.assertEqual(swept["remaining"], [])
+        self.assertFalse(locked_dir.exists())
+        manifest = json.loads(Path(result["cleanup_journal"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["phase"], "completed")
+        self.assert_untouched()
+
+    def test_sweep_never_touches_in_place_path_reused_by_live_project(self):
+        journal = self.roots.journals / f"project_17_{'a' * 32}"
+        journal.mkdir(parents=True)
+        (journal / "manifest.json").write_text(json.dumps({
+            "project_id": 17, "phase": "cleanup_pending",
+            "cleanup_pending": [str(self.roots.outputs / "17")]}), encoding="utf-8")
+        swept = sweep_pending(self.session, self.roots)
+        self.assertEqual(swept["remaining"], [str(self.roots.outputs / "17")])
+        self.assert_untouched()
+
+    def test_sweep_removes_only_empty_trash_shells(self):
+        empty = self.roots.outputs / ".project-trash" / f"project_9_{'b' * 32}"
+        full = self.roots.media / ".project-trash" / f"project_9_{'c' * 32}" / "x"
+        empty.mkdir(parents=True)
+        full.mkdir(parents=True)
+        (full / "keep.dat").write_bytes(b"restore me")
+        sweep_pending(self.session, self.roots)
+        self.assertFalse((self.roots.outputs / ".project-trash").exists())
+        self.assertEqual((full / "keep.dat").read_bytes(), b"restore me")
+        self.assert_untouched()
+
+    def test_project_ids_are_never_reused_after_delete(self):
+        install_id_guard(self.engine, self.roots)
+        delete_project_data(self.session, self.other, self.roots)
+        self.assertEqual(deleted_id_floor(self.roots), 17)
+        fresh = Project(name="Fresh")
+        batch = [Project(name="Batch A"), Project(name="Batch B")]
+        self.session.add(fresh)
+        self.session.add_all(batch)
+        self.session.commit()
+        self.assertEqual(sorted([fresh.id, batch[0].id, batch[1].id]), [18, 19, 20])
 
     def test_purge_failure_reports_recoverable_quarantine(self):
         with patch("backend.project_cleanup.shutil.rmtree",

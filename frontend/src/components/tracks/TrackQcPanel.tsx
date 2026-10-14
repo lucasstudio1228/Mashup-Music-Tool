@@ -101,7 +101,7 @@ export default function TrackQcPanel({ projectId }: { projectId: number }) {
   const shown = showAll ? tracks : tracks.filter((t) => t.status !== 'ok');
   const sel = [...selected].filter((id) => byId.get(id)?.is_suno);
   const freeCount = sel.filter((id) => (byId.get(id)?.free_spares ?? 0) > 0).length;
-  const cpc = data?.credits_per_create ?? 10;
+  const cpc = data?.credits_per_create ?? 20;
 
   if (isLoading) return <p className="text-sm text-gray-500">Đang tải báo cáo rà soát…</p>;
 

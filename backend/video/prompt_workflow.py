@@ -191,6 +191,7 @@ def ensure_english_manifest(project_id: int, project_name: str | None,
         save_manifest(path, out)
         if log:
             log("Đã chuyển hồ sơ prompt cũ sang 100% tiếng Anh (bản gốc: prompts.vi.bak.json).")
+    out = _footwear_safe(project_id, project_name, out, log)
     if extend:
         grown = extend_scene_count(project_id, out, api_config=api_config, log=log)
         if grown is not out:
@@ -200,6 +201,41 @@ def ensure_english_manifest(project_id: int, project_name: str | None,
                     f"{len(grown['motions'])}.")
             out = grown
     return out
+
+
+def _footwear_safe(project_id: int, project_name: str | None, saved: dict, log=None) -> dict:
+    """Hồ sơ tả nhân vật CHÂN TRẦN → Gemini chặn ngầm bảng nhân vật (trả «I
+    encountered an error…» mãi). Khi bảng nhân vật (1.png) CHƯA vẽ, đổi sang dép
+    rơm ở prompts + motions + khoá continuity (cùng một phép thay → nhân vật vẫn
+    nhất quán), lưu lại; bản gốc ở prompts.barefoot.bak.json. Đã có 1.png thì giữ
+    nguyên (danh tính đã chốt bằng ảnh)."""
+    from .footwear_safety import sanitize_manifest
+    img_dir = config.images_dir(project_id, project_name)
+    if (img_dir / f"{config.IMG_MAIN_SHEET}.png").exists():
+        return saved
+    fixed = sanitize_manifest(saved)
+    if fixed is saved:
+        return saved
+    try:
+        fixed["prompt_hashes"] = validate_manifest(
+            project_id, fixed, len(fixed.get("prompts") or {}) or None,
+            len(fixed.get("motions") or {}) or None)
+    except ValueError as exc:
+        if log:
+            log(f"Không tự đổi được mô tả chân trần ({exc}) — giữ nguyên hồ sơ.")
+        return saved
+    path = img_dir / "prompts.json"
+    backup = path.with_name("prompts.barefoot.bak.json")
+    if not backup.exists():
+        try:
+            backup.write_text(json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+    save_manifest(path, fixed)
+    if log:
+        log("Hồ sơ tả nhân vật chân trần (Gemini chặn ngầm ảnh bàn chân) → đã đổi sang "
+            "dép rơm ở mọi prompt ảnh/cảnh (bản gốc: prompts.barefoot.bak.json).")
+    return fixed
 
 
 _SIGNATURE_KEYS = ("context", "style", "count", "scene_count", "style_version", "workflow_version")

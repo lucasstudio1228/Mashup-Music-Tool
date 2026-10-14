@@ -1,7 +1,8 @@
 """
 video/gemini_driver.py — Tự động hoá Gemini web (gemini.google.com) để tạo ảnh.
 
-Chọn model 3.1 Pro (2 bước: '3.1 Pro' rồi 'Tư duy mở rộng'), sinh N ảnh:
+Chọn model 3.1 Pro (2 bước: '3.1 Pro' rồi mức suy luận 'Cao' — trước
+2026-10-13 là 'Tư duy mở rộng'), sinh N ảnh:
   0 = ảnh nền thumbnail (KHÔNG chữ); 1..N-1 = các shot liên kết,
   đồng bộ nhân vật, bối cảnh và diễn tiến ánh sáng.
 Lưu vào media/<project>/images/{i}.png.
@@ -20,7 +21,7 @@ from typing import Callable, Optional
 
 from . import config
 from .browser_base import (
-    BrowserSession, fill_first, click_first, wait_for_manual_login,
+    BrowserSession, click_first, query_first, wait_for_manual_login,
 )
 
 MIN_IMAGE_DIM = 400
@@ -178,17 +179,43 @@ def _prompt_for(index: int, topic: str, params: config.VideoParams,
     return wrapped
 
 
+_OPEN_MENU = ["[role='menu']", "[role='listbox']", ".cdk-overlay-backdrop-showing"]
+
+
+def _close_menus(page, tries: int = 3) -> bool:
+    """Đóng menu/overlay còn mở (Escape). Trả True nếu không còn menu nào.
+
+    Menu chế độ còn mở CHE ô nhập prompt → click ô nhập chờ 30s rồi lỗi, trước
+    đây bị nuốt thành «không tìm thấy ô nhập prompt» (project 35, 2026-10-13)."""
+    for _ in range(tries):
+        if not _visible(page, _OPEN_MENU):
+            return True
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        page.wait_for_timeout(400)
+    return not _visible(page, _OPEN_MENU)
+
+
+def _pick_menu_option(page, sels, key: str) -> bool:
+    """Mở menu chế độ → bấm mục `key`. Không thấy mục → Escape (KHÔNG để menu
+    mở che ô nhập)."""
+    if not click_first(page, sels["model_selector"], timeout_ms=6000):
+        return False
+    page.wait_for_timeout(600)
+    ok = click_first(page, sels[key], timeout_ms=6000)
+    page.wait_for_timeout(800)
+    _close_menus(page)
+    return ok
+
+
 def _select_model(page, sels) -> bool:
-    """2 bước: (1) '3.1 Pro'; (2) bật 'Tư duy mở rộng'; rồi bật công cụ «Tạo
-    hình ảnh». Best-effort; trả True nếu công cụ vẽ đã bật."""
-    if click_first(page, sels["model_selector"], timeout_ms=6000):
-        page.wait_for_timeout(600)
-        click_first(page, sels["model_option_pro"], timeout_ms=6000)
-        page.wait_for_timeout(800)
-    if click_first(page, sels["model_selector"], timeout_ms=6000):
-        page.wait_for_timeout(600)
-        click_first(page, sels["model_option_thinking"], timeout_ms=6000)
-        page.wait_for_timeout(800)
+    """2 bước: (1) '3.1 Pro'; (2) mức suy luận 'Cao' (từ 2026-10-13 thay cho
+    'Tư duy mở rộng'); rồi bật công cụ «Tạo hình ảnh». Best-effort; trả True
+    nếu công cụ vẽ đã bật."""
+    _pick_menu_option(page, sels, "model_option_pro")
+    _pick_menu_option(page, sels, "model_option_thinking")
     return _enable_image_tool(page, sels)
 
 
@@ -233,6 +260,38 @@ def _enable_image_tool(page, sels, ratio: str = "") -> bool:
             page.keyboard.press("Escape")
         page.wait_for_timeout(400)
     return ok
+
+
+def _fill_prompt(page, sels, text: str) -> str:
+    """Điền prompt vào ô soạn. Trả "" nếu được, ngược lại LÝ DO THẬT (không nuốt
+    lỗi như browser_base.fill_first): ô bị menu/hộp thoại che, hay thật sự
+    không thấy ô."""
+    reason = "không tìm thấy ô nhập prompt"
+    for round_ in range(2):
+        _close_menus(page)
+        loc = query_first(page, sels["prompt_box"], timeout_ms=8000)
+        if loc is None:
+            reason = "không tìm thấy ô nhập prompt"
+        else:
+            try:
+                loc.click(timeout=8000)
+                try:
+                    loc.fill(text, timeout=15000)
+                except Exception:
+                    page.keyboard.insert_text(text)
+                return ""
+            except Exception as e:
+                covered = _visible(page, _OPEN_MENU + ["[role='dialog']"])
+                first = (str(e).splitlines() or [""])[0][:120]
+                reason = ("ô nhập prompt bị menu/hộp thoại che" if covered
+                          else f"không bấm/điền được ô nhập prompt ({type(e).__name__}: {first})")
+        if round_ == 0:
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            page.wait_for_timeout(800)
+    return reason
 
 
 def _start_new_chat(page) -> None:
@@ -637,6 +696,7 @@ def generate_images(
 
                 last_err = ""
                 saved_ok = False
+                text_only_hits = 0
                 dest = out_dir / f"{i}.png"
                 for attempt in range(1, _IMAGE_ATTEMPTS + 1):
                     tag = f"(lần {attempt}/{_IMAGE_ATTEMPTS})"
@@ -667,8 +727,9 @@ def generate_images(
                             pass
 
                     _p(f"[{k+1}/{len(todo)}] Gửi prompt ảnh {i} {tag}...", pct)
-                    if not fill_first(page, sels["prompt_box"], IMAGE_DIRECTIVE + prompt):
-                        last_err = "không tìm thấy ô nhập prompt"
+                    fill_err = _fill_prompt(page, sels, IMAGE_DIRECTIVE + prompt)
+                    if fill_err:
+                        last_err = fill_err
                         continue
                     page.wait_for_timeout(400)
                     if not click_first(page, sels["send_button"], timeout_ms=4000):
@@ -694,6 +755,7 @@ def generate_images(
                         waited = int(time.time() - t_wait)
                         reply = " ".join((winfo.get("reply") or "").split())[:220]
                         if winfo.get("text_only"):
+                            text_only_hits += 1
                             last_err = (f"Gemini trả lời bằng CHỮ, không có ảnh sau {waited}s"
                                         f" — «{reply}»" if reply else
                                         f"Gemini trả lời xong nhưng không có ảnh ({waited}s)")
@@ -730,7 +792,12 @@ def generate_images(
                         f"'Tạo tiếp ảnh thiếu' (resume) để làm nốt phần còn lại mà "
                         f"KHÔNG mất ảnh đã có."
                         + (f" CHẨN ĐOÁN → {_diagnostic(page)}"
-                           if last_err.startswith("không tải được") else ""))
+                           if last_err.startswith("không tải được") else "")
+                        + (" GỢI Ý: cả " f"{_IMAGE_ATTEMPTS}" " lần Gemini chỉ trả lời "
+                           "chữ chung chung với CÙNG một prompt → nhiều khả năng bộ "
+                           "lọc an toàn của Gemini chặn ngầm nội dung prompt (vd cận "
+                           "cảnh chân trần/cơ thể). Sửa mô tả nhân vật trong prompt "
+                           "rồi bấm lại." if text_only_hits >= _IMAGE_ATTEMPTS else ""))
 
     # Trình duyệt có thể tự đóng giữa chừng (đã gặp thật, cả khi đang rảnh).
     # Ảnh lưu NGAY từng cái, nên chỉ cần mở phiên mới và làm nốt phần còn thiếu.

@@ -27,7 +27,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
+import subprocess
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -37,6 +40,50 @@ from typing import Optional
 
 class GPMError(RuntimeError):
     """Lỗi khi gọi GPMLogin Local API (kèm hướng dẫn khắc phục cho user)."""
+
+
+# ── Tiến trình Chrome SÓT của 1 profile ─────────────────────────
+# 2026-10-06: GPMLogin có lúc «mất dấu» trình duyệt của profile (báo ProfileInUse,
+# stop trả OK nhưng chrome.exe vẫn sống, giữ khoá thư mục profile — log GPM:
+# «Delete failed … IO_SharingViolation»). Mọi lần bật sau đó Chrome mới chỉ chuyển
+# lệnh cho bản cũ rồi thoát → cổng debug không bao giờ mở (GPM: «Stuck at:
+# Starting», tool: «connect ECONNREFUSED»). Chỉ nhắm chrome.exe có UUID profile
+# trong dòng lệnh (--user-data-dir=…\<uuid>) → không đụng Chrome thường/profile khác.
+_PROFILE_ID_RE = re.compile(r"^[0-9A-Za-z-]{8,64}$")
+
+
+def _ps(script: str, timeout: float = 30.0) -> str:
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                       capture_output=True, text=True, timeout=timeout,
+                       creationflags=flags)
+    return r.stdout or ""
+
+
+def find_profile_browser_pids(profile_id: str) -> list[int]:
+    """PID các chrome.exe đang chạy với thư mục dữ liệu của profile này."""
+    if sys.platform != "win32" or not _PROFILE_ID_RE.match(profile_id or ""):
+        return []
+    try:
+        out = _ps("Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | "
+                  f"Where-Object {{ $_.CommandLine -like '*{profile_id}*' }} | "
+                  "ForEach-Object { $_.ProcessId }")
+    except Exception:
+        return []
+    return [int(x) for x in out.split() if x.strip().isdigit()]
+
+
+def kill_profile_browsers(profile_id: str) -> int:
+    """Tắt cưỡng bức các chrome.exe sót của profile. Trả số PID đã tắt."""
+    pids = find_profile_browser_pids(profile_id)
+    if not pids:
+        return 0
+    try:
+        _ps("Stop-Process -Force -ErrorAction SilentlyContinue -Id "
+            + ",".join(str(p) for p in pids))
+    except Exception:
+        return 0
+    return len(pids)
 
 
 # ── Đọc cấu hình GPMLogin trên máy (best-effort) ────────────────
@@ -222,6 +269,7 @@ class GPMClient:
             # GPMLogin giải phóng profile CHẬM sau khi stop (quan sát: >6 giây) —
             # đóng rồi thử lại nhiều lần trong ~60 giây thay vì bỏ cuộc ngay.
             self.close_profile(profile_id)
+            self.kill_leftover_browsers(profile_id)
             data = None
             for _ in range(6):
                 time.sleep(10)
@@ -272,6 +320,18 @@ class GPMClient:
         except GPMError:
             # Đóng thất bại không nên làm hỏng cả job — chỉ bỏ qua.
             pass
+
+    def kill_leftover_browsers(self, profile_id: str, wait_sec: float = 10.0) -> int:
+        """Gọi SAU close_profile: chờ GPM tự tắt trình duyệt (bình thường <2 giây);
+        còn chrome.exe của profile sau wait_sec → tắt cưỡng bức. Trả số đã tắt."""
+        deadline = time.time() + wait_sec
+        while find_profile_browser_pids(profile_id):
+            if time.time() >= deadline:
+                n = kill_profile_browsers(profile_id)
+                time.sleep(2.0)
+                return n
+            time.sleep(1.0)
+        return 0
 
     # ── Mở app nếu chưa chạy (tùy chọn) ─────────────────────────
     def ensure_app_running(self, exe_path: str | None = None,

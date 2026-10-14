@@ -50,10 +50,16 @@ class ProjectCreate(BaseModel):
     music_style: str = ""
 
 
+class ProjectBulkDelete(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=500)
+    # False (mặc định) = chuyển vào Thùng rác 7 ngày; True = xoá vĩnh viễn ngay.
+    permanent: bool = False
+
+
 class ProjectRename(BaseModel):
     name: str
     # none = chỉ đổi tên · text = vẽ lại chữ thumbnail + ghép lại video ·
-    # regen = tạo lại ảnh bìa Gemini + clip 00 Flow rồi như text
+    # regen = tạo lại ảnh bìa (Muse.ai, dự phòng Gemini) + clip 00 rồi như text
     refresh: Optional[str] = "none"
 
 

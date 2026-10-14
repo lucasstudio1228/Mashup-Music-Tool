@@ -313,6 +313,29 @@ def migrate_add_project_mix_settings():
         conn.close()
 
 
+def migrate_add_project_trash_columns():
+    """
+    M011: thêm project.deleted_at + trash_dir (Thùng rác 7 ngày trước khi xoá
+    vĩnh viễn).
+    """
+    if not DB_PATH.exists():
+        return
+    conn = _get_conn()
+    try:
+        if not _table_exists(conn, "project"):
+            return
+        for col, ddl in (("deleted_at", "DATETIME"), ("trash_dir", "VARCHAR")):
+            if not _column_exists(conn, "project", col):
+                print(f"  [Migration M011] Adding project column: {col}")
+                conn.execute(f"ALTER TABLE project ADD COLUMN {col} {ddl}")
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise RuntimeError(f"Migration M011 failed: {e}") from e
+    finally:
+        conn.close()
+
+
 def run_all():
     """Gọi hàm này ở startup, trước create_db_and_tables()."""
     migrate_remove_project_api_fields()   # M001
@@ -324,5 +347,6 @@ def run_all():
     migrate_add_suno_columns()             # M007
     migrate_add_suno_idea_column()         # M008
     migrate_add_project_batch_id()         # M009
-    migrate_add_project_mix_settings()     # M010 — mới
+    migrate_add_project_mix_settings()     # M010
+    migrate_add_project_trash_columns()    # M011 — Thùng rác
     # Thêm migration mới vào đây theo thứ tự

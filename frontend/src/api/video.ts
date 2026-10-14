@@ -100,6 +100,23 @@ export function useResumeVideo(projectId: number) {
 }
 
 export const useUploadYoutube = (pid: number) => useVideoAction(pid, "upload-youtube");
+export const useUploadShort = (pid: number) => useVideoAction(pid, "upload-short");
+
+export type ShortSettings = { auto_short: boolean; seconds: number; crop_x: number; hook: boolean };
+export function useShortSettings(projectId: number) {
+  return useQuery<ShortSettings>({
+    queryKey: ["short-settings"],
+    queryFn: async () => (await api.get(`${base(projectId)}/short-settings`)).data,
+  });
+}
+export function useSaveShortSettings(projectId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { auto_short?: boolean; short_seconds?: number }) =>
+      api.post(`${base(projectId)}/short-settings`, body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["short-settings"] }),
+  });
+}
 
 // Mở cửa sổ Flow/Gemini bằng profile của tool (theo dõi/đăng nhập/kiểm tra).
 export function useOpenVideoBrowser(projectId: number) {
@@ -116,6 +133,7 @@ export type YoutubeHistoryItem = {
   id: number;
   channel_name: string;
   title: string;
+  kind?: "long" | "short";
   hashtags: string;
   status: string;
   error_message: string | null;

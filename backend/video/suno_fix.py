@@ -33,12 +33,15 @@ from sqlmodel import Session, select
 
 from backend.database import engine
 from backend.models import Project, SunoBatch, SunoCandidate, Track
+from backend.storage_maintenance import link_or_copy
 from backend.video import config as vconfig
 from backend.video import suno_verify, track_qc
-from backend.video.suno_driver import SunoBudgetError, SunoError, SunoUIChanged
+from backend.video.suno_driver import (SunoBudgetError, SunoDownloadLimit, SunoError,
+                                       SunoUIChanged)
 
 DEFAULT_MAX_CREATES_PER_TRACK = 2
-CREDITS_PER_CREATE = 10          # đo thật: 10 Create = 9550 → 9450
+# Đo thật 10/Create (9550 → 9450 cho 10 lượt); Max Mode LUÔN bật → ×2 (tooltip Suno).
+CREDITS_PER_CREATE = vconfig.SUNO.credits_per_create
 
 
 class FixError(SunoError):
@@ -121,8 +124,11 @@ def _replace_tracks(project_id: int, progress_cb: Callable, *,
         _SunoBrowser, _configure_create_form, _record_candidate, _is_browser_closed,
         _wait_newest_song_age, _plan_index, _file_logger, _acquire_lock,
         _release_lock, _touch, _sync_counters, _duration_off,
-        _ASSUMED_SONGS_PER_REQUEST,
+        _ASSUMED_SONGS_PER_REQUEST, upgrade_plan_v2, _make_instrument_qc,
+        _create_and_wait,
+        _pace_create,
     )
+    from backend.video.instrument_qc import badness
 
     last = [0.0]
 
@@ -158,11 +164,20 @@ def _replace_tracks(project_id: int, progress_cb: Callable, *,
 
         batch = s.get(SunoBatch, s.get(SunoCandidate, jobs[0][1]).batch_id)
         cfg = json.loads(batch.config_json or "{}")
-        plan = cfg.get("prompt_plan") or []
         staging = Path(batch.staging_dir) if batch.staging_dir else \
             (vconfig.SUNO_STAGING_ROOT / f"project_{project_id}")
         staging.mkdir(parents=True, exist_ok=True)
         log = _file_logger(staging / "_suno.log", lambda m: report(m))
+        proj = s.get(Project, project_id)
+        if proj is not None and upgrade_plan_v2(cfg, proj.instrument or "",
+                                                proj.music_style or ""):
+            batch.config_json = json.dumps(cfg, ensure_ascii=False)
+            s.add(batch); s.commit()
+            log("Nâng prompt Suno đã lưu (form v1) lên form v2 trước khi tạo lại "
+                "— nhạc cụ chính đứng đầu, nền chỉ âm thanh thiên nhiên.")
+        plan = cfg.get("prompt_plan") or []
+        # Chấm "đúng nhạc cụ chính" (PANNs, 0 credit) để chọn bài thay thế sạch hơn.
+        iqc = _make_instrument_qc(s, batch, cfg, log)
         minimum = float(cfg.get("minimum_duration_seconds", 120))
         lo = float(cfg.get("preferred_duration_seconds_min") or 180)
         hi = float(cfg.get("preferred_duration_seconds_max") or 300)
@@ -177,7 +192,7 @@ def _replace_tracks(project_id: int, progress_cb: Callable, *,
         _acquire_lock(s, batch)
         replaced, failed = [], []
         try:
-            with _SunoBrowser(dry_run, log) as sb:
+            with _SunoBrowser(dry_run, log, debug_dir=staging / "_debug") as sb:
                 driver = None
                 stats = {"dl_ok": 0, "ui_fail": 0}
 
@@ -205,6 +220,11 @@ def _replace_tracks(project_id: int, progress_cb: Callable, *,
                             except Exception as e:      # noqa: BLE001
                                 if type(e).__name__ == "JobCancelled":
                                     raise
+                                if isinstance(e, SunoDownloadLimit):
+                                    # Lỗi tài khoản, không phải của bài → dừng job.
+                                    c.download_status = "pending"
+                                    s.add(c); s.commit()
+                                    raise FixError(str(e)) from e
                                 if _is_browser_closed(e) and attempt == 0:
                                     log("Trình duyệt Suno đóng/sập — mở lại rồi tải lại.")
                                     driver = sb.reopen()
@@ -248,16 +268,32 @@ def _replace_tracks(project_id: int, progress_cb: Callable, *,
                             + "; ".join(i["message"] for i in issues
                                         if i["level"] == "error"))
                         return None
+                    q = iqc(c) if iqc else None
+                    if q is not None:      # iqc ghi clean/leaky; bài vẫn ĐẠT rà soát
+                        c.content_qc_status = "passed"
+                        s.add(c); s.commit()
                     return {"cand": c, "duration": m["duration"],
+                            "clean": q["clean"] if q else None,
+                            "bad": badness(q) if q else 0.0,
                             "warnings": [i["message"] for i in issues]}
 
                 def better(a: dict, b: Optional[dict], old_dur: float) -> dict:
-                    """Ưu tiên trong 3–5 phút, rồi gần độ dài bài cũ (ít lệch mix)."""
+                    """Ưu tiên đúng nhạc cụ chính (chấm PANNs), rồi trong 3–5
+                    phút, rồi ít lẫn hơn, rồi gần độ dài bài cũ (ít lệch mix)."""
                     if b is None:
                         return a
-                    ka = (_duration_off(a["duration"], lo, hi), abs(a["duration"] - old_dur))
-                    kb = (_duration_off(b["duration"], lo, hi), abs(b["duration"] - old_dur))
-                    return a if ka <= kb else b
+
+                    def key(x: dict) -> tuple:
+                        leaky = x.get("clean") is False
+                        return (leaky, _duration_off(x["duration"], lo, hi),
+                                round(x.get("bad", 0.0), 2) if leaky else 0.0,
+                                abs(x["duration"] - old_dur))
+                    return a if key(a) <= key(b) else b
+
+                def good(x: Optional[dict]) -> bool:
+                    """Đủ tốt để dừng tìm: trong 3–5 phút và không lẫn nhạc cụ."""
+                    return bool(x) and x.get("clean") is not False \
+                        and _duration_off(x["duration"], lo, hi) == 0
 
                 n = len(jobs)
                 for k, (tid, cid) in enumerate(jobs):
@@ -278,7 +314,7 @@ def _replace_tracks(project_id: int, progress_cb: Callable, *,
                         got = fetch(sp)
                         if got:
                             chosen, source = better(got, chosen, old_dur), "spare"
-                            if _duration_off(chosen["duration"], lo, hi) == 0:
+                            if good(chosen):
                                 break
 
                     # 2) Create lại bằng đúng prompt của bài này.
@@ -309,15 +345,15 @@ def _replace_tracks(project_id: int, progress_cb: Callable, *,
                                f"{CREDITS_PER_CREATE} credit)…", base + 10)
                         d.open_create_page()
                         _configure_create_form(d, cfg, dry_run=False)
+                        _pace_create(report)
                         before = d.snapshot_song_ids()
                         d.fill_styles(plan[idx]["styles"])
                         d.fill_exclusions(plan[idx]["exclusions"])
                         batch.create_actions_used += 1
                         req = f"fix{batch.create_actions_used}:p{idx + 1}"
                         _touch(s, batch, message=f"Tạo lại Suno cho {old_t.filename} ({req})…")
-                        d.click_create()
-                        new = d.wait_for_new_songs(
-                            before, expected=_ASSUMED_SONGS_PER_REQUEST, timeout_sec=300)
+                        new = _create_and_wait(s, batch, d, before, credits,
+                                               _ASSUMED_SONGS_PER_REQUEST, report, log)
                         if not new:
                             log(f"{req}: chưa thấy bài mới sau 300s.")
                             continue
@@ -329,11 +365,9 @@ def _replace_tracks(project_id: int, progress_cb: Callable, *,
                         report(f"{label}: chờ Suno render xong ({req})…", base + 15)
                         _wait_newest_song_age(s, batch, cfg, log)
                         first = fetch(cands[0])
-                        # Chỉ lấy 1/2. Tải bản thứ 2 khi bản đầu lỗi, hoặc để so
-                        # độ dài khi bản đầu nằm ngoài 3–5 phút.
-                        if len(cands) > 1 and (
-                                first is None
-                                or _duration_off(first["duration"], lo, hi) > 0):
+                        # Chỉ lấy 1/2. Tải bản thứ 2 khi bản đầu lỗi, lẫn nhạc
+                        # cụ khác, hoặc nằm ngoài 3–5 phút (để so).
+                        if len(cands) > 1 and not good(first):
                             second = fetch(cands[1])
                             first = better(second, first, old_dur) if second else first
                         if first:
@@ -363,6 +397,8 @@ def _replace_tracks(project_id: int, progress_cb: Callable, *,
                            f"{'0 credit' if source == 'spare' else f'{creates} lượt Create'}).",
                            base + 90 / n)
         finally:
+            if iqc is not None:
+                iqc.release()
             _sync_counters(s, batch)
             if orig_phase and batch.phase != orig_phase:
                 _touch(s, batch, orig_phase,
@@ -392,7 +428,7 @@ def _swap_track(s: Session, project_id: int, pname: Optional[str],
     dest_dir.mkdir(parents=True, exist_ok=True)
     final = dest_dir / Path(new_c.wav_path).name
     if not final.exists():
-        shutil.copy2(new_c.wav_path, final)
+        link_or_copy(new_c.wav_path, final)   # hardlink, không nhân đôi WAV
     core_track = core_bridge.probe_file(str(final))
     if core_track is None:
         raise FixError(f"Không đọc được WAV khi import: {final.name}")

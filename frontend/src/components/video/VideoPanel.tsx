@@ -4,7 +4,8 @@ import {
   useRegenImage, useRegenClip, useRegenMotions, useVideoStyles,
   useThumbnailFonts, useSetThumbnailFont, thumbnailFontPreviewUrl, useSetClipEngine,
   usePreparePrompts, usePromptManifest,
-  useUploadYoutube, useYoutubeHistory, useOpenVideoBrowser, useCloseVideoBrowser,
+  useUploadYoutube, useUploadShort, useShortSettings, useSaveShortSettings,
+  useYoutubeHistory, useOpenVideoBrowser, useCloseVideoBrowser,
   videoDownloadUrl, videoThumbnailUrl, videoImageUrl, videoClipUrl,
 } from "../../api/video";
 import { useProject, useUpdateProject } from "../../api/projects";
@@ -62,6 +63,9 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
   const regenClip    = useRegenClip(projectId);
   const regenMotions = useRegenMotions(projectId);
   const uploadYoutube = useUploadYoutube(projectId);
+  const uploadShort = useUploadShort(projectId);
+  const { data: shortCfg } = useShortSettings(projectId);
+  const saveShortCfg = useSaveShortSettings(projectId);
   const { data: ytHistory, refetch: refetchYtHistory } = useYoutubeHistory(projectId);
   const openBrowser  = useOpenVideoBrowser(projectId);
   const closeBrowser = useCloseVideoBrowser(projectId);
@@ -122,6 +126,8 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
     rebuild: "Đang tạo lại video từ ảnh",
     motions: "Đang sinh lại prompt cảnh (clip)",
     upload: "Đang đăng nháp lên YouTube",
+    upload_short: "Đang tạo & đăng nháp YouTube Short",
+    continue: "Đang chạy tiếp chu trình (phần thiếu → ghép → nháp YouTube → Short)",
     "browser-flow": "Cửa sổ Flow đang mở",
     "browser-gemini": "Cửa sổ Gemini đang mở",
     "clips-manual": "Chế độ thủ công — chờ bạn tạo clip trên Flow",
@@ -245,7 +251,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
 
         <Section title="Theo dõi trình duyệt (Flow / Gemini)">
           <p className="mb-3 text-xs text-gray-400">
-            Mở đúng cửa sổ + profile tool dùng để tạo clip (Flow) / ảnh (Gemini) — xem tài khoản,
+            Mở đúng cửa sổ + profile tool dùng cho Flow / Gemini (Gemini = máy ảnh dự phòng) — xem tài khoản,
             tự đăng nhập hoặc kiểm tra cảnh báo. Tool không tự nhập mật khẩu.
           </p>
           {browserOpen ? (
@@ -359,7 +365,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
             })}
           </div>
           <p className="mt-2 text-xs text-gray-500">
-            Cuộn để chọn phong cách. Lựa chọn này ép thẳng vào prompt tạo <b>ảnh</b> (Gemini)
+            Cuộn để chọn phong cách. Lựa chọn này ép thẳng vào prompt tạo <b>ảnh</b> ({p.image_engine_label ?? "Muse.ai"})
             và <b>video</b> ({p.clip_engine_label ?? "Flow/Veo"}). Đổi phong cách rồi bấm <b>Tạo lại từ đầu</b> để áp dụng
             cho toàn bộ.
           </p>
@@ -506,19 +512,20 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
         <Section title="Chạy từng bước">
           <p className="mb-3 text-xs text-gray-500">
             Dùng khi muốn kiểm soát từng phần hoặc tạo tiếp phần còn dở.
-            <b> Tạo tiếp</b> = giữ cái đã có, chỉ làm phần còn thiếu.
+            <b> Tạo tiếp</b> = giữ cái đã có, làm phần còn thiếu rồi <b>chạy tiếp cả chu trình</b>
+            (ảnh → clip → ghép video → đăng nháp YouTube → đăng nháp Short; bước nào xong rồi thì bỏ qua).
             <b> Làm lại</b> = xoá hết phần đó rồi tạo mới.
           </p>
           <div className="space-y-4">
             {/* Bước 1 — Ảnh */}
             <div>
               <div className="mb-1.5 text-xs font-semibold text-gray-300">
-                ① Ảnh — {st.image_count}/{p.image_count} (0 bìa không chữ · 1 bảng nhân vật chính · 2 bảng linh thú)
+                ① Ảnh — {st.image_count}/{p.image_count} ({p.image_engine_label ?? "Muse.ai"}{p.image_fallback_label ? `, dự phòng ${p.image_fallback_label}` : ""} · 0 bìa không chữ · 1 bảng nhân vật chính · 2 bảng linh thú)
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <button className={`${ghost} w-full`} disabled={busy}
                         onClick={() => genImages.mutate({ mode: "resume" })}>
-                  Tạo tiếp ảnh thiếu
+                  ⏩ Tạo tiếp ảnh thiếu → … → Short
                 </button>
                 <button className={`${warn} w-full`} disabled={busy}
                         onClick={() => {
@@ -540,7 +547,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
                   <span>Máy tạo clip:</span>
                   <select className="rounded border border-gray-600 bg-gray-800 px-2 py-1 text-xs text-gray-200"
                           value={p.clip_engine ?? "muse"} disabled={busy || setEngine.isPending}
-                          title="Áp dụng cho mọi project. Bảng nhân vật + phân tích nhân vật vẫn do Gemini làm."
+                          title="Áp dụng cho mọi project. Ảnh (bìa + bảng nhân vật) do máy tạo ảnh riêng làm — mặc định Muse.ai, dự phòng Gemini."
                           onChange={(e) => setEngine.mutate(e.target.value, {
                             onError: (err: any) => alert(err?.response?.data?.detail ?? String(err)),
                           })}>
@@ -556,7 +563,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
               <div className="grid grid-cols-2 gap-2">
                 <button className={`${ghost} w-full`} disabled={busy || !imagesDone}
                         onClick={() => genClips.mutate({ mode: "resume" })}>
-                  Tạo tiếp clip thiếu
+                  ⏩ Tạo tiếp clip thiếu → … → Short
                 </button>
                 <button className={`${warn} w-full`} disabled={busy || !imagesDone}
                         onClick={() => {
@@ -664,6 +671,19 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
           >
             📤 Đăng nháp lên YouTube
           </button>
+          <button
+            className={`${ghost} mt-2 w-full`}
+            disabled={busy || !st.final_exists || !ytFieldsSet || ytFieldsDirty}
+            onClick={() => {
+              if (confirm(
+                "Cắt 1 đoạn DỌC 9:16 ở GIỮA video → YouTube Short, AI viết tiêu đề/hook/mô tả ngắn, " +
+                "rồi đăng NHÁP lên cùng kênh (không publish)?")) {
+                uploadShort.mutate(undefined);
+              }
+            }}
+          >
+            🎬 Tạo &amp; đăng nháp YouTube Short
+          </button>
           {!st.final_exists && (
             <p className="mt-1 text-xs text-yellow-300">
               ⚠️ Chưa có final.mp4 — hãy render video trước.
@@ -698,6 +718,25 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
             </span>
           </label>
 
+          <label className="mt-2 flex cursor-pointer items-start gap-2 rounded-lg border border-white/5 bg-background px-3 py-2">
+            <input
+              type="checkbox"
+              className="mt-0.5 h-4 w-4 accent-accent"
+              checked={shortCfg?.auto_short ?? true}
+              disabled={!shortCfg || saveShortCfg.isPending}
+              onChange={(e) => saveShortCfg.mutate({ auto_short: e.target.checked })}
+            />
+            <span className="text-xs text-gray-300">
+              <b>Tự động tạo Short sau khi đăng nháp video dài xong</b>
+              <br />
+              <span className="text-gray-500">
+                Cắt {Math.round(shortCfg?.seconds ?? 45)}s dọc 9:16 ở giữa video (gọn trong 1 bài),
+                chữ hook trên đầu, AI viết nội dung ngắn — lưu <b>NHÁP</b> cùng kênh
+                (áp dụng cho mọi project).
+              </span>
+            </span>
+          </label>
+
           {ytHistory && ytHistory.length > 0 && (
             <div className="mt-4">
               <div className="mb-1.5 text-xs font-semibold text-gray-300">
@@ -711,6 +750,11 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
                   >
                     <div className="flex items-center justify-between gap-2">
                       <span className="truncate text-xs font-semibold text-gray-200">
+                        {h.kind === "short" && (
+                          <span className="mr-1.5 rounded bg-fuchsia-950/50 px-1 py-0.5 text-[10px] text-fuchsia-300">
+                            SHORT
+                          </span>
+                        )}
                         {h.title || "(chưa có title)"}
                       </span>
                       <span

@@ -53,7 +53,7 @@ class StartBody(BaseModel):
 
 def _project_or_404(db: Session, project_id: int) -> Project:
     p = db.get(Project, project_id)
-    if not p:
+    if not p or getattr(p, "deleted_at", None):
         raise HTTPException(404, f"Project {project_id} không tồn tại")
     return p
 

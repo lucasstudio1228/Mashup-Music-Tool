@@ -172,7 +172,7 @@ class FakeDriver:
     def close_extra_tabs(self): pass
     def click_create(self): self.clicks += 1
 
-    def wait_for_new_songs(self, before, expected=2, timeout_sec=300):
+    def wait_for_new_songs(self, before, expected=2, timeout_sec=300, **kw):
         out = []
         for _ in range(2):
             self.n += 1
@@ -186,7 +186,7 @@ class FakeDriver:
 class FakeBrowser:
     driver = None
 
-    def __init__(self, dry_run, log): pass
+    def __init__(self, dry_run, log, **kw): pass
     def open(self): return FakeBrowser.driver
     def __enter__(self): return self
     def __exit__(self, *a): pass
@@ -294,6 +294,25 @@ class ReplaceTests(unittest.TestCase):
             new_c = s.exec(select(SunoCandidate).where(
                 SunoCandidate.track_id == r["new_track_id"])).one()
             self.assertTrue(new_c.request_id.startswith("fix6:p1"))
+
+    def test_create_prefers_clean_instrument_take(self):
+        """Bản 1 của lượt Create lẫn nhạc cụ khác → tải bản 2 (0 credit) và giữ
+        bản đúng nhạc cụ chính."""
+        noisy = lambda: tone(seed=7) + 0.08 * np.random.default_rng(5).standard_normal(  # noqa: E731
+            125 * SR).astype(np.float32)
+
+        def fake_qc(c):
+            return {"clean": c.song_id == "new-2", "leak_score": 0.5,
+                    "vocal_share": 0.0}
+        fake_qc.release = lambda: None
+        with patch.object(ss, "_make_instrument_qc", lambda *a, **k: fake_qc):
+            res, drv = self.run_fix({"spare-0": noisy,     # 2 bản khác nhau (khác hash)
+                                     "new-1": lambda: tone(seed=21),
+                                     "new-2": lambda: tone(seed=22)})
+        r = res["replaced"][0]
+        self.assertEqual((r["source"], r["creates"], r["new_song_id"]),
+                         ("create", 1, "new-2"))
+        self.assertEqual(drv.clicks, 1)
 
     def test_gives_up_after_cap(self):
         noisy = lambda: tone(seed=7) + 0.08 * np.random.default_rng(5).standard_normal(  # noqa: E731

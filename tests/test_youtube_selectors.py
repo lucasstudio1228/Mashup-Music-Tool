@@ -102,5 +102,27 @@ class EnsureRadioTests(unittest.TestCase):
             yd._bb.click_first = orig
 
 
+class NoDetailsMessageTest(unittest.TestCase):
+    """Kênh chưa bật Intermediate features → báo rõ cách sửa + chữ YouTube hiện."""
+    def test_message_points_to_feature_eligibility(self):
+        from backend.video import youtube_driver as yd
+
+        class _P:
+            def evaluate(self, js):
+                return "Upload videos -- Video is too long"
+        m = yd._no_details_message(_P())
+        self.assertIn("Feature eligibility", m)
+        self.assertIn("15 phút", m)
+        self.assertIn("Video is too long", m)
+
+    def test_message_survives_page_errors(self):
+        from backend.video import youtube_driver as yd
+
+        class _P:
+            def evaluate(self, js):
+                raise RuntimeError("closed")
+        self.assertIn("Intermediate features", yd._no_details_message(_P()))
+
+
 if __name__ == "__main__":
     unittest.main()

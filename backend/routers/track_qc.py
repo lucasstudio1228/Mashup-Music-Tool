@@ -47,7 +47,7 @@ class RegenerateBody(BaseModel):
 
 def _project(db: Session, pid: int) -> Project:
     p = db.get(Project, pid)
-    if not p:
+    if not p or getattr(p, "deleted_at", None):
         raise HTTPException(404, f"Project {pid} không tồn tại")
     return p
 

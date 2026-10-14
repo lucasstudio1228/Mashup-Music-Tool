@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { useGlobalTasks, type GlobalTask } from '../../api/tasks';
 
 const ICON: Record<string, string> = {
-  suno: '🎼', 'suno-login': '🔑', 'suno-fix': '🩹', remux: '🎬', upload: '📤',
+  suno: '🎼', 'suno-login': '🔑', 'suno-fix': '🩹', remux: '🎬', upload: '📤', upload_short: '📱', continue: '⏩',
   full: '🎞️', images: '🖼️', clips: '🎥', assemble: '🧩', mix: '🎚️', stem: '🪄',
   batch: '🏭',
 };

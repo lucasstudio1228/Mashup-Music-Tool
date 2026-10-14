@@ -49,3 +49,5 @@ storage_state*.json
 # Script do live trinh duyet (chi dung khi phat trien)
 tests/_probe_*.py
 tests/_run_*.py
+# Thùng rác project (giữ 7 ngày trước khi xoá vĩnh viễn)
+Trash/

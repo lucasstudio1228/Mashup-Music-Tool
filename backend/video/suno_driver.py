@@ -49,8 +49,19 @@ class SunoSubmissionUncertain(SunoError):
     KHÔNG được bấm Create lại (tránh tạo trùng, tốn credit)."""
 
 
+class SunoCaptchaRequired(SunoError):
+    """Suno bắt xác minh CAPTCHA (hCaptcha/Turnstile) khi Create mà KHÔNG được giải
+    trong thời gian chờ → WAITING_FOR_HUMAN. Tool KHÔNG BAO GIỜ tự giải/vượt
+    CAPTCHA: chỉ đưa cửa sổ Suno lên trước và chờ người dùng tự giải."""
+
+
 class SunoBudgetError(SunoError):
     """Chạm trần ngân sách/credit trước khi kịp tạo → dừng an toàn."""
+
+
+class SunoDownloadLimit(SunoError):
+    """Hết lượt tải của gói Suno (từ 03/09/2026: Pro 20, Premier 60 bài/tháng) →
+    INSUFFICIENT_DOWNLOAD_ALLOWANCE. KHÔNG bao giờ tự mua 'download packs'."""
 
 
 @dataclass
@@ -74,6 +85,41 @@ _JS_DURATION_STATE = r"""() => {
   const auto = [...row.querySelectorAll('button')].find(b => b.innerText.trim() === 'Auto');
   if (!auto) return null;
   return auto.getAttribute('data-selected') === 'true' ? 'auto' : 'custom';
+}"""
+
+
+# Từ 2026-10-12 Suno chặn mỗi lượt Create bằng captcha (POST /api/c/check →
+# Turnstile ẩn «interaction-only»; không qua thì bật hCaptcha ghép hình «Drag the
+# letter…»). Chỉ ĐỌC trạng thái: khung captcha có HIỆN không + toast lỗi tạo bài.
+_JS_GEN_STATE = r"""() => {
+  const shown = (e, w, h) => {
+    const r = e.getBoundingClientRect();
+    if (r.width < w || r.height < h) return false;
+    if (r.bottom <= 0 || r.right <= 0 || r.top >= innerHeight || r.left >= innerWidth) return false;
+    if (e.checkVisibility && !e.checkVisibility({opacityProperty: true, visibilityProperty: true})) return false;
+    return true;
+  };
+  const frames = [...document.querySelectorAll('iframe')].filter(f => {
+    const src = f.getAttribute('src') || '', t = f.getAttribute('title') || '';
+    return /hcaptcha|turnstile|challenges\.cloudflare/i.test(src) || /captcha|challenge/i.test(t);
+  }).filter(f => shown(f, 50, 50));
+  // Turnstile gắn iframe trong shadow DOM ĐÓNG → querySelectorAll('iframe') không
+  // thấy (2026-10-12: ô «Verify you are human» hiện giữa trang mà frames rỗng).
+  // Đo chính phần tử chứa — khung hiện ~300×65, lúc ẩn 0×0.
+  const hosts = [...document.querySelectorAll(
+      "#generation-turnstile-container,[id*=turnstile],[class*=turnstile],.cf-turnstile")]
+    .filter(e => shown(e, 120, 30));
+  const toast = [...document.querySelectorAll(
+      "[data-sonner-toast],[role=alert],[role=status],[class*=toast],[class*=Toast]")]
+    .map(e => (e.innerText || '').trim().replace(/\s+/g, ' '))
+    .find(t => /generation failed|failed to generate|verification failed|captcha|verify you are human/i.test(t)) || '';
+  const f = frames[0], h = hosts[0];
+  const kind = f ? ((f.getAttribute('title') || '') + ' ' +
+                    (f.getAttribute('src') || '').split('?')[0]).trim()
+                 : h ? 'Cloudflare Turnstile «Verify you are human» #' + (h.id || h.className) : '';
+  return {captcha: frames.length > 0 || hosts.length > 0,
+          kind: kind.slice(0, 120),
+          toast: toast.slice(0, 200)};
 }"""
 
 
@@ -136,6 +182,13 @@ class SunoDriver:
         self.dry_run = dry_run
         self.sel = selectors or config.get_selectors("suno")
         self._log = log or (lambda m: None)
+        # Ảnh chụp chẩn đoán khi Create không được nhận (service gán staging).
+        self.debug_dir: Optional[Path] = None
+        # Tín hiệu quanh lượt Create (console captcha + request /api/generate/).
+        # KHÔNG lưu token, header, cookie hay body request.
+        self._gen_events: list[str] = []
+        self._gen_bad: list = []
+        self._gen_watch = False
 
     def _wait(self, ms: float) -> None:
         """Chờ trên trang nhưng huỷ được ngay (xem browser_base.wait_ms)."""
@@ -205,6 +258,72 @@ class SunoDriver:
             "đăng nhập bằng tài khoản của bạn trong cửa sổ vừa mở, rồi bấm chạy "
             "lại. Tool KHÔNG tự nhập mật khẩu.")
 
+    _JS_ACCOUNT_VALUES = r"""() => {
+      const out = {};
+      for (const e of document.querySelectorAll('span,div,p')) {
+        if (e.children.length) continue;
+        const t = (e.textContent || '').trim();
+        if (!/^(Downloads Remaining|Credits Remaining|Current Plan)$/i.test(t)) continue;
+        const v = e.nextElementSibling;
+        if (v) out[t.toLowerCase()] = (v.textContent || '').trim();
+      }
+      return out;
+    }"""
+
+    def read_download_allowance(self) -> Optional[int]:
+        """Số lượt tải còn lại (trang suno.com/account, ô 'Downloads Remaining').
+        None = không đọc được (không chặn). Chỉ ĐỌC — không bấm gì trên trang."""
+        try:
+            self.page.goto("https://suno.com/account", wait_until="domcontentloaded")
+            vals = {}
+            for _ in range(10):
+                self._wait(1000)
+                vals = self.page.evaluate(self._JS_ACCOUNT_VALUES) or {}
+                if "downloads remaining" in vals:
+                    break
+        except Exception as e:      # noqa: BLE001
+            self._log(f"Không đọc được hạn mức tải ({type(e).__name__}).")
+            return None
+        raw = vals.get("downloads remaining", "")
+        m = re.search(r"(\d[\d,]*)", raw)
+        if not m:
+            if re.search(r"unlimited|∞", raw, re.I):
+                return 10**6
+            return None
+        n = int(m.group(1).replace(",", ""))
+        self._log(f"Lượt tải Suno còn lại: {n} ({vals.get('current plan', '?')}).")
+        return n
+
+    _JS_OUT_OF_DOWNLOADS = r"""() => {
+      for (const d of document.querySelectorAll('[role=dialog]')) {
+        const t = (d.innerText || '').trim();
+        if (/out of downloads|used all (of )?your downloads/i.test(t)) {
+          const m = t.match(/Refreshes\s*\n*\s*([0-9\/.\-]+)/i);
+          return {refresh: m ? m[1] : ''};
+        }
+      }
+      return null;
+    }"""
+
+    def _raise_if_out_of_downloads(self) -> None:
+        """Hộp thoại Download đổi thành 'Out of Downloads' khi hết hạn mức → đóng
+        (Escape, KHÔNG bấm 'Buy download packs') rồi báo SunoDownloadLimit."""
+        try:
+            hit = self.page.evaluate(self._JS_OUT_OF_DOWNLOADS)
+        except Exception:
+            hit = None
+        if not hit:
+            return
+        try:
+            self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        when = f", làm mới {hit['refresh']}" if hit.get("refresh") else ""
+        raise SunoDownloadLimit(
+            f"Suno báo hết lượt tải{when} (hộp «Out of Downloads»). Tải WAV qua "
+            "Studio của gói Premier vốn không bị tính lượt — kiểm tra gói Suno còn "
+            "Premier không. Tool không tự mua thêm; xử lý xong rồi Resume.")
+
     def read_credits(self) -> Optional[int]:
         """Đọc số credit còn lại từ aria-label 'Credits remaining: N'. None nếu
         không đọc được (không chặn — chỉ để tiền-kiểm ngân sách)."""
@@ -237,8 +356,50 @@ class SunoDriver:
         except Exception as e:
             raise SunoUIChanged(f"Không bấm được tab Advanced: {e}") from e
 
+    # Nút model = nút có aria-haspopup (LIVE 2026-10-12: 'dialog'; trước đó
+    # 'menu') nằm CÙNG HÀNG, ngay bên phải pill «Credits remaining». Định vị
+    # theo hình học thay vì `:right-of(...)`: selector cũ khớp nhầm các nút ⋯
+    # của danh sách bài khi Suno đổi haspopup menu→dialog (lỗi 2026-10-12).
+    _JS_MARK_MODEL_BUTTON = r"""() => {
+      document.querySelectorAll('[data-mm-model-btn]')
+        .forEach(e => e.removeAttribute('data-mm-model-btn'));
+      const cr = [...document.querySelectorAll("[aria-label^='Credits remaining']")]
+        .find(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+      if (!cr) return false;
+      const c = cr.getBoundingClientRect(), cy = c.top + c.height / 2;
+      let best = null, bestD = 1e9;
+      for (const b of document.querySelectorAll('button[aria-haspopup]')) {
+        const r = b.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue;
+        if (Math.abs(r.top + r.height / 2 - cy) > Math.max(12, c.height / 2)) continue;
+        const d = r.left - c.right;
+        if (d < 0 || d > 600) continue;
+        if (d < bestD) { best = b; bestD = d; }
+      }
+      if (!best) return false;
+      best.setAttribute('data-mm-model-btn', '1');
+      return true;
+    }"""
+
+    def _model_button(self, timeout_ms: int = 6000):
+        """Locator nút chọn model; None nếu không thấy."""
+        deadline = time.time() + timeout_ms / 1000.0
+        while True:
+            try:
+                if self.page.evaluate(self._JS_MARK_MODEL_BUTTON):
+                    loc = self.page.locator("button[data-mm-model-btn='1']").first
+                    if loc.count() > 0 and loc.is_visible():
+                        return loc
+            except Exception:
+                pass
+            if time.time() >= deadline:
+                break
+            self._wait(300)
+        # Dự phòng: selector cấu hình (config.SUNO_SELECTORS['model_button']).
+        return self._find("model_button", timeout_ms=1500, required=False)
+
     def _current_model_text(self) -> str:
-        loc = self._find("model_button", timeout_ms=6000, required=False)
+        loc = self._model_button()
         if loc is None:
             return ""
         try:
@@ -246,39 +407,103 @@ class SunoDriver:
         except Exception:
             return ""
 
+    # LIVE 2026-10-12: nút model mở [role=dialog] chứa [role=grid][aria-label=
+    # 'Model'] gồm các [role=row][data-grid-list-row] (aria-selected="true" =
+    # đang chọn). Hàng đầu là «Create Custom Model» (100 credit — KHÔNG BAO GIỜ
+    # bấm), rồi MY MODELS (custom) và ALL MODELS (v6 / v6-wild / v6-mini).
+    # Kiểu cũ (LIVE 2026-10-08): [role=menu] chứa [role=menuitemradio]
+    # (aria-checked). Cả hai: dòng đầu innerText = tên model. Khi đang ở custom
+    # model, nút chỉ còn ảnh bìa (KHÔNG có chữ 'v6') và Suno NHỚ lựa chọn qua
+    # lần tải lại.
+    _MODEL_ITEMS = ("[role=grid][aria-label='Model'] [role=row][data-grid-list-row], "
+                    "[role=menu] [role=menuitemradio]")
+
+    def _open_model_menu(self) -> bool:
+        btn = self._model_button()
+        if btn is None:
+            return False
+        try:
+            if not self._real_click(btn):
+                btn.click()
+            self.page.locator(self._MODEL_ITEMS).first.wait_for(
+                state="visible", timeout=4000)
+            return True
+        except Exception:
+            self._close_menu()
+            return False
+
+    def _close_menu(self) -> None:
+        try:
+            self.page.keyboard.press("Escape")
+            self._wait(300)
+        except Exception:
+            pass
+
+    def _model_items(self) -> list:
+        """[(tên, đang_chọn, locator)] của menu model đang mở."""
+        out = []
+        items = self.page.locator(self._MODEL_ITEMS)
+        for i in range(items.count()):
+            it = items.nth(i)
+            try:
+                name = (it.inner_text() or "").strip().split("\n")[0].strip()
+                if not name or name.lower().startswith("create custom model"):
+                    continue          # hàng tạo custom model (tốn credit)
+                on = "true" in (it.get_attribute("aria-checked"),
+                                it.get_attribute("aria-selected"))
+                out.append((name, on, it))
+            except Exception:
+                continue
+        return out
+
+    def current_model(self) -> str:
+        """Tên model đang chọn (đọc aria-selected/aria-checked trong hộp model)."""
+        if not self._open_model_menu():
+            return self._current_model_text()
+        try:
+            return next((n for n, on, _ in self._model_items() if on), "")
+        finally:
+            self._close_menu()
+
     def select_model(self, preferred: str = "v6",
                      allow_fallback: bool = False) -> str:
-        """Đảm bảo model đang chọn là `preferred`. Trả về model text cuối cùng.
+        """Đảm bảo model đang chọn là `preferred` ('v6', 'v6-wild', hoặc tên
+        custom model như 'Bamboo Flute v1'). Trả về tên model cuối cùng.
         allow_fallback=False + không chọn được preferred → raise (không chấp
         nhận model khác)."""
-        current = self._current_model_text()
-        # Nút hiện 'v6-mini'/'v6-wild' cũng chứa 'v6' → so khớp chính xác token.
-        def _is_pref(txt: str) -> bool:
-            t = txt.lower()
-            if preferred == "v6":
-                return "v6" in t and "mini" not in t and "wild" not in t
-            return preferred.lower() in t
-
-        if _is_pref(current):
-            self._log(f"Model đã đúng: {current!r}")
-            return current
-
-        btn = self._find("model_button", timeout_ms=6000, required=False)
-        if btn is not None:
-            try:
-                btn.click()
-                self._wait(500)
-                opt = self._find("model_option_v6", timeout_ms=4000, required=False)
-                if opt is not None:
-                    opt.click()
-                    self._wait(500)
-            except Exception as e:
-                self._log(f"Chọn model gặp lỗi: {e}")
-
-        current = self._current_model_text()
-        if _is_pref(current):
-            self._log(f"Đã chọn model {current!r}.")
-            return current
+        want = (preferred or "v6").strip().lower()
+        current = ""
+        if self._open_model_menu():
+            items = self._model_items()
+            current = next((n for n, on, _ in items if on), "")
+            if current.lower() == want:
+                self._close_menu()
+                self._log(f"Model đã đúng: {current!r}")
+                return current
+            target = next((it for n, _, it in items if n.lower() == want), None)
+            if target is None:
+                self._close_menu()
+                self._log(f"Menu model không có {preferred!r} (có: "
+                          f"{[n for n, _, _ in items]}).")
+            else:
+                try:
+                    target.click()
+                    self._wait(800)
+                except Exception as e:
+                    self._log(f"Chọn model gặp lỗi: {e}")
+                    self._close_menu()
+                current = self.current_model()
+                if current.lower() == want:
+                    self._log(f"Đã chọn model {current!r}.")
+                    return current
+        else:
+            # Dự phòng kiểu cũ: đọc chữ trên nút (chỉ đúng với họ v6).
+            current = self._current_model_text()
+            t = current.lower()
+            if (want == "v6" and "v6" in t and "mini" not in t and "wild" not in t) \
+                    or (want != "v6" and want in t):
+                self._log(f"Model đã đúng: {current!r}")
+                return current
         if allow_fallback:
             self._log(f"CẢNH BÁO: không set được {preferred!r}, dùng {current!r} "
                       f"(allow_model_fallback=True).")
@@ -304,9 +529,14 @@ class SunoDriver:
                 loc.click()
                 self.page.keyboard.press("Control+A")
                 self.page.keyboard.press("Delete")
+                self._wait(300)
+                left = (loc.inner_text() or "").strip()
             except Exception as e:
                 raise SunoUIChanged(
                     f"Không xóa được Lyrics để giữ instrumental: {e}") from e
+            if left:
+                raise SunoUIChanged("Lyrics vẫn còn chữ sau khi xóa — dừng để không "
+                                    "tạo bài có lời.")
         else:
             self._log("Lyrics trống → instrumental OK.")
 
@@ -379,9 +609,264 @@ class SunoDriver:
         raise SunoUIChanged("Duration vẫn Custom sau khi tải lại /create — "
                             "hãy chuyển về Auto bằng tay rồi chạy tiếp.")
 
+    # Max Mode (More Options; LIVE 2026-10-08): hàng <span>Max Mode</span> + 2 nút
+    # Off/On mang data-selected="true|false"; tải lại /create → về Off. Selector
+    # chung "button:has-text('On')" cũ khớp nhầm (tab "Songs", hàng Personalize…)
+    # → chỉ bấm nút trong ĐÚNG hàng Max Mode (chuột thật) rồi đọc lại trạng thái.
+    _JS_TOGGLE_ROW = r"""([label, want]) => {
+      const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+      const txt = b => (b.innerText || b.textContent || '').trim();
+      const state = b => {
+        const a = b.getAttribute('data-selected') ?? b.getAttribute('aria-pressed')
+              ?? b.getAttribute('aria-checked') ?? b.getAttribute('data-state');
+        if (a !== null) return /^(true|on|checked|active)$/i.test(a);
+        return /variant-standard/.test(String(b.className));
+      };
+      document.querySelectorAll('[data-tool-toggle]').forEach(e => e.removeAttribute('data-tool-toggle'));
+      for (const l of document.querySelectorAll('span,div,p,label')) {
+        if (l.children.length || txt(l) !== label || !vis(l)) continue;
+        let row = l;
+        for (let i = 0; i < 4 && row; i++) {
+          row = row.parentElement;
+          if (!row) break;
+          const btns = [...row.querySelectorAll('button')].filter(vis);
+          const off = btns.find(b => txt(b) === 'Off'), on = btns.find(b => txt(b) === 'On');
+          if (off && on) {
+            (want ? on : off).setAttribute('data-tool-toggle', '1');
+            return {on: state(on), off: state(off)};
+          }
+        }
+      }
+      return null;
+    }"""
+
+    def max_mode_state(self) -> Optional[bool]:
+        """True/False = Max Mode đang On/Off; None = không thấy hàng Max Mode."""
+        st = self.page.evaluate(self._JS_TOGGLE_ROW, ["Max Mode", True])
+        if st is None:
+            return None
+        return bool(st["on"]) and not bool(st["off"])
+
     def set_max_mode(self, on: bool) -> None:
-        key = "max_mode_on" if on else "max_mode_off"
-        click_first(self.page, self.sel.get(key, []), timeout_ms=3000)
+        """Bật/tắt Max Mode và XÁC NHẬN đã đổi (không đoán). Không thấy hàng hoặc
+        bấm không ăn → SunoUIChanged (không tạo nhạc sai cấu hình)."""
+        st = None
+        for attempt in range(4):
+            st = self.page.evaluate(self._JS_TOGGLE_ROW, ["Max Mode", on])
+            if st is None and attempt == 0:
+                self.open_more_options()        # More Options có thể đang đóng
+                self._wait(700)
+                st = self.page.evaluate(self._JS_TOGGLE_ROW, ["Max Mode", on])
+            if st is None:
+                break
+            if bool(st["on"]) == on and bool(st["off"]) != on:
+                self._log(f"Max Mode = {'On' if on else 'Off'}.")
+                return
+            loc = self.page.locator("[data-tool-toggle='1']").first
+            if not self._real_click(loc):
+                try:
+                    loc.click(timeout=3000)
+                except Exception:
+                    pass
+            self._wait(800)
+        if st is None:
+            raise SunoUIChanged("Không thấy hàng 'Max Mode' trong More Options.")
+        raise SunoUIChanged(
+            f"Không {'bật' if on else 'tắt'} được Max Mode (On={st['on']}, "
+            f"Off={st['off']}).")
+
+    # ── Thanh trượt sáng tạo (More Options; LIVE 2026-10-08) ─────
+    # Weirdness 0–100, Style Influence 0–100, Variety 0–4 (Off/Normal/High/
+    # Extra/Max). Variety > 0 làm Suno VIẾT LẠI Styles (đảo thứ tự, rút gọn, tự
+    # thêm nhạc cụ) → tool đặt Variety=0 để Suno dùng nguyên văn prompt.
+    SLIDERS = {"weirdness": "Weirdness", "style_influence": "Style Influence",
+               "variety": "Variety"}
+
+    _JS_SLIDER_STATE = r"""(e) => {
+      const r = e.getBoundingClientRect();
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      const top = (cx >= 0 && cy >= 0 && cx < innerWidth && cy < innerHeight)
+          ? document.elementFromPoint(cx, cy) : null;
+      return {x: r.left, y: r.top, w: r.width, h: r.height,
+              onTop: !!top && (top === e || e.contains(top) || top.contains(e)),
+              popout: !!e.closest('.card-popout-boundary')};
+    }"""
+
+    def _slider_all(self, key: str) -> list:
+        sels = self.sel.get(f"slider_{key}") or [
+            f"[role=slider][aria-label='{self.SLIDERS[key]}']"]
+        for s in sels:
+            try:
+                loc = self.page.locator(s)
+                n = loc.count()
+            except Exception:
+                continue
+            if n:
+                return [loc.nth(i) for i in range(n)]
+        return []
+
+    # Khoảng cách (số cấp cha) tới khối chứa thanh Weirdness: thanh của form More
+    # Options nằm cùng khối (2–3 cấp); bản 'Variety' thứ hai ở chỗ khác → xa hơn.
+    _JS_NEAR_WEIRDNESS = r"""(e) => { let a = e;
+      for (let k = 0; k < 12 && a; k++) { a = a.parentElement;
+        if (a && a.querySelector("[role=slider][aria-label='Weirdness']")) return k; }
+      return 99; }"""
+
+    def _slider(self, key: str):
+        """Thanh trượt của khung More Options. LIVE 2026-10-08 có 2 'Variety' (1
+        trong More Options cạnh Weirdness/Style Influence, 1 ở khối khác) → chọn
+        cái nằm gần Weirdness nhất."""
+        items = self._slider_all(key)
+        if not items:
+            return query_first(self.page, self.sel.get(f"slider_{key}") or [
+                f"[role=slider][aria-label='{self.SLIDERS[key]}']"], timeout_ms=4000)
+        if len(items) == 1:
+            return items[0]
+        best, best_d = items[0], 999
+        for loc in items:
+            try:
+                dist = loc.evaluate(self._JS_NEAR_WEIRDNESS)
+            except Exception:
+                continue
+            if dist < best_d:
+                best, best_d = loc, dist
+        return best
+
+    @staticmethod
+    def _read_now(loc) -> Optional[int]:
+        try:
+            return int(round(float(loc.get_attribute("aria-valuenow"))))
+        except Exception:
+            return None
+
+    def read_slider(self, key: str) -> Optional[int]:
+        loc = self._slider(key)
+        return None if loc is None else self._read_now(loc)
+
+    def set_slider(self, key: str, value: int) -> int:
+        """Đặt 1 thanh trượt bằng CHUỘT THẬT rồi đọc lại aria-valuenow.
+        LIVE 2026-10-08: thanh là DIV tuỳ biến (role=slider, không có thumb riêng),
+        KHÔNG nhận phím (focus + Home/mũi tên) và KHÔNG nhận 1 cú click tại chỗ →
+        KÉO trên rãnh tới x = trái + (giá trị−min)/(max−min)·rộng; lệch thì chỉnh
+        dần theo số đọc lại.
+        Không đặt được → SunoUIChanged."""
+        loc = self._slider(key)
+        if loc is None:
+            raise SunoUIChanged(f"Không thấy thanh trượt '{self.SLIDERS[key]}' trong "
+                                "More Options — giao diện Suno có thể đã đổi.")
+        got = self._drag_slider(loc, value)
+        if got != max(self._attr_int(loc, "aria-valuemin", 0),
+                      min(self._attr_int(loc, "aria-valuemax", 100), int(value))):
+            raise SunoUIChanged(f"Không đặt được '{self.SLIDERS[key]}' = {value} "
+                                f"(đang {got}).")
+        return got
+
+    @staticmethod
+    def _attr_int(loc, name: str, default: int) -> int:
+        try:
+            return int(float(loc.get_attribute(name)))
+        except Exception:
+            return default
+
+    def _drag_slider(self, loc, value: int) -> Optional[int]:
+        """Kéo 1 phần tử role=slider tới `value`; trả giá trị đọc lại."""
+        try:
+            lo = int(float(loc.get_attribute("aria-valuemin") or 0))
+            hi = int(float(loc.get_attribute("aria-valuemax") or 100))
+        except Exception:
+            lo, hi = 0, 100
+        target = max(lo, min(hi, int(value)))
+        if self._read_now(loc) == target:
+            return target
+        try:
+            loc.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+        self._wait(250)
+        st = loc.evaluate(self._JS_SLIDER_STATE)
+        if not st["onTop"]:
+            # Rãnh bị che (thanh cuộn panel/sticky footer) → cuộn vào giữa khung.
+            loc.evaluate("e => e.scrollIntoView({block: 'center'})")
+            self._wait(300)
+            st = loc.evaluate(self._JS_SLIDER_STATE)
+        x0, w = st["x"], max(1.0, st["w"])
+        cy = st["y"] + st["h"] / 2
+        span = max(1, hi - lo)
+        mouse = self.page.mouse
+
+        def pos(v: float) -> float:
+            return x0 + (v - lo) / span * w
+
+        # LIVE: 1 cú click (down/up tại chỗ) KHÔNG đổi giá trị; phải KÉO (down →
+        # move nhiều bước → up). Kéo từ vị trí hiện tại tới đích; biên thì kéo
+        # vượt rãnh 12px cho chắc chạm min/max.
+        x = pos(target)
+        for _ in range(5):
+            cur = self._read_now(loc)
+            if cur is None or cur == target:
+                break
+            xe = x0 - 12 if target == lo else (x0 + w + 12 if target == hi else x)
+            xs = min(x0 + w - 2, max(x0 + 2, pos(cur)))
+            mouse.move(xs, cy)
+            self._wait(80)
+            mouse.down()
+            self._wait(80)
+            mouse.move(xe, cy, steps=12)
+            self._wait(80)
+            mouse.up()
+            self._wait(250)
+            got = self._read_now(loc)
+            if got is not None and got != target:
+                x = min(x0 + w, max(x0, x + (target - got) / span * w))
+        return self._read_now(loc)
+
+    def set_creative_sliders(self, values: dict) -> dict:
+        """values: {"variety": 0, "style_influence": 75, "weirdness": 30}; khoá
+        None/thiếu = để nguyên. Trả giá trị đọc lại sau khi đặt."""
+        out = {}
+        for key in ("variety", "style_influence", "weirdness"):
+            if values.get(key) is None:
+                continue
+            out[key] = self.set_slider(key, int(values[key]))
+        if out:
+            self._log("Thanh trượt Suno: " + ", ".join(
+                f"{self.SLIDERS[k]}={v}" for k, v in out.items()))
+        return out
+
+    def ensure_creative_sliders(self, values: dict) -> dict:
+        """Chỉ kéo những thanh đang LỆCH so với `values` (đọc lại trước mỗi Create
+        rẻ hơn kéo lại cả 3). Trả `values` đã chốt."""
+        want = {k: int(v) for k, v in values.items() if v is not None and k in self.SLIDERS}
+        drift = {k: v for k, v in want.items() if self.read_slider(k) != v}
+        if drift:
+            self.set_creative_sliders(drift)
+        return want
+
+    def fill_lyrics(self, text: str) -> None:
+        """Điền ô Lyrics (chỉ dùng cho THẺ CẤU TRÚC instrumental như
+        '[Intro - solo flute only]' — không bao giờ điền lời hát)."""
+        loc = self._find("lyrics_editor", timeout_ms=6000)
+        if (loc.get_attribute("data-cowrite-input") or "").lower() == "true":
+            raise SunoUIChanged("Selector Lyrics trỏ nhầm ô Cowriter (nhờ Suno viết lời).")
+        try:
+            # Lexical contenteditable: xoá rồi GÕ từng dòng (Enter = đoạn mới).
+            loc.click()
+            self.page.keyboard.press("Control+A")
+            self.page.keyboard.press("Delete")
+            lines = [ln.strip() for ln in (text or "").splitlines()]
+            for i, ln in enumerate(lines):
+                if ln:
+                    self.page.keyboard.insert_text(ln)
+                if i < len(lines) - 1:
+                    self.page.keyboard.press("Enter")
+            self._wait(300)
+            got = (loc.inner_text() or "").strip()
+        except Exception as e:
+            raise SunoUIChanged(f"Không điền được Lyrics: {e}") from e
+        want = [ln for ln in lines if ln]
+        if want and want[0] not in got:
+            raise SunoUIChanged("Lyrics sau khi điền không khớp nội dung mong muốn.")
+        self._log(f"Đã điền thẻ cấu trúc vào Lyrics ({len(text)} ký tự).")
 
     # ── snapshot / monitor ───────────────────────────────────────
     def snapshot_song_ids(self) -> set[str]:
@@ -418,13 +903,98 @@ class SunoDriver:
             pass
         return title, dur
 
+    def generation_state(self) -> dict:
+        """{captcha: khung captcha đang HIỆN, kind, toast: thông báo lỗi tạo bài}."""
+        try:
+            st = self.page.evaluate(_JS_GEN_STATE) or {}
+        except Exception:
+            st = {}
+        return {"captcha": bool(st.get("captcha")), "kind": st.get("kind") or "",
+                "toast": st.get("toast") or ""}
+
+    def _gen_flags(self) -> dict:
+        ev = list(self._gen_events)
+        last_req = max((i for i, e in enumerate(ev) if e == "captcha_required"), default=-1)
+        last_ver = max((i for i, e in enumerate(ev) if e.startswith("captcha_verified")),
+                       default=-1)
+        sent = "generate_sent" in ev
+        return {"sent": sent,
+                "ok": any(e.startswith("generate_http_2") for e in ev),
+                "bad": [e for e in ev if e.startswith(("generate_http_4", "generate_http_5"))],
+                # Suno đòi captcha mà CHƯA có «captcha verified» → đang chờ xác minh.
+                "captcha_pending": last_req > last_ver and not sent,
+                "events": ev}
+
+    def _gen_diag(self) -> str:
+        """Tóm tắt tín hiệu lượt Create (không token/cookie) + body lỗi /generate."""
+        parts = [e for e in dict.fromkeys(self._gen_events)]
+        for resp in self._gen_bad[:1]:
+            try:
+                body = (resp.text() or "").strip().replace("\n", " ")[:200]
+            except Exception:
+                body = ""
+            if body:
+                parts.append(f"body: {body}")
+        return "; ".join(parts) or "không có tín hiệu captcha/generate"
+
+    def save_debug(self, tag: str) -> Optional[str]:
+        if self.debug_dir is None:
+            return None
+        try:
+            Path(self.debug_dir).mkdir(parents=True, exist_ok=True)
+            p = Path(self.debug_dir) / f"create_{tag}_{time.strftime('%H%M%S')}.png"
+            self.page.screenshot(path=str(p))
+            return str(p)
+        except Exception:
+            return None
+
+    def _alert_human(self, msg: str, on_human: Optional[Callable[[str], None]],
+                     beep: bool = False) -> None:
+        self._log(msg)
+        try:
+            self.page.bring_to_front()
+        except Exception:
+            pass
+        if beep:
+            try:
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            except Exception:
+                pass
+        if on_human is not None:
+            try:
+                on_human(msg)
+            except Exception:
+                pass
+
     def wait_for_new_songs(self, before_ids: set[str], expected: int,
                            timeout_sec: int = 300,
-                           poll_sec: float = 3.0) -> list[NewSong]:
+                           poll_sec: float = 3.0,
+                           accept_sec: Optional[float] = None,
+                           captcha_wait_sec: float = 1200,
+                           on_human: Optional[Callable[[str], None]] = None,
+                           captcha_grace_sec: float = 10,
+                           captcha_beep_sec: float = 180
+                           ) -> list[NewSong]:
         """Chờ tới khi xuất hiện >= expected bài MỚI (id không thuộc before_ids).
-        Đã-bấm-Create + hết giờ mà chưa thấy → SunoSubmissionUncertain."""
-        deadline = time.time() + timeout_sec
+        Đã-bấm-Create + hết giờ mà chưa thấy → SunoSubmissionUncertain.
+
+        accept_sec (bật kiểm tra lượt Create có được NHẬN không — bình thường bài
+        mới hiện ~3s sau khi bấm):
+          • khung CAPTCHA hiện, HOẶC console Suno báo «captcha required» mà sau
+            captcha_grace_sec vẫn chưa «captcha verified» (Turnstile nằm trong shadow
+            DOM đóng — có thể không đo được khung) → đưa cửa sổ Suno lên trước, báo
+            người dùng TỰ giải (on_human), chờ thêm tới captcha_wait_sec. KHÔNG bấm
+            gì vào captcha. Hết giờ mà chưa có bài → SunoCaptchaRequired.
+          • Suno báo «Generation failed» / /generate trả 4xx–5xx → dừng NGAY.
+          • quá accept_sec: không bài, không captcha, không request tạo bài đang
+            chờ → SunoSubmissionUncertain sớm (không mù chờ 300s)."""
+        start = time.time()
+        deadline = start + timeout_sec
         new_ids: list[str] = []
+        captcha_seen = False
+        resolved_at: Optional[float] = None     # captcha vừa biến mất (người đã giải)
+        last_nag = last_beep = 0.0
         while time.time() < deadline:
             current = self.snapshot_song_ids()
             fresh = [i for i in current if i not in before_ids]
@@ -434,17 +1004,131 @@ class SunoDriver:
             # Giữ lại tối đa những gì đã thấy để báo cáo.
             if len(fresh) > len(new_ids):
                 new_ids = fresh
+            flags = self._gen_flags()
+            if accept_sec is not None and not new_ids and not flags["ok"]:
+                st = self.generation_state()
+                now = time.time()
+                pending = (flags["captcha_pending"] and now - start >= captcha_grace_sec
+                           and not st["toast"] and not flags["bad"])
+                if st["captcha"] or pending:
+                    # Ưu tiên chờ người giải (kể cả khi toast lỗi còn đọng lại).
+                    resolved_at = None
+                    if not st["captcha"]:
+                        st["kind"] = "Cloudflare «Verify you are human» — chưa xác minh"
+                    if not captcha_seen:
+                        captcha_seen = True
+                        deadline = max(deadline, now + captcha_wait_sec)
+                        self.save_debug("captcha")
+                        self._alert_human(
+                            f"⚠️ CẦN BẠN: Suno yêu cầu xác minh CAPTCHA khi Create "
+                            f"({st['kind'] or 'captcha'}). Hãy TỰ giải trong cửa sổ "
+                            f"Suno (Cốc Cốc) — tool KHÔNG tự giải; đang chờ tối đa "
+                            f"{int(captcha_wait_sec // 60)} phút…", on_human, beep=True)
+                        last_nag = last_beep = now
+                    elif now - last_nag >= 60:
+                        last_nag = now
+                        beep = now - last_beep >= captcha_beep_sec
+                        if beep:
+                            last_beep = now
+                        self._alert_human(
+                            f"⚠️ Vẫn đang chờ bạn giải CAPTCHA trong cửa sổ Suno — "
+                            f"còn ~{int((deadline - now) // 60)} phút.", on_human, beep=beep)
+                elif flags["bad"] or st["toast"]:
+                    why = st["toast"] or flags["bad"][0]
+                    shot = self.save_debug("failed")
+                    err = (f"Suno báo lỗi sau Create: «{why}» — lượt này KHÔNG được nhận. "
+                           f"[{self._gen_diag()}]" + (f" Ảnh: {shot}" if shot else ""))
+                    if captcha_seen:
+                        raise SunoCaptchaRequired(
+                            "CAPTCHA chưa được xác minh xong. " + err)
+                    raise SunoSubmissionUncertain(err)
+                elif captcha_seen and not flags["sent"]:
+                    # Captcha đã tắt mà Suno chưa gửi lệnh tạo bài: cho thêm accept_sec.
+                    if resolved_at is None:
+                        resolved_at = now
+                    elif now - resolved_at >= accept_sec:
+                        shot = self.save_debug("after_captcha")
+                        raise SunoCaptchaRequired(
+                            f"CAPTCHA đã tắt nhưng {int(accept_sec)}s sau Suno vẫn không "
+                            f"gửi lệnh tạo bài — lượt Create không được nhận. "
+                            f"[{self._gen_diag()}]" + (f" Ảnh: {shot}" if shot else ""))
+                elif (not captcha_seen and not flags["sent"]
+                      and now - start >= accept_sec):
+                    shot = self.save_debug("not_accepted")
+                    raise SunoSubmissionUncertain(
+                        f"Sau Create {int(accept_sec)}s: không có bài mới, không thấy "
+                        f"CAPTCHA, Suno không gửi lệnh tạo bài — lượt này KHÔNG được "
+                        f"nhận. [{self._gen_diag()}]" + (f" Ảnh: {shot}" if shot else ""))
             self._wait(int(poll_sec * 1000))
         if len(new_ids) < max(expected, 1):
+            if captcha_seen and not new_ids:
+                raise SunoCaptchaRequired(
+                    f"Suno yêu cầu CAPTCHA nhưng chưa được giải trong "
+                    f"{int(captcha_wait_sec // 60)} phút — lượt Create không được nhận. "
+                    f"Giải CAPTCHA trên Suno rồi bấm Resume (tool không tự giải).")
             raise SunoSubmissionUncertain(
                 f"Sau Create không thấy đủ bài mới ({len(new_ids)}/{expected}) "
                 f"trong {timeout_sec}s. KHÔNG bấm Create lại — kiểm tra thủ công "
-                f"trên Suno rồi resume.")
+                f"trên Suno rồi resume. [{self._gen_diag()}]")
         out: list[NewSong] = []
         for sid in new_ids:
             title, dur = self._song_meta(sid)
             out.append(NewSong(song_id=sid, title=title, duration_seconds=dur))
         return out
+
+    # ── tín hiệu quanh lượt Create (chỉ đọc) ─────────────────────
+    def _on_console(self, msg) -> None:
+        try:
+            t = (msg.text or "").strip().lower()
+        except Exception:
+            return
+        if "captcha required" in t:
+            self._gen_events.append("captcha_required")
+        elif "captcha verified" in t:        # KHÔNG lưu token
+            self._gen_events.append("captcha_verified_null" if t.endswith("null")
+                                    else "captcha_verified")
+
+    @staticmethod
+    def _is_generate(url: str) -> bool:
+        return "/api/generate/" in (url or "")
+
+    def _on_request(self, req) -> None:
+        try:
+            if req.method == "POST" and self._is_generate(req.url):
+                self._gen_events.append("generate_sent")
+        except Exception:
+            pass
+
+    def _on_response(self, resp) -> None:
+        try:
+            if resp.request.method != "POST" or not self._is_generate(resp.url):
+                return
+            self._gen_events.append(f"generate_http_{resp.status}")
+            if resp.status >= 400:
+                self._gen_bad.append(resp)
+        except Exception:
+            pass
+
+    def _on_request_failed(self, req) -> None:
+        try:
+            if req.method == "POST" and self._is_generate(req.url):
+                self._gen_events.append("generate_http_599 (request failed)")
+        except Exception:
+            pass
+
+    def _arm_create_watch(self) -> None:
+        self._gen_events.clear()
+        self._gen_bad.clear()
+        if self._gen_watch:
+            return
+        try:
+            self.page.on("console", self._on_console)
+            self.page.on("request", self._on_request)
+            self.page.on("response", self._on_response)
+            self.page.on("requestfailed", self._on_request_failed)
+            self._gen_watch = True
+        except Exception:
+            pass
 
     # ── LIVE: Create (chỉ khi dry_run=False) ─────────────────────
     def click_create(self) -> None:
@@ -452,6 +1136,7 @@ class SunoDriver:
             self._log("[DRY-RUN] BỎ QUA click Create (không tiêu credit).")
             return
         loc = self._find("create_button", timeout_ms=8000)
+        self._arm_create_watch()
         try:
             loc.click()
             self._log("Đã bấm Create (LIVE).")
@@ -913,6 +1598,7 @@ class SunoDriver:
             raise SunoUIChanged("Không bấm được mục Download trong menu ⋯.")
         entry.click()
         self._wait(800)
+        self._raise_if_out_of_downloads()
 
         # Hộp thoại Download = danh sách TOGGLE. Mặc định MP3 bật, WAV tắt.
         # Quy trình chuẩn (theo yêu cầu): BẬT WAV, TẮT MP3, rồi bấm 'Download'.
@@ -1067,3 +1753,8 @@ class SunoDriver:
         self._open_song_in_studio(song_id, load_timeout_sec=render_timeout)
         self._studio_export_full_song(render_timeout_sec=render_timeout)
         return self._download_wav_current(dest, timeout_sec=timeout_sec)
+
+    # KHÔNG có đường tải MP3 / tải thường từ trang bài: kiểu tải đó bị trừ lượt Suno
+    # (Premier 60/tháng). Mọi lần tải — production lẫn thử nghiệm — đều qua
+    # download_wav (Studio → Export → WAV), không bị tính lượt với gói Premier
+    # (đo thật 2026-10-08: tài khoản 0 lượt vẫn tải WAV Studio bình thường).

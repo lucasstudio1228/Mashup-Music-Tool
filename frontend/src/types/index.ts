@@ -245,6 +245,9 @@ export interface VideoParamsInfo {
   model:          string;
   clip_engine?:   string;   // "flow" (mặc định) | "gemini" | "muse"
   clip_engine_label?: string;
+  image_engine?:  string;   // "muse" (mặc định, dự phòng Gemini) | "gemini"
+  image_engine_label?: string;
+  image_fallback_label?: string | null;
   clip_engines?:  { key: string; label: string }[];
   aspect_ratio:   string;
   flow_mode:      string;
@@ -509,4 +512,111 @@ export interface QcAutoFix {
   replaced?: number;
   failed?: number;
   at: string;
+}
+
+// ---------- Xoá nhiều project + dọn dữ liệu thừa ----------
+export interface BulkDeleteItem {
+  id: number;
+  name: string;
+  ok: boolean;
+  busy?: boolean;
+  error?: string;
+  warnings?: string[];
+  cleanup_pending?: string[];
+  freed_bytes?: number;
+  trashed?: boolean;
+}
+
+export interface BulkDeleteResult {
+  results: BulkDeleteItem[];
+  deleted: number;
+  failed: number;
+  freed_bytes: number;
+  /** true = đã chuyển vào Thùng rác (mặc định), false = xoá vĩnh viễn. */
+  trashed?: boolean;
+  retention_days?: number;
+}
+
+export interface ProjectDiskUsage {
+  projects: Record<string, number>;
+  total_bytes: number;
+}
+
+export interface JunkItem {
+  key: string;
+  label: string;
+  bytes: number;
+  project_id: number | null;
+  detail: string;
+}
+
+export interface JunkCategory {
+  key: string;
+  title: string;
+  description: string;
+  bytes: number;
+  items: JunkItem[];
+}
+
+export interface JunkScan {
+  categories: JunkCategory[];
+  total_bytes: number;
+  busy_project_ids: number[];
+  untouched: { label: string; bytes: number }[];
+}
+
+export interface JunkCleanResult {
+  freed_bytes: number;
+  done: string[];
+  errors: string[];
+}
+
+// ---------- Tình trạng project (Nhạc → Mix → Ảnh → Clip → Video → Nháp YT → Short) ----------
+export type ProgressStepState =
+  | 'pending' | 'done' | 'running' | 'paused' | 'queued' | 'waiting'
+  | 'blocked' | 'error' | 'stopped' | 'skipped';
+
+export interface ProgressStep {
+  key: string;
+  label: string;
+  state: ProgressStepState;
+  detail: string;
+  percent?: number;
+}
+
+export interface ProjectProgress {
+  project_id: number;
+  /** new | running | paused | queued | stopped | blocked | error | done | unknown */
+  state: string;
+  stage: string;
+  stage_label: string;
+  summary: string;
+  percent: number | null;
+  done_steps: number;
+  total_steps: number;
+  steps: ProgressStep[];
+}
+
+export interface ProjectsProgressResponse {
+  steps: { key: string; label: string }[];
+  projects: ProjectProgress[];
+}
+
+// ---------- Thùng rác (giữ 7 ngày rồi mới xoá vĩnh viễn) ----------
+export interface TrashItem {
+  id: number;
+  name: string;
+  description?: string | null;
+  deleted_at: string;
+  purge_at: string | null;
+  days_left: number;
+  size_bytes: number;
+  trash_dir: string | null;
+  in_place: string[];
+}
+
+export interface TrashList {
+  retention_days: number;
+  items: TrashItem[];
+  total_bytes: number;
 }

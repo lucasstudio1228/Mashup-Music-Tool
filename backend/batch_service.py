@@ -74,7 +74,17 @@ _HARD_STOP = {
     suno_service.INSUFFICIENT_GENERATION_CREDITS,
     suno_service.INSUFFICIENT_DOWNLOAD_ALLOWANCE,
     suno_service.PAUSED,
+    # Create chưa xác nhận: tự chạy lại = bấm Create lần nữa (spec: KHÔNG bấm lại).
+    # 2026-10-12 lô tự thử lại đã bấm Create 3 lần liền cho project 33.
+    suno_service.SUBMISSION_UNCERTAIN,
 }
+
+
+def _needs_human(phase: Optional[str], detail: str) -> bool:
+    """Chặn cần người: phase cứng, hoặc Suno đòi CAPTCHA (WAITING_FOR_HUMAN kèm
+    chữ CAPTCHA — sản phẩm kế cũng sẽ bị đòi, tool không tự giải)."""
+    return phase in _HARD_STOP or (phase == suno_service.WAITING_FOR_HUMAN
+                                   and "captcha" in (detail or "").lower())
 # Số lần TỰ resume 1 sản phẩm trước khi bỏ qua nó và chạy sản phẩm kế.
 _MAX_RETRY_PER_PRODUCT = 2
 
@@ -351,7 +361,7 @@ def _run_batch(batch_key: str, resume: bool = False) -> None:
             run = session.exec(
                 select(BatchRun).where(BatchRun.batch_key == batch_key)).first()
             proj = session.get(Project, pid)
-            if proj is not None:
+            if proj is not None and not getattr(proj, "deleted_at", None):
                 name = proj.name
                 suno_idea = proj.suno_idea or ""
                 # Chốt lại cấu hình an toàn cho từng project (phòng khi bị đổi).
@@ -360,6 +370,14 @@ def _run_batch(batch_key: str, resume: bool = False) -> None:
                 proj.auto_upload = True
                 session.add(proj)
                 session.commit()
+            if proj is None or getattr(proj, "deleted_at", None):
+                # Project đã bị người dùng xoá (hoặc chuyển vào Thùng rác) giữa
+                # lô → bỏ qua, không chạy Suno cho project đó.
+                _touch(session, run, current_index=idx, current_project_id=pid,
+                       failed=run.failed + 1,
+                       message=f"Sản phẩm {idx + 1}/{len(project_ids)}: project #{pid} "
+                               "đã bị xoá — bỏ qua.")
+                continue
             _touch(session, run, current_index=idx, current_project_id=pid,
                    message=f"Sản phẩm {idx + 1}/{len(project_ids)}: «{name}» — bắt đầu Suno.")
 
@@ -411,7 +429,7 @@ def _run_batch(batch_key: str, resume: bool = False) -> None:
                     break
             if outcome == "cancelled":
                 break
-            if phase in _HARD_STOP:
+            if _needs_human(phase, detail):
                 break                   # cần người — không thử lại
             attempt += 1
             if attempt > _MAX_RETRY_PER_PRODUCT:
@@ -437,7 +455,7 @@ def _run_batch(batch_key: str, resume: bool = False) -> None:
                 _touch(session, run, message=f"Đã huỷ ở sản phẩm {idx + 1}.")
                 _finish(batch_key, "cancelled", f"Đã huỷ lô ở sản phẩm {idx + 1}.")
                 return
-            elif phase in _HARD_STOP or acct:
+            elif _needs_human(phase, detail) or acct:
                 # Đăng nhập/credit/pause/Flow chặn tài khoản: sản phẩm kế cũng hỏng
                 # y hệt (lại còn đốt credit Suno) ⇒ dừng lô, chờ người xử lý rồi resume.
                 _touch(session, run, failed=run.failed + 1,
@@ -477,7 +495,8 @@ def _has_youtube_draft(pid: int) -> bool:
     with Session(engine) as session:
         rows = session.exec(
             select(YoutubeUpload).where(YoutubeUpload.project_id == pid)).all()
-    return any((r.status or "") == "draft" for r in rows)
+    return any((r.status or "") == "draft"
+               and not (r.video_path or "").endswith("short.mp4") for r in rows)
 
 
 def _chain_busy() -> bool:

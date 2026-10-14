@@ -243,7 +243,9 @@ class SunoFormTests(unittest.TestCase):
         styles, excl, problems = suno_prompt.compose_form_styles(_form(), spec, genre)
         self.assertEqual(problems, [])
         self.assertIn("Tempo: 88 BPM", styles)            # 120 kẹp vào 68–88
-        self.assertIn("Chord progression: Fmaj7 – Dm9 – Bbmaj7 – C7", styles)
+        self.assertIn("Harmony on the piano: Fmaj7 – Dm9 – Bbmaj7 – C7", styles)
+        self.assertTrue(styles.startswith("Lead: solo felt piano"))   # lead đứng đầu
+        self.assertNotIn("Rhodes", styles)                # piano mộc: không thêm piano điện
         self.assertTrue(styles.endswith("Purely instrumental, no vocals."))
         self.assertLessEqual(len(styles), suno_prompt.BASE_STYLES_MAX_CHARS)
         terms = [t.strip().lower() for t in excl.split(",")]
@@ -352,9 +354,13 @@ class NoPianoLeakTests(unittest.TestCase):
             self.assertNotIn("rhodes", text)
             self.assertNotIn("piano", text)
 
-    def test_piano_project_keeps_rhodes_accent(self):
-        self.assertIn("soft Rhodes chord pads",
-                      music_spec.accents_for(self.lofi["accents"], self.piano))
+    def test_genre_accents_are_ambience_only(self):
+        flute = music_spec.find_instrument("Bamboo Flute")
+        for g in music_spec.GENRES:
+            for inst in (self.piano, flute, self.guitar):
+                self.assertEqual(music_spec.accents_for(g["accents"], inst), g["accents"],
+                                 (g["key"], inst["key"]))
+        self.assertIn("electric piano", music_spec.leak_exclusions(self.piano))
 
     def test_rules_forbid_other_melodic_instruments(self):
         rules = music_spec.suno_rules(self.guitar, self.lofi)
@@ -378,7 +384,73 @@ class NoPianoLeakTests(unittest.TestCase):
     def test_flute_family_is_own_for_shakuhachi(self):
         spec = music_spec.find_instrument("Shakuhachi")
         self.assertEqual(music_spec.competing_instruments("breathy bamboo flute", spec), [])
-        self.assertEqual(music_spec.leak_exclusions(self.piano), [])
+        self.assertNotIn("flute", music_spec.leak_exclusions(spec))
+        self.assertNotIn("piano", music_spec.leak_exclusions(self.piano))
+        # Mô tả âm sắc "bell-like" không phải nhạc cụ thứ hai.
+        self.assertEqual(music_spec.competing_instruments("bell-like tone", spec), [])
+
+
+class LeadFirstFormTests(unittest.TestCase):
+    """2026-10-08 (đo PANNs): project sáo trúc lẫn harp/guitar/piano vì prompt gửi
+    'Chord progression' cho nhạc cụ ĐƠN ÂM + màu đệm chuông/bát + genre 'Chinese'."""
+
+    def setUp(self):
+        self.flute = music_spec.find_instrument("Bamboo Flute")
+        self.zen = music_spec.find_genre("Chinese Zen Music")
+        self.data = {"genre": "Chinese traditional zen meditation", "mood": "serene, airy",
+                     "lead": "solo Chinese bamboo flute, breathy tone",
+                     "support": "wind ambience, distant temple bell, soft singing-bowl, "
+                                "mountain stream", "bpm": 58, "groove": "free-flowing rubato",
+                     "key": "G major pentatonic", "progression": ["G", "A", "D", "E"],
+                     "melody": "gentle rising thirds", "structure": "misty intro, theme, outro",
+                     "mix": "long reverb, airy high end"}
+
+    def test_monophonic_lead_gets_no_chords(self):
+        styles, excl, problems = suno_prompt.compose_form_styles(self.data, self.flute, self.zen)
+        self.assertEqual(problems, [])
+        self.assertNotIn("Chord progression", styles)
+        self.assertNotIn("G – A – D – E", styles)
+        self.assertIn("Harmony: a single faint low drone beneath the bamboo flute", styles)
+        self.assertIn("The bamboo flute alone carries the melody", styles)
+        self.assertTrue(styles.startswith("Lead: solo Chinese bamboo flute"))
+        # Không cần vòng hợp âm → progression rỗng vẫn hợp lệ.
+        self.assertEqual(suno_prompt.compose_form_styles(
+            {**self.data, "progression": []}, self.flute, self.zen)[2], [])
+
+    def test_tuned_accents_and_nationality_dropped(self):
+        styles, excl, _ = suno_prompt.compose_form_styles(self.data, self.flute, self.zen)
+        low = styles.lower()
+        self.assertNotIn("temple bell", low)
+        self.assertNotIn("singing-bowl", low)
+        self.assertIn("Zen meditation, serene", styles)
+        self.assertNotIn("traditional", low)
+        terms = [t.strip() for t in excl.split(",")]
+        for t in ("piano", "guitar", "harp", "guzheng", "bells", "vocals", "drums"):
+            self.assertIn(t, terms)
+        self.assertNotIn("flute", terms)
+        self.assertLessEqual(len(terms), 22)
+
+    def test_plan_repeats_lead_and_transposes_harmony(self):
+        piano = music_spec.find_instrument("Piano")
+        styles, excl, _ = suno_prompt.compose_form_styles(_form(), piano,
+                                                          music_spec.find_genre("Lofi"))
+        plan = suno_prompt.build_suno_prompt_plan(styles, excl, 3, music_style="Lofi",
+                                                  instrument="Piano")
+        self.assertIn("Harmony on the piano: Gmaj7 – Em9 – Cmaj7 – D7", plan[1]["styles"])
+        self.assertTrue(plan[0]["variation"].startswith("The piano opens the motif"))
+
+    def test_restyle_from_v1_roundtrip(self):
+        v1 = ("Chinese zen meditation, serene, airy. Lead: solo Chinese bamboo flute, breathy "
+              "tone. Support: wind ambience, distant temple bell. Tempo: 58 BPM, free-flowing "
+              "rubato. Key: G major pentatonic. Chord progression: G – A – D – E. Melody: "
+              "rising thirds. Structure: intro, theme, outro. Mix: long reverb. Purely "
+              "instrumental, no vocals. Signature: soft thirds.")
+        d = suno_prompt.restyle_from_v1(v1)
+        self.assertEqual((d["genre"], d["bpm"], d["groove"], d["key"]),
+                         ("Chinese zen meditation", 58, "free-flowing rubato", "G major pentatonic"))
+        self.assertEqual(d["progression"], ["G", "A", "D", "E"])
+        self.assertEqual(d["tail"], "Signature: soft thirds.")
+        self.assertEqual(suno_prompt.compose_form_styles(d, self.flute, self.zen)[2], [])
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """
 video/service.py — Điều phối pipeline Video:
   0) Chuẩn bị hồ sơ chung + prompt đầy đủ và kiểm tra chống trùng.
-  1) Tạo 3 ảnh (Gemini): 0 = thumbnail, 1 = bảng phân tích nhân vật chính,
+  1) Tạo 3 ảnh (Muse.ai, dự phòng Gemini): 0 = thumbnail, 1 = bảng phân tích nhân vật chính,
      2 = bảng phân tích linh thú.
   2) Tạo config.PARAMS.total_clips clip (Flow): MỌI clip nạp ảnh 1 + ảnh 2 làm
      nguyên liệu, chỉ khác prompt bối cảnh.
@@ -15,6 +15,7 @@ Chạy trong worker thread (Playwright sync API + ffmpeg).
 from __future__ import annotations
 import json
 import random
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -146,11 +147,11 @@ def step_images(project_id: int,
                 project_name: str | None = None,
                 idea: str | None = None,
                 style_key: str | None = None) -> list[str]:
-    # Tạo ảnh bằng Gemini web (model 3.1 Pro - tư duy mở rộng).
+    # Tạo ảnh bằng Muse.ai (mặc định); Muse hỏng → tự chuyển Gemini web vẽ lại
+    # toàn bộ (_generate_images).
     # mode="resume": bỏ qua ảnh đã có, chỉ tạo ảnh còn thiếu.
     # idea: ý tưởng người dùng → Claude viết prompt bám theo (đồng bộ nhân vật).
     # style_key: "2d"/"3d" → quyết định phong cách ép vào mọi prompt ảnh.
-    from .gemini_driver import generate_images
     style_key = config.normalize_style(style_key)
     prompts_override = _resolve_prompts(project_id, project_name, idea,
                                         progress_cb, style_key,
@@ -158,9 +159,67 @@ def step_images(project_id: int,
     # Ảnh 0 giữ SẠCH (không chữ). Tiêu đề chỉ overlay ở bước ghép video
     # (step_assemble) lên clip intro + thumbnail.png — tránh chữ nướng sẵn bị
     # Veo tạo lại thành bóng ma/chồng chéo với overlay ghép.
-    return generate_images(project_id, topic, config.PARAMS, progress_cb,
-                           resume=(mode == "resume"), project_name=project_name,
-                           prompts_override=prompts_override, style=style_key)
+    return _generate_images(project_id, topic, progress_cb,
+                            resume=(mode == "resume"), project_name=project_name,
+                            prompts_override=prompts_override, style=style_key)
+
+
+def _generate_images(project_id: int, topic: str,
+                     progress_cb: Callable[[str, float], None], *,
+                     resume: bool = False, project_name: str | None = None,
+                     prompts_override: Optional[dict] = None,
+                     style: str | None = None,
+                     only: Optional[list[int]] = None) -> list[str]:
+    """Tạo ảnh bằng máy chính (config.image_engine — mặc định Muse.ai). Máy chính
+    hỏng (hết lượt ảnh / lỗi máy chủ / bộ lọc / mất đăng nhập) → TỰ chuyển máy dự
+    phòng (Gemini) vẽ lại TOÀN BỘ ảnh TỪ ĐẦU (1 → 2 → 0, cùng bộ prompt) để cả bộ
+    đồng nhất một máy, rồi chuỗi đi tiếp clip → ghép → nháp YouTube → Short
+    (yêu cầu người dùng 2026-10-07, đảo Muse chính 2026-10-08). Tạo lại 1 ảnh lẻ
+    (only) → máy dự phòng chỉ vẽ ảnh đó."""
+    from .job_manager import JobCancelled
+    kw = dict(resume=resume, project_name=project_name,
+              prompts_override=prompts_override, style=style, only=only)
+
+    def _run(engine: str) -> list[str]:
+        if engine == "muse":
+            from .muse_image import generate_images_muse
+            return generate_images_muse(project_id, topic, config.PARAMS, progress_cb, **kw)
+        from .gemini_driver import generate_images
+        return generate_images(project_id, topic, config.PARAMS, progress_cb, **kw)
+
+    main = config.image_engine()
+    backup = config.image_fallback_engine()
+    main_l, backup_l = config.image_engine_label(main), config.image_engine_label(backup)
+    try:
+        return _run(main)
+    except JobCancelled:
+        raise
+    except (ValueError, FileNotFoundError):
+        raise              # lỗi bộ prompt/dữ liệu — máy dự phòng cũng sẽ hỏng y hệt
+    except Exception as e:
+        if not config.image_fallback():
+            raise
+        err1 = " ".join(str(e).split())[:300]
+        if only is None:
+            kw["resume"] = False           # vẽ lại TOÀN BỘ từ đầu bằng máy dự phòng
+        what = (f"ảnh {sorted(only)}" if only is not None
+                else "TOÀN BỘ ảnh từ đầu (1 → 2 → 0)")
+        progress_cb(f"{main_l} không tạo được ảnh — «{err1[:160]}» → chuyển sang "
+                    f"{backup_l} vẽ lại {what}…", 1.0)
+        try:
+            log = config.images_dir(project_id, project_name) / "_image_fallback.log"
+            with log.open("a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {main_l} lỗi → "
+                        f"{backup_l} ({what}): {err1}\n")
+        except Exception:
+            pass
+        try:
+            return _run(backup)
+        except JobCancelled:
+            raise
+        except Exception as e2:
+            raise RuntimeError(f"{' '.join(str(e2).split())} || (Trước đó {main_l} lỗi: "
+                               f"{err1[:200]})") from e2
 
 
 def _clip_generator():
@@ -257,11 +316,10 @@ def regen_image(project_id: int,
                 style_key: str | None = None) -> list[str]:
     """Tạo lại ĐÚNG 1 ảnh (ghi đè), GIỮ NGUYÊN mọi ảnh khác. Dùng lại prompt đã
     lưu để nhân vật/bối cảnh vẫn khớp cả bộ."""
-    from .gemini_driver import generate_images
     style_key = config.normalize_style(style_key)
     prompts_override = _validate_saved_workflow(project_id, project_name)["prompts"]
-    return generate_images(
-        project_id, (project_name or "Healing"), config.PARAMS, progress_cb,
+    return _generate_images(
+        project_id, (project_name or "Healing"), progress_cb,
         project_name=project_name, prompts_override=prompts_override,
         style=style_key, only=[int(index)])
 
@@ -437,7 +495,7 @@ def retitle_video(project_id: int,
                   style_key: str | None = None,
                   regen_cover: bool = False) -> dict:
     """Sau khi ĐỔI TÊN project: cập nhật chữ tiêu đề trên thumbnail + intro.
-    regen_cover=True: tạo lại ảnh bìa (ảnh 0, Gemini) + clip intro 00 (Flow)
+    regen_cover=True: tạo lại ảnh bìa (ảnh 0) + clip intro 00
     trước — prompt đã khoá giữ nguyên nên nhân vật/bối cảnh vẫn khớp cả bộ.
     Rồi vẽ lại final/thumbnail.png và (nếu đủ clip + nhạc) ghép lại final.mp4
     để chữ ở intro là tên mới. KHÔNG tự đăng YouTube (bấm «Đăng nháp» sau)."""
@@ -447,7 +505,7 @@ def retitle_video(project_id: int,
     out: dict = {"regen_cover": bool(regen_cover)}
     lo = 1.0
     if regen_cover:
-        progress_cb("Tạo lại ảnh bìa (ảnh 0) bằng Gemini…", 1.0)
+        progress_cb(f"Tạo lại ảnh bìa (ảnh 0) bằng {config.image_engine_label()}…", 1.0)
         regen_image(project_id, scaled(1.0, 35.0), 0, project_name, style_key)
         progress_cb(f"Tạo lại clip intro 00 ({clip_engine_label()})…", 35.0)
         regen_clip(project_id, scaled(35.0, 70.0), 0, project_name, style_key)
@@ -534,6 +592,148 @@ def run_video_from_images(project_id: int,
     return result
 
 
+# ── Chạy tiếp chu trình sau gián đoạn ──────────────────────────────
+# «Tạo tiếp ảnh thiếu» / «Tạo tiếp clip thiếu»: làm phần còn thiếu rồi đi TIẾP
+# cả chuỗi Ghép video → Đăng nháp YouTube → Đăng nháp Short. Bước nào đã xong
+# (final.mp4 mới hơn clip + nhạc; đã có nháp cho final.mp4 này) thì bỏ qua.
+
+def _final_up_to_date(project_id: int, project_name: str | None,
+                      audio: str) -> bool:
+    final = config.final_dir(project_id, project_name) / "final.mp4"
+    if not final.exists():
+        return False
+    clip_dir = config.clips_dir(project_id, project_name)
+    srcs = [clip_dir / f"clip_{i:02d}.mp4" for i in range(config.PARAMS.total_clips)]
+    srcs.append(Path(audio))
+    try:
+        newest = max(p.stat().st_mtime for p in srcs if p.exists())
+    except ValueError:
+        return False
+    return final.stat().st_mtime >= newest
+
+
+def _draft_done_since(project_id: int, since_ts: float, shorts: bool) -> bool:
+    """Đã có bản nháp (video dài hoặc Short) tạo SAU mốc since_ts chưa."""
+    from datetime import datetime, timezone
+    con = _db()
+    try:
+        rows = con.execute(
+            "SELECT created_at FROM youtubeupload WHERE project_id=? AND status='draft' AND "
+            + ("video_path LIKE '%short.mp4'" if shorts
+               else "video_path NOT LIKE '%short.mp4'"), (project_id,)).fetchall()
+    except Exception:
+        return False
+    finally:
+        con.close()
+    for r in rows:
+        try:
+            t = datetime.fromisoformat(r["created_at"])
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            if t.timestamp() >= since_ts:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _continue_chain(project_id: int, progress_cb: Callable[[str, float], None],
+                    project_name: str | None, lo: float) -> dict:
+    """Ghép (nếu cần) → nháp YouTube (nếu chưa) → nháp Short (nếu bật & chưa).
+    Đăng nháp chạy KỂ CẢ khi project tắt auto_upload (người dùng đã bấm chạy tiếp).
+    Lỗi đăng nháp chỉ báo qua progress, không làm hỏng video đã ghép."""
+    from . import shorts
+    from .job_manager import JobCancelled
+
+    def scaled(a, b):
+        return lambda m, p: progress_cb(m, a + (p / 100.0) * (b - a))
+
+    audio = find_latest_audio(project_id, project_name)
+    if not audio:
+        progress_cb("Đủ clip nhưng chưa có nhạc nền — mix Audio rồi bấm "
+                    "«Tạo tiếp clip thiếu» để chạy tiếp (ghép → nháp YouTube → Short).", 100.0)
+        return {"assembled": False, "reason": "no_audio"}
+
+    result: dict = {}
+    if _final_up_to_date(project_id, project_name, audio):
+        progress_cb("final.mp4 đã ghép từ đúng clip + nhạc hiện tại — bỏ qua bước ghép.", 85.0)
+        result["assembled"] = "skipped"
+    else:
+        progress_cb("Ghép video + gắn nhạc", lo)
+        res = step_assemble(project_id, scaled(lo, 85.0), project_name=project_name)
+        result = res if isinstance(res, dict) else {}
+        result["assembled"] = True
+
+    final = config.final_dir(project_id, project_name) / "final.mp4"
+    final_ts = final.stat().st_mtime
+    fields = _read_project_fields(project_id)
+
+    def _try(label: str, fn) -> bool:
+        try:
+            result[label] = fn()
+            return True
+        except JobCancelled:
+            raise
+        except Exception as e:
+            result[f"{label}_error"] = f"{type(e).__name__}: {e}"
+            progress_cb(f"{'Đăng nháp YouTube' if label == 'upload' else 'Short'} lỗi "
+                        f"(video ĐÃ ghép xong): {result[f'{label}_error']}", 100.0)
+            return False
+
+    if _draft_done_since(project_id, final_ts, shorts=False):
+        progress_cb("Đã có bản nháp YouTube cho final.mp4 này — bỏ qua đăng lại.", 90.0)
+    else:
+        progress_cb("Chạy tiếp: đăng nháp lên YouTube…", 86.0)
+        if not _try("upload", lambda: step_upload_youtube(
+                project_id, scaled(86.0, 95.0), project_name,
+                fields.get("instrument"), fields.get("music_style"))):
+            return result
+
+    if not shorts.settings()["auto_short"]:
+        progress_cb("Hoàn thành (tự tạo Short đang tắt).", 100.0)
+        return result
+    if _draft_done_since(project_id, final_ts, shorts=True):
+        progress_cb("Đã có nháp Short cho final.mp4 này — hoàn thành.", 100.0)
+        return result
+    progress_cb("Chạy tiếp: tạo & đăng nháp YouTube Short…", 95.0)
+    if _try("short", lambda: step_upload_short(
+            project_id, scaled(95.0, 100.0), project_name,
+            fields.get("instrument"), fields.get("music_style"))):
+        progress_cb("Hoàn thành chu trình: video → nháp YouTube → nháp Short.", 100.0)
+    return result
+
+
+def continue_from_images(project_id: int,
+                         progress_cb: Callable[[str, float], None],
+                         topic: str,
+                         project_name: str | None = None,
+                         idea: str | None = None,
+                         style_key: str | None = None) -> dict:
+    """«Tạo tiếp ảnh thiếu»: ảnh thiếu → clip thiếu → ghép → nháp YouTube → Short."""
+    def scaled(a, b):
+        return lambda m, p: progress_cb(m, a + (p / 100.0) * (b - a))
+    style_key = config.normalize_style(style_key)
+    progress_cb("Chạy tiếp: tạo ảnh còn thiếu", 1.0)
+    step_images(project_id, scaled(1.0, 25.0), topic, mode="resume",
+                project_name=project_name, idea=idea, style_key=style_key)
+    progress_cb(f"Chạy tiếp: tạo clip còn thiếu ({clip_engine_label()})", 25.0)
+    step_clips(project_id, scaled(25.0, 75.0), mode="resume",
+               project_name=project_name, style_key=style_key)
+    return _continue_chain(project_id, progress_cb, project_name, 75.0)
+
+
+def continue_from_clips(project_id: int,
+                        progress_cb: Callable[[str, float], None],
+                        project_name: str | None = None,
+                        style_key: str | None = None) -> dict:
+    """«Tạo tiếp clip thiếu»: clip thiếu → ghép → nháp YouTube → Short."""
+    style_key = config.normalize_style(style_key)
+    progress_cb(f"Chạy tiếp: tạo clip còn thiếu ({clip_engine_label()})", 1.0)
+    step_clips(project_id, lambda m, p: progress_cb(m, 1.0 + p * 0.74),
+               mode="resume", project_name=project_name, style_key=style_key)
+    return _continue_chain(project_id, progress_cb, project_name, 75.0)
+
+
 # ── Đăng nháp YouTube qua GPMLogin ──────────────────────────────
 
 def _db():
@@ -613,12 +813,16 @@ def _read_project_fields(project_id: int) -> dict:
     return dict(row) if row else {}
 
 
-def _past_titles(profile_id: str, limit: int = 20) -> list[str]:
+def _past_titles(profile_id: str, limit: int = 20,
+                 shorts: bool = False) -> list[str]:
+    """Title đã đăng của kênh — video dài và Short tách riêng (Short = short.mp4)."""
     con = _db()
     try:
         rows = con.execute(
-            "SELECT title FROM youtubeupload WHERE profile_id=? "
-            "ORDER BY id DESC LIMIT ?", (profile_id, limit)
+            "SELECT title FROM youtubeupload WHERE profile_id=? AND "
+            + ("video_path LIKE '%short.mp4'" if shorts
+               else "video_path NOT LIKE '%short.mp4'")
+            + " ORDER BY id DESC LIMIT ?", (profile_id, limit)
         ).fetchall()
     except Exception:
         return []
@@ -694,35 +898,14 @@ def step_upload_youtube(project_id: int,
     if not final.exists():
         raise RuntimeError("Chưa có final.mp4 — hãy render video trước khi đăng.")
 
-    # Track lẻ + khung thời gian của bản mix dùng làm nhạc nền → đưa vào mô tả
-    # dưới dạng chapters (tên track do bước Mix tự đặt).
+    # Mô tả YouTube KHÔNG kèm tracklist/mốc thời gian (yêu cầu người dùng
+    # 2026-10-07) — chỉ phần AI viết + hashtag.
     meta_warnings: list[str] = []
-    audio = find_latest_audio(project_id, project_name)
-    tracklist = youtube_meta.load_tracklist(audio)
-    if not tracklist:
-        meta_warnings.append(
-            "Không có dữ liệu track lẻ cho nhạc nền "
-            f"({Path(audio).name if audio else 'không rõ file'}) — mô tả thiếu "
-            "tracklist. Chỉ bản mix render từ tab Audio mới có mốc thời gian.")
-    else:
-        # Bản mix mới hơn video đã render ⇒ mốc thời gian sẽ LỆCH. Thà thiếu
-        # tracklist còn hơn ghi sai giờ.
-        try:
-            gap = abs(probe_duration(str(final)) - probe_duration(audio))
-        except Exception:
-            gap = 0.0
-        if gap > 5.0:
-            tracklist = []
-            meta_warnings.append(
-                f"Bỏ tracklist: nhạc nền mới nhất ({Path(audio).name}) lệch "
-                f"{gap:.0f} giây so với final.mp4 — mốc thời gian sẽ sai. "
-                "Hãy render lại video từ đúng bản mix.")
 
     # Metadata (AI vision + bộ nhớ chống trùng)
     progress_cb("AI viết tiêu đề & mô tả từ thumbnail…", 10.0)
     api_config = get_api_config_from_db(str(DB_PATH))
     meta = youtube_meta.generate_metadata(
-        tracklist=tracklist,
         thumbnail_path=str(thumb),
         channel_name=mapping.get("channel_name", ""),
         instrument=instrument, music_style=music_style,
@@ -767,6 +950,7 @@ def step_upload_youtube(project_id: int,
         raise
 
     _record_upload(project_id, mapping, meta, str(final), status="draft")
+    _save_long_draft_info(out_dir, meta["title"], result.get("video_url") or "")
     warns = meta_warnings + (result.get("warnings") or [])
     msg = "Đã lưu bản nháp trên YouTube."
     if warns:
@@ -774,7 +958,118 @@ def step_upload_youtube(project_id: int,
     progress_cb(msg, 100.0)
     return {"status": "draft", "title": meta["title"],
             "channel_name": mapping.get("channel_name", ""),
+            "video_url": result.get("video_url") or "",
             "warnings": warns}
+
+
+_LONG_DRAFT_INFO = "youtube_draft.json"
+
+
+def _save_long_draft_info(out_dir: Path, title: str, url: str) -> None:
+    """Ghi title + link bản nháp video dài → Short dẫn link về bản đầy đủ."""
+    from datetime import datetime, timezone
+    try:
+        (out_dir / _LONG_DRAFT_INFO).write_text(json.dumps(
+            {"title": title, "url": url,
+             "at": datetime.now(timezone.utc).isoformat()},
+            ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_long_draft_info(out_dir: Path) -> dict:
+    try:
+        return json.loads((out_dir / _LONG_DRAFT_INFO).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def step_upload_short(project_id: int,
+                      progress_cb: Callable[[str, float], None],
+                      project_name: str | None = None,
+                      instrument: str | None = None,
+                      music_style: str | None = None) -> dict:
+    """Cắt 1 đoạn DỌC ở GIỮA final.mp4 → short.mp4 (1080×1920 + hook chữ), AI
+    viết nội dung ngắn, rồi đăng NHÁP lên CÙNG kênh với video dài. KHÔNG publish."""
+    from backend.core_bridge import get_api_config_from_db
+    from backend.database import DB_PATH
+    from . import gpm_client as gpmc
+    from . import shorts, youtube_meta, youtube_driver
+
+    fields = _read_project_fields(project_id)
+    instrument = (instrument if instrument is not None else fields.get("instrument")) or ""
+    music_style = (music_style if music_style is not None else fields.get("music_style")) or ""
+    project_name = project_name or fields.get("name")
+    progress_cb("Chuẩn bị YouTube Short…", 1.0)
+    mapping = _lookup_channel_mapping(instrument, music_style)
+    if not mapping or not mapping.get("gpm_profile_id"):
+        raise RuntimeError(
+            f"Chưa cấu hình kênh cho nhạc cụ '{instrument}' + phong cách "
+            f"'{music_style}' — không biết đăng Short lên kênh nào.")
+    profile_id = mapping["gpm_profile_id"]
+
+    out_dir = config.final_dir(project_id, project_name)
+    final = out_dir / "final.mp4"
+    if not final.exists():
+        raise RuntimeError("Chưa có final.mp4 — hãy render video trước khi tạo Short.")
+
+    audio = find_latest_audio(project_id, project_name)
+    tracklist = youtube_meta.load_tracklist(audio)
+    try:
+        if tracklist and abs(probe_duration(str(final)) - probe_duration(audio)) > 5.0:
+            tracklist = []        # bản mix khác video → mốc bài sai, lấy giữa video
+    except Exception:
+        tracklist = []
+
+    long_info = _load_long_draft_info(out_dir)
+    built = shorts.build_short(
+        str(final), out_dir, tracklist,
+        channel_name=mapping.get("channel_name", ""),
+        instrument=instrument, music_style=music_style,
+        long_title=long_info.get("title") or project_name or "",
+        past_titles=_past_titles(profile_id, shorts=True),
+        api_config=get_api_config_from_db(str(DB_PATH)),
+        progress_cb=lambda m, p: progress_cb(m, 1.0 + p * 0.5),
+        project_id=project_id,
+    )
+    meta = dict(built["meta"])
+    meta["description"] = shorts.compose_description(
+        meta, mapping.get("channel_name", ""), long_info.get("url") or "")
+    progress_cb(f"Short: «{meta['title']}»", 18.0)
+
+    base_url, exe_path = _read_gpm_settings_db()
+    client = gpmc.GPMClient(base_url or None)
+    try:
+        client.ensure_app_running(exe_path)
+    except gpmc.GPMError as e:
+        progress_cb(f"(Bỏ qua tự mở app: {e})", 20.0)
+
+    def _do_upload(cdp: str) -> dict:
+        progress_cb("Đăng NHÁP Short lên YouTube Studio…", 22.0)
+        return youtube_driver.upload_draft(
+            cdp_endpoint=cdp, video_path=built["path"],
+            title=meta["title"], description=meta["description"],
+            hashtags=meta["hashtags"],
+            language=mapping.get("language", "en-US"),
+            thumbnail_path=None,          # Short: YouTube tự chọn khung hình
+            progress_cb=lambda m, p: progress_cb(m, 22.0 + (p / 100.0) * 76.0),
+            log=lambda m: progress_cb(m, 24.0),
+            expected_channel=mapping.get("channel_name", ""),
+        )
+
+    try:
+        result = _upload_with_gpm_retry(client, profile_id, _do_upload, progress_cb)
+    except Exception as e:
+        _record_upload(project_id, mapping, meta, built["path"],
+                       status="failed", error=f"{type(e).__name__}: {e}")
+        raise
+    _record_upload(project_id, mapping, meta, built["path"], status="draft")
+    warns = result.get("warnings") or []
+    progress_cb("Đã lưu NHÁP YouTube Short." +
+                (" Lưu ý: " + " | ".join(warns) if warns else ""), 100.0)
+    return {"status": "draft", "title": meta["title"], "hook": meta["hook"],
+            "path": built["path"], "video_url": result.get("video_url") or "",
+            "channel_name": mapping.get("channel_name", ""), "warnings": warns}
 
 
 def _upload_with_gpm_retry(client, profile_id: str,
@@ -812,13 +1107,47 @@ def _upload_with_gpm_retry(client, profile_id: str,
             raise
         finally:
             client.close_profile(profile_id)
+        # GPMLogin có lúc mất dấu Chrome cũ của profile (vẫn giữ khoá thư mục) →
+        # Chrome mới thoát ngay, cổng debug không mở. Dọn tiến trình sót rồi mới bật lại.
+        kill = getattr(client, "kill_leftover_browsers", None)
+        if kill:
+            n = kill(profile_id)
+            if n:
+                progress_cb(f"Đã tắt {n} tiến trình Chrome sót của profile GPMLogin "
+                            f"(GPM đóng không sạch) — bật lại…", 22.0)
         if i < attempts:
             sleep(pause_sec)     # GPMLogin giải phóng profile chậm sau khi stop
     raise RuntimeError(
         f"{last} — đã đóng/bật lại profile {attempts} lần vẫn không nối được. "
         f"Hãy mở GPMLogin, bấm «Mở» profile này 1 lần xem trình duyệt có lên "
         f"không (lỗi proxy/nhân trình duyệt/profile hỏng), đóng nó lại rồi bấm "
-        f"«Đăng nháp YouTube» lần nữa. Video đã dựng xong, không mất gì.")
+        f"«Đăng nháp YouTube» lần nữa (nếu GPMLogin báo profile đang mở mà không "
+        f"thấy cửa sổ: tắt hẳn GPMLogin rồi mở lại). Video đã dựng xong, không mất gì.")
+
+
+def step_upload_youtube_and_short(project_id: int,
+                                  progress_cb: Callable[[str, float], None],
+                                  project_name: str | None = None,
+                                  instrument: str | None = None,
+                                  music_style: str | None = None) -> dict:
+    """Nút «Đăng nháp YouTube»: nháp video dài, xong thì tự nháp Short (nếu bật
+    auto_short). Short lỗi KHÔNG làm hỏng kết quả video dài."""
+    from . import shorts
+    res = step_upload_youtube(project_id, progress_cb, project_name,
+                              instrument, music_style)
+    if shorts.settings()["auto_short"]:
+        try:
+            progress_cb("Tự động tạo & đăng nháp YouTube Short…", 100.0)
+            res["short"] = step_upload_short(project_id, progress_cb, project_name,
+                                             instrument, music_style)
+        except Exception as e:
+            from .job_manager import JobCancelled
+            if isinstance(e, JobCancelled):
+                raise
+            res["short_error"] = f"{type(e).__name__}: {e}"
+            progress_cb(f"Auto Short lỗi (video dài ĐÃ lưu nháp): "
+                        f"{res['short_error']}", 100.0)
+    return res
 
 
 def _maybe_auto_upload(project_id: int,
@@ -836,3 +1165,15 @@ def _maybe_auto_upload(project_id: int,
     except Exception as e:
         progress_cb(f"Auto-upload YouTube lỗi (video ĐÃ render xong, bỏ qua "
                     f"đăng nháp): {type(e).__name__}: {e}", 100.0)
+        return
+    # Nháp video dài xong → tự cắt & đăng nháp Short (tắt: auto_short=false).
+    from . import shorts
+    if not shorts.settings()["auto_short"]:
+        return
+    try:
+        progress_cb("Tự động tạo & đăng nháp YouTube Short…", 100.0)
+        step_upload_short(project_id, progress_cb, project_name,
+                          fields.get("instrument"), fields.get("music_style"))
+    except Exception as e:
+        progress_cb(f"Auto Short lỗi (video dài ĐÃ lưu nháp): "
+                    f"{type(e).__name__}: {e}", 100.0)

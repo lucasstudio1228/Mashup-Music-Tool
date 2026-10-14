@@ -28,6 +28,7 @@ import re
 from typing import Optional
 
 from . import music_spec
+from .footwear_safety import mentions_bare_feet, sanitize_data
 from .translate import TranslationError, non_english_fields, to_english
 
 # Số clip (= số bối cảnh) mặc định nếu caller không truyền. Giữ khớp
@@ -608,6 +609,10 @@ Design a chill / relaxing / meditation "{medium}" consisting of:
    otherwise): the main character is a peaceful ADULT (25+), never a child or
    teenager, never a real or famous person; NO blood, injury, fire or smoke;
    no brand, studio or artist names.
+   FOOTWEAR: the main character ALWAYS wears simple footwear (sandals,
+   slippers, shoes or boots) — even if the idea says "barefoot", give them
+   simple woven straw sandals instead. Never write barefoot, bare feet, soles
+   or toes (the image model silently refuses bare-feet close-ups).
    WEAPONS follow the idea/description: if it describes a warrior, guardian,
    archer, samurai… with a weapon, KEEP that weapon exactly as described
    (sword, bow, spear, staff…), consistent in every scene; if it describes
@@ -624,7 +629,7 @@ Return ONLY valid JSON (no explanation, no markdown):
   "character_sheet": "CONDENSED 60-100 word identity block of the MAIN CHARACTER ONLY: gender/age/ethnicity + face/hair/eyes/skin/height + EVERY outfit item with hex + worn accessories. NO instrument, NO hand-held object/prop/device, NO furniture, NO setting/action/lighting (the system adds the instrument separately)",
   "main_subject": "2-4 sentences so an artist can draw the main character turnaround (build, head-to-body ratio, EMPTY-HANDED relaxed standing pose with arms at the sides, demeanour) — no objects",
   "main_expressions": ["NEUTRAL — short description", "CALM — ...", "DETERMINED — ...", "JOYFUL — ..."],
-  "main_insets": ["UPPERCASE ENGLISH LABEL — detailed English description (5-8 items: hair & head accessories, face/eyes, hands (empty), upper-body outfit, lower-body outfit, footwear, worn accessories) — NO instrument, NO props"],
+  "main_insets": ["UPPERCASE ENGLISH LABEL — detailed English description (5-8 items: hair & head accessories, face/eyes, hands (empty), upper-body outfit, lower-body outfit, footwear (shoes/sandals/boots — never bare feet), worn accessories) — NO instrument, NO props"],
   "main_outfit": ["UPPERCASE PIECE NAME — material, colour + hex (3-7 items: every clothing piece and worn accessory, for the OUTFIT REFERENCE flat-lay)"],
   "instrument_detail": "1-2 sentences describing ONLY the instrument realistically (material, colour, real-world size, construction, ornament) — no person",
   "main_scale": "height & proportion note for the main character, e.g. 'HEIGHT 1.62 m — 6.5 heads tall'",
@@ -817,6 +822,10 @@ def generate_scene_prompts(
             last_reason = "OpenAI (prompt cảnh) trả về không phải JSON"
             _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — thử lại…")
             continue
+        if not mentions_bare_feet(character_sheet):
+            # Nhân vật mang dép (Gemini chặn ngầm ảnh chân trần) — cảnh không được
+            # tả lại chân trần. Hồ sơ cũ đã vẽ chân trần thì giữ nguyên cho khớp ảnh.
+            data = sanitize_data(data)
         bad = non_english_fields(data.get("scenes"))
         if bad:
             last_reason = f"prompt cảnh còn chữ không phải tiếng Anh ({', '.join(bad[:4])})"
@@ -1051,6 +1060,8 @@ def generate_prompts(
             last_reason = "trả về không phải JSON hợp lệ"
             _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — thử lại…")
             continue
+        # Chân trần → Gemini chặn ngầm bảng nhân vật («I encountered an error…»).
+        data = sanitize_data(data)
         bad = non_english_fields(data)
         if bad:
             last_reason = f"còn chữ không phải tiếng Anh ở {', '.join(bad[:4])}"
