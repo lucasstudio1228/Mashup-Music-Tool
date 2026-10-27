@@ -893,6 +893,9 @@ def _db():
     """Kết nối SQLite app.db (worker thread) — trả sqlite3.Connection."""
     import sqlite3
     from backend.database import DB_PATH
+    # Bản clone mới chưa có data/ → tạo thư mục để lỗi «no such table»
+    # rơi vào except của nơi gọi (trả mặc định) thay vì văng lỗi mở file.
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(DB_PATH))
     con.row_factory = sqlite3.Row
     return con
