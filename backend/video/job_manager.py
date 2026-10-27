@@ -17,6 +17,16 @@ class JobCancelled(Exception):
     """Ném từ progress callback khi user bấm Cancel → dừng job hợp tác."""
 
 
+def _reap_thread_browsers() -> None:
+    """Job đã xong mà luồng worker còn phiên Playwright sống = phiên RÒ → dọn
+    ngay, kẻo job sau (cùng luồng) lỗi «Sync API inside the asyncio loop»."""
+    try:
+        from .browser_base import reap_leaked_playwright
+        reap_leaked_playwright("job kết thúc")
+    except Exception:       # noqa: BLE001
+        pass
+
+
 @dataclass
 class VideoJob:
     project_id: int
@@ -130,6 +140,8 @@ class VideoJobManager:
             self._update(project_id, status="failed", error=detail)
             self._push(project_id, {"type": "error", "message": detail})
             self._push(project_id, {"type": "done", "status": "failed"})
+        finally:
+            _reap_thread_browsers()
 
     def _progress(self, project_id):
         ev = self._cancels.get(project_id)

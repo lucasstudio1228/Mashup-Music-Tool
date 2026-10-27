@@ -33,10 +33,44 @@ export function useVideoStyles(projectId: number) {
 
 export type ThumbnailFontOption = { key: string; label: string; note: string };
 
-// Font tiêu đề thumbnail + intro — lựa chọn CHUNG cho mọi project.
+// Công thức thumbnail riêng của project (bố cục/kiểu chữ/màu theo phong cách kênh).
+export type ThumbnailRecipeInfo = {
+  look: string;
+  look_label: string;
+  look_icon: string;
+  look_styles: string[];
+  layout: string;
+  treatment: string;
+  palette: string;
+  font: string;
+  font_auto: boolean;
+  shot: string;
+  light: string;
+  transition: string;
+  legacy: boolean;
+  subtitle: string;
+  // Chữ + style thumbnail do ChatGPT/model ảnh tự thiết kế (false = đã khoá font tay).
+  ai_text?: boolean;
+  ai_lettering?: string;
+  ai_lettering_label?: string;
+  ai_design?: string;
+  ai_design_label?: string;
+};
+
+export type ThumbnailFontsData = {
+  selected: string;
+  default: string;
+  auto: boolean;            // true = font tự chọn theo phong cách kênh
+  auto_font: string;        // font tự chọn (khi auto)
+  suggested: string[];      // font hợp phong cách kênh
+  recipe: ThumbnailRecipeInfo | null;
+  fonts: ThumbnailFontOption[];
+};
+
+// Font tiêu đề thumbnail + intro — RIÊNG từng project ("auto" = theo phong cách kênh).
 export function useThumbnailFonts(projectId: number) {
-  return useQuery<{ selected: string; default: string; fonts: ThumbnailFontOption[] }>({
-    queryKey: ["thumbnail-fonts"],
+  return useQuery<ThumbnailFontsData>({
+    queryKey: ["thumbnail-fonts", projectId],
     queryFn: async () => (await api.get(`${base(projectId)}/thumbnail-fonts`)).data,
   });
 }
@@ -100,6 +134,9 @@ export function useResumeVideo(projectId: number) {
 }
 
 export const useUploadYoutube = (pid: number) => useVideoAction(pid, "upload-youtube");
+// Body {engine: "chatgpt" | "ai" | "pil"} — "chatgpt" = ChatGPT web (tài khoản của bạn,
+// mặc định); "ai" tốn phí theo model ảnh (Cài đặt → Thumbnail AI); "pil" = chữ font.
+export const useMakeThumbnail = (pid: number) => useVideoAction(pid, "thumbnail");
 export const useUploadShort = (pid: number) => useVideoAction(pid, "upload-short");
 
 export type ShortSettings = { auto_short: boolean; seconds: number; crop_x: number; hook: boolean };
@@ -122,7 +159,7 @@ export function useSaveShortSettings(projectId: number) {
 export function useOpenVideoBrowser(projectId: number) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (site: "flow" | "gemini") =>
+    mutationFn: (site: "flow" | "gemini" | "chatgpt") =>
       api.post(`${base(projectId)}/open-browser`, null, { params: { site } }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["video", projectId] }),
   });

@@ -951,10 +951,19 @@ class SunoDriver:
     def _alert_human(self, msg: str, on_human: Optional[Callable[[str], None]],
                      beep: bool = False) -> None:
         self._log(msg)
-        try:
-            self.page.bring_to_front()
-        except Exception:
-            pass
+        if beep:
+            # Kéo CỬA SỔ Suno lên trên cùng (bỏ thu nhỏ) để người dùng tự tick
+            # captcha ngay — chỉ đưa cửa sổ lên, KHÔNG bấm gì vào captcha.
+            from .window_focus import raise_page_window
+            how = raise_page_window(self.page)
+            if how != "foreground":
+                self._log(f"Đưa cửa sổ Suno lên trước: {how} (Windows chặn chiếm "
+                          "tiêu điểm → nháy nút trên thanh tác vụ)")
+        else:
+            try:
+                self.page.bring_to_front()
+            except Exception:
+                pass
         if beep:
             try:
                 import winsound

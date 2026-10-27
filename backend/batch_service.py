@@ -90,7 +90,8 @@ _MAX_RETRY_PER_PRODUCT = 2
 
 # Lỗi Video ở mức TÀI KHOẢN (Flow/Gemini gắn cờ chống tự động hoá, hết hạn mức):
 # sản phẩm nào cũng sẽ hỏng y hệt ⇒ không "bỏ qua sang sản phẩm kế" (mỗi sản phẩm
-# kế lại đốt 15 credit Suno mà vẫn không ra video) — thử lại tại chỗ rồi DỪNG lô.
+# kế lại đốt 15 credit Suno mà vẫn không ra video) — DỪNG lô NGAY, cũng KHÔNG thử
+# lại tại chỗ (cờ bám theo profile, chạy lại chỉ làm nó bám chặt hơn).
 _ACCOUNT_BLOCK_MARKERS = ("hoạt động bất thường", "unusual activity",
                           "flowblocked", "google flow từ chối",
                           # Gemini Video hết lượt/giới hạn (gemini_video.GeminiVideoLimit)
@@ -181,7 +182,10 @@ def create_batch(count: int, instrument: str, music_style: str, video_style: str
                  theme: str = "", *, target_tracks: Optional[int] = None,
                  max_create_actions: Optional[int] = None,
                  channel_name: str = "",
-                 mix_duration_minutes: float = 120.0) -> dict:
+                 channel_id: Optional[int] = None,
+                 mix_duration_minutes: float = 120.0,
+                 intro_mode: str = "thumbnail",
+                 cast_mode: str = "character_pet") -> dict:
     """
     Sinh N ý tưởng phân biệt (1 call LLM, KHÔNG tốn credit Suno) → tạo N Project
     cùng batch_id → tạo BatchRun → khởi động thread chạy tuần tự.
@@ -201,7 +205,29 @@ def create_batch(count: int, instrument: str, music_style: str, video_style: str
     music_style = (music_style or "").strip()
     # Dùng chính bộ phong cách của video/config (10 key) — không tự chế danh sách
     # riêng, tránh gửi key lạ rồi bị normalize_style âm thầm đổi về "2d".
-    style_key = vconfig.normalize_style(video_style)
+    # "channel" = phong cách riêng của kênh: xoay vòng trong cặp phong cách của
+    # kênh cho từng project (styles_cycle); key cụ thể = giữ nguyên cả lô.
+    from backend.video import channel_looks
+    from backend.video.service import _lookup_channel_by_id
+    # Kênh người dùng chọn cho cả lô — kênh nào cũng nhận nhạc cụ/thể loại nào.
+    chosen = _lookup_channel_by_id(channel_id) if channel_id else None
+    if channel_id and not chosen:
+        raise RuntimeError("Kênh YouTube đã chọn không còn trong ⚙️ Cài đặt — chọn lại kênh.")
+    channel_id = chosen["id"] if chosen else None
+    intro_mode = vconfig.normalize_intro_mode(intro_mode)
+    cast_mode = vconfig.normalize_cast_mode(cast_mode)
+    if chosen:
+        channel_name = chosen.get("channel_name") or channel_name
+    styles_cycle: list[str] = []
+    if (video_style or "").strip().lower() in ("", "channel"):
+        m = channel_looks.mapping_for(instrument, music_style, channel_id=channel_id)
+        if m:
+            recent = channel_looks.recent_channel_styles(m)
+            styles_cycle = [channel_looks.style_for_channel(m, recent, offset=i)
+                            for i in range(count)]
+    style_key = (styles_cycle[0] if styles_cycle
+                 else channel_looks.resolve_video_style(video_style, instrument, music_style,
+                                                        channel_id=channel_id))
     if not instrument:
         raise RuntimeError("Thiếu loại nhạc cụ cho lô sản xuất.")
     if not music_style:
@@ -223,34 +249,48 @@ def create_batch(count: int, instrument: str, music_style: str, video_style: str
     try:
         api_config = get_api_config_from_db(str(DB_PATH))
         ideas = batch_ideas.generate_batch_ideas(
-            count, instrument, style_key, theme, api_config, music_style=music_style)
+            count, instrument, style_key, theme, api_config, music_style=music_style,
+            cast_mode=cast_mode)
         return _create_batch_rows(ideas, count, instrument, music_style, style_key,
-                                  theme, channel_name, tgt, mca, mix_duration_minutes)
+                                  theme, channel_name, tgt, mca, mix_duration_minutes,
+                                  styles_cycle=styles_cycle, channel_id=channel_id,
+                                  intro_mode=intro_mode, cast_mode=cast_mode)
     finally:
         _create_lock.release()
 
 
 def _create_batch_rows(ideas, count, instrument, music_style, style_key, theme,
-                       channel_name, tgt, mca, mix_duration_minutes) -> dict:
+                       channel_name, tgt, mca, mix_duration_minutes,
+                       styles_cycle: Optional[list[str]] = None,
+                       channel_id: Optional[int] = None,
+                       intro_mode: str = "thumbnail",
+                       cast_mode: str = "character_pet") -> dict:
     batch_key = uuid.uuid4().hex
     params = {
         "count": count, "instrument": instrument, "music_style": music_style,
-        "video_style": style_key, "theme": theme, "channel_name": channel_name,
+        "video_style": ("channel:" + ",".join(dict.fromkeys(styles_cycle))
+                        if styles_cycle else style_key),
+        "theme": theme, "channel_name": channel_name, "channel_id": channel_id,
+        "intro_mode": intro_mode, "cast_mode": cast_mode,
         "target_tracks": tgt, "max_create_actions": mca,
         "mix_duration_minutes": float(mix_duration_minutes),
     }
 
     with Session(engine) as session:
         created_ids = []
-        for it in ideas:
+        for i, it in enumerate(ideas):
             p = Project(
                 name=it["project_name"],
                 description=it["description"],
                 video_idea=it["video_idea"],
                 suno_idea=it["suno_idea"],
-                video_style=style_key,
+                video_style=(styles_cycle[i % len(styles_cycle)] if styles_cycle
+                             else style_key),
                 instrument=instrument,
                 music_style=music_style,
+                channel_id=channel_id,
+                intro_mode=intro_mode,
+                cast_mode=cast_mode,
                 music_source="suno",
                 auto_video=True,
                 auto_upload=True,

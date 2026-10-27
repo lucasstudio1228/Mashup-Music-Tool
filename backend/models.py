@@ -16,6 +16,14 @@ class AppSettings(SQLModel, table=True):
     gpm_api_base_url: str = "http://localhost:9495"
     # (Tùy chọn) đường dẫn GPMLoginGlobal.exe để tự mở app nếu chưa chạy.
     gpm_exe_path: Optional[str] = None
+    # Thumbnail AI qua API (ShopAIKey…): model ảnh vẽ cả ảnh lẫn chữ tiêu đề.
+    # Key RIÊNG (khác key OpenAI ở trên), không bao giờ trả về client.
+    thumb_api_key: Optional[str] = None
+    thumb_api_base_url: str = "https://api.shopaikey.com"
+    thumb_api_model: str = "gemini-3-pro-image-preview"
+    thumb_ai_enabled: bool = True       # chỉ có hiệu lực khi đã có key
+    thumb_ai_verify: bool = True        # đọc lại chữ bằng model vision trước khi dùng
+    thumb_engine: str = "chatgpt"       # máy vẽ thumbnail: chatgpt | api | pil
     updated_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc))
 
@@ -36,12 +44,21 @@ class Project(SQLModel, table=True):
     # Phong cách ảnh/video: "2d" (tranh vẽ/anime/cartoon) hoặc "3d" (Pixar CGI).
     # Mặc định 2D cho cả project mới lẫn cũ (migration set '2d').
     video_style: str = "2d"
+    # Intro 00:00: "thumbnail" (MẶC ĐỊNH — ảnh thumbnail đã vẽ chữ AI chuyển động
+    # rồi tan vào clip 00) hoặc "font" (chữ font có sẵn đè lên clip 00 như cũ).
+    intro_mode: str = "thumbnail"
+    # Dàn cảnh: "character_pet" (MẶC ĐỊNH — nhân vật chính + linh thú/thú nuôi)
+    # hoặc "scenery" (chỉ cảnh vật, không nhân vật, không con vật).
+    cast_mode: str = "character_pet"
 
     # ── Auto-upload YouTube ──
     # Loại nhạc cụ + phong cách nhạc: dùng để tra ChannelMapping → chọn đúng
     # profile GPMLogin (kênh YouTube) khi đăng nháp video.
     instrument: str = ""
     music_style: str = ""
+    # Kênh YouTube người dùng CHỌN (ChannelMapping.id) — kênh nào cũng nhận nhạc
+    # cụ/thể loại nào (2026-10-25). NULL = tự tra theo (instrument, music_style).
+    channel_id: Optional[int] = Field(default=None, index=True)
     # Nguồn nhạc nền cho project: "local" (import WAV thủ công như cũ — MẶC ĐỊNH,
     # giữ nguyên hành vi hiện có) hoặc "suno" (tạo 15 bài WAV từ Suno ở STEP 0).
     music_source: str = "local"
@@ -168,17 +185,21 @@ class Mix(SQLModel, table=True):
 
 class ChannelMapping(SQLModel, table=True):
     """
-    Bảng ánh xạ (nhạc cụ + phong cách nhạc) → 1 profile GPMLogin (kênh YouTube).
-    Khi đăng nháp video, tool đọc project.instrument + project.music_style, tra
-    bảng này để biết bật profile nào + tên kênh + hashtag mặc định + ngôn ngữ.
+    Kênh YouTube → 1 profile GPMLogin. Project CHỌN kênh qua project.channel_id
+    (kênh nào cũng nhận nhạc cụ/thể loại nào — 2026-10-25); instrument +
+    music_style chỉ là gợi ý để tự chọn kênh cho project chưa chọn. Khi đăng nháp,
+    tool lấy profile + tên kênh + hashtag mặc định + ngôn ngữ từ dòng này.
     """
     id: Optional[int] = Field(default=None, primary_key=True)
-    instrument: str = Field(index=True)          # vd "piano", "guitar"
-    music_style: str = Field(index=True)         # vd "lofi", "ambient"
+    instrument: str = Field(default="", index=True)    # gợi ý, vd "piano" (có thể trống)
+    music_style: str = Field(default="", index=True)   # gợi ý, vd "lofi" (có thể trống)
     gpm_profile_id: str                          # UUID profile GPMLogin
     channel_name: str = ""                       # tên kênh (đưa vào description)
     default_hashtags: str = ""                   # vd "#relax #healing #sleep"
     language: str = "en-US"                      # ngôn ngữ video (Anh–Mỹ)
+    # Phong cách kênh (video/channel_looks: look có sẵn hoặc "custom_…" tự nhập).
+    # Chọn tự do — nhiều kênh dùng chung 1 look được (từ 2026-10-26).
+    visual_look: str = ""
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(

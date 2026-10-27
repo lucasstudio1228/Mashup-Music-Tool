@@ -1,6 +1,6 @@
 """Pydantic request/response schemas (tách khỏi DB models)."""
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -40,7 +40,52 @@ class ApiTestResult(BaseModel):
     retryable: bool = False                # True nếu nên chờ & thử lại (vd 524)
 
 
+class ThumbAISettingsRead(BaseModel):
+    base_url: str
+    model: str
+    enabled: bool
+    verify: bool
+    has_api_key: bool          # KHÔNG trả key thật
+    protocol: str              # gemini | images | chat (suy từ tên model)
+    models: list[dict]         # model gợi ý + giá ShopAIKey
+    engine: str = "chatgpt"    # máy vẽ thumbnail khi ghép video: chatgpt | api | pil
+    engines: list[dict] = []
+    chatgpt_logged_in: Optional[bool] = None   # lần kiểm tra gần nhất (None = chưa rõ)
+    chatgpt_checked_at: Optional[str] = None
+
+
+class ThumbAISettingsUpdate(BaseModel):
+    api_key: Optional[str] = None          # None/rỗng = giữ key cũ
+    clear_api_key: bool = False
+    base_url: Optional[str] = None
+    model: Optional[str] = None
+    enabled: Optional[bool] = None
+    verify: Optional[bool] = None
+    engine: Optional[str] = None           # chatgpt | api | pil
+
+
+class ThumbAITestRequest(BaseModel):
+    api_key: Optional[str] = None          # rỗng → key đã lưu
+    base_url: Optional[str] = None
+    model: Optional[str] = None
+
+
+class ThumbAITestResult(BaseModel):
+    ok: bool
+    base_url: str
+    model: str
+    model_available: Optional[bool] = None  # model có trong danh sách của key?
+    image_models: list[str] = []            # model ảnh key dùng được
+    model_count: int = 0
+    latency_ms: Optional[int] = None
+    error: Optional[str] = None
+
+
 # ---------- Projects ----------
+IntroMode = Literal["thumbnail", "font"]
+CastMode = Literal["character_pet", "scenery"]
+
+
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1)
     description: str = ""
@@ -48,6 +93,16 @@ class ProjectCreate(BaseModel):
     # thể loại nhạc. Rỗng = AI tự suy từ tên/mô tả như trước.
     instrument: str = ""
     music_style: str = ""
+    # Kênh YouTube đăng nháp (ChannelMapping.id) — độc lập với nhạc cụ/thể loại.
+    # None = tự chọn (AI phân loại theo nhạc cụ ở bước Suno / khớp ánh xạ cũ).
+    channel_id: Optional[int] = None
+    # Phong cách ảnh: "channel"/rỗng = theo phong cách riêng của kênh YouTube
+    # (xoay vòng trong cặp phong cách của kênh); key cụ thể = giữ nguyên.
+    video_style: Optional[str] = None
+    # Intro 00:00: "thumbnail" (mặc định — ảnh thumbnail chuyển động) | "font".
+    intro_mode: IntroMode = "thumbnail"
+    # Dàn cảnh: "character_pet" (mặc định — nhân vật + linh thú) | "scenery".
+    cast_mode: CastMode = "character_pet"
 
 
 class ProjectBulkDelete(BaseModel):
@@ -69,8 +124,11 @@ class ProjectUpdate(BaseModel):
     video_idea: Optional[str] = None
     auto_video: Optional[bool] = None
     video_style: Optional[str] = None
+    intro_mode: Optional[IntroMode] = None
+    cast_mode: Optional[CastMode] = None
     instrument: Optional[str] = None
     music_style: Optional[str] = None
+    channel_id: Optional[int] = None         # null = bỏ chọn (tự khớp như cũ)
     auto_upload: Optional[bool] = None
     music_source: Optional[str] = None       # "local" | "suno"
     suno_idea: Optional[str] = None          # ý tưởng/nhạc cụ cho STEP 0 (Suno)
@@ -89,6 +147,8 @@ class ProjectResponse(BaseModel):
     video_idea: str = ""
     auto_video: bool = False
     video_style: str = "2d"
+    intro_mode: str = "thumbnail"
+    cast_mode: str = "character_pet"
     instrument: str = ""
     music_style: str = ""
     auto_upload: bool = False
@@ -97,18 +157,29 @@ class ProjectResponse(BaseModel):
     batch_id: Optional[str] = None
     mix_duration_minutes: float = 120.0
     mix_crossfade_seconds: float = 5.0
+    # Kênh đã chọn (None = chưa chọn) + kênh THỰC SỰ dùng khi đăng nháp (đã chọn,
+    # hoặc khớp theo nhạc cụ + thể loại với project cũ chưa chọn).
+    channel_id: Optional[int] = None
+    effective_channel_id: Optional[int] = None
+    effective_channel_name: str = ""
 
 
 # ---------- Batch (sản xuất hàng loạt) ----------
 class BatchCreate(BaseModel):
     count: int = Field(ge=1, le=50)
     # Nhạc cụ + thể loại nhạc: giữ nguyên cả lô, là đầu vào của mọi prompt
-    # (Suno/Gemini/Flow) VÀ là khoá tra ChannelMapping khi đăng nháp YouTube.
+    # (Suno/Gemini/Flow). Kênh đăng nháp = channel_id (không cần khớp).
     instrument: str = Field(min_length=1)
     music_style: str = Field(min_length=1)
     channel_name: str = ""
-    # Style ảnh giữ nguyên cả lô — key trong video/config.STYLES (2d/3d/…/real).
-    video_style: str = "2d"
+    # Kênh YouTube cho cả lô — kênh nào cũng nhận nhạc cụ/thể loại nào.
+    channel_id: Optional[int] = None
+    # Style ảnh — key trong video/config.STYLES (2d/3d/…/real) giữ nguyên cả lô,
+    # hoặc "channel" = theo phong cách riêng của kênh (xoay vòng trong lô).
+    video_style: str = "channel"
+    # Intro + dàn cảnh giữ nguyên cả lô (mặc định: thumbnail động + nhân vật/linh thú).
+    intro_mode: IntroMode = "thumbnail"
+    cast_mode: CastMode = "character_pet"
     # Chủ đề tuỳ chọn (giữ mạch); rỗng = AI tự chọn 1 mạch chung.
     theme: str = ""
     # Ngân sách Suno mỗi project (mặc định theo SunoConfig nếu bỏ trống).

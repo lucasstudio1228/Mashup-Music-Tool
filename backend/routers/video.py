@@ -76,26 +76,65 @@ class ThumbnailFontBody(BaseModel):
     key: str
 
 
+def _project_recipe(project_id: int, project_name: str | None):
+    """Công thức thumbnail riêng của project (None nếu lỗi → kiểu cũ)."""
+    try:
+        from backend.video import thumbnail_recipe
+        return thumbnail_recipe.recipe_for_project(project_id, project_name)
+    except Exception:
+        return None
+
+
 @router.get("/thumbnail-fonts")
-def list_thumbnail_fonts(project_id: int):
-    """Danh mục font tiêu đề (thumbnail + intro) + font đang chọn (chung mọi project)."""
+def list_thumbnail_fonts(project_id: int, db: Session = Depends(get_session)):
+    """Danh mục font tiêu đề (thumbnail + intro) + font của RIÊNG project này
+    (công thức thumbnail: tự động theo phong cách kênh, hoặc khoá tay)."""
+    from backend.video import channel_looks
     from backend.video import thumbnail as th
+    from backend.video import thumbnail_recipe as tr
+    project = _project_or_404(db, project_id)
+    fonts = [{"key": f["key"], "label": f["label"], "note": f["note"]}
+             for f in th.FONT_CATALOG if Path(f["file"]).exists()]
+    have = {f["key"] for f in fonts}
+    recipe = _project_recipe(project_id, project.name)
+    if not recipe:
+        return {"selected": th.selected_font_key(), "default": th.DEFAULT_FONT_KEY,
+                "auto": False, "auto_font": "", "suggested": [], "recipe": None,
+                "fonts": fonts}
+    lk = channel_looks.look_info(recipe.get("look"))
+    lock = recipe.get("font_lock") or ""
     return {
-        "selected": th.selected_font_key(),
+        "selected": lock or recipe.get("font") or th.DEFAULT_FONT_KEY,
         "default": th.DEFAULT_FONT_KEY,
-        "fonts": [{"key": f["key"], "label": f["label"], "note": f["note"]}
-                  for f in th.FONT_CATALOG if Path(f["file"]).exists()],
+        "auto": not lock,
+        "auto_font": recipe.get("font") or "",
+        "suggested": [k for k in lk["fonts"] if k in have],
+        "recipe": {**tr.describe(recipe), "look_icon": lk["icon"],
+                   "look_styles": list(lk["styles"]),
+                   "subtitle": tr.project_subtitle(project_id, recipe)},
+        "fonts": fonts,
     }
 
 
 @router.put("/thumbnail-fonts")
-def set_thumbnail_font(project_id: int, body: ThumbnailFontBody):
+def set_thumbnail_font(project_id: int, body: ThumbnailFontBody,
+                       db: Session = Depends(get_session)):
+    """Khoá font cho RIÊNG project này; key "auto"/rỗng = tự động theo phong cách kênh."""
     from backend.video import thumbnail as th
-    f = th.font_entry(body.key)
-    if not f or not Path(f["file"]).exists():
-        raise HTTPException(400, f"Font '{body.key}' không có trên máy.")
-    config.save_override("thumbnail_font", body.key)
-    return {"selected": body.key}
+    from backend.video import thumbnail_recipe as tr
+    project = _project_or_404(db, project_id)
+    key = (body.key or "").strip()
+    if key.lower() == "auto":
+        key = ""
+    if key:
+        f = th.font_entry(key)
+        if not f or not Path(f["file"]).exists():
+            raise HTTPException(400, f"Font '{body.key}' không có trên máy.")
+    try:
+        rec = tr.set_font_lock(project_id, key, project.name)
+    except Exception as exc:
+        raise HTTPException(500, f"Không lưu được font cho project: {exc}")
+    return {"selected": key or rec.get("font") or th.DEFAULT_FONT_KEY, "auto": not key}
 
 
 class ClipEngineBody(BaseModel):
@@ -118,20 +157,29 @@ def set_clip_engine(project_id: int, body: ClipEngineBody):
 @router.get("/thumbnail-fonts/{key}/preview")
 def thumbnail_font_preview(project_id: int, key: str,
                            db: Session = Depends(get_session)):
-    """Ảnh mẫu: tên project viết bằng font `key` trên ảnh bìa của project."""
+    """Ảnh mẫu: tên project viết bằng font `key` trên ảnh bìa của project, theo
+    kiểu chữ (bố cục/hiệu ứng/màu/dòng phụ) của công thức thumbnail project."""
     import hashlib
+    import json as _json
     from backend.video import thumbnail as th
+    from backend.video import thumbnail_recipe as tr
     project = _project_or_404(db, project_id)
     if not th.font_entry(key):
         raise HTTPException(404, f"Không có font '{key}'.")
     title = (project.name or "Healing Music").strip()
     bg = config.images_dir(project_id, project.name) / "0.png"
-    stamp = f"{title}|{bg.stat().st_mtime if bg.exists() else 0}"
+    recipe = _project_recipe(project_id, project.name)
+    style = tr.render_style(recipe) if recipe else None
+    subtitle = (tr.project_subtitle(project_id, recipe) if recipe
+                else service._thumbnail_keywords())
+    look_sig = _json.dumps({k: (recipe or {}).get(k) for k in
+                            ("look", "layout", "treatment", "palette", "sub_font", "upper")},
+                           sort_keys=True)
+    stamp = f"{title}|{bg.stat().st_mtime if bg.exists() else 0}|{subtitle}|{look_sig}"
     h = hashlib.sha1(stamp.encode("utf-8")).hexdigest()[:10]
     out = config.OVERRIDES.parent / "thumb_font_previews" / f"{project_id}_{key}_{h}.jpg"
     if not out.exists() and not th.render_font_preview(
-            key, out, title, service._thumbnail_keywords(),
-            bg if bg.exists() else None):
+            key, out, title, subtitle, bg if bg.exists() else None, style=style):
         raise HTTPException(500, "Không vẽ được ảnh mẫu cho font này.")
     return FileResponse(str(out), media_type="image/jpeg")
 
@@ -142,6 +190,10 @@ def status(project_id: int, db: Session = Depends(get_session)):
     media = service.list_media(project_id, project.name)
     job = video_job_manager.get(project_id)
     p = config.PARAMS
+    # Bộ ảnh đã chuẩn bị theo hồ sơ nào thì nhãn theo hồ sơ đó; chưa có → theo project.
+    img_dir = config.images_dir(project_id, project.name)
+    cast_mode = (config.images_cast_mode(img_dir) if (img_dir / "prompts.json").exists()
+                 else config.normalize_cast_mode(getattr(project, "cast_mode", None)))
     media["job"] = None if not job else {
         "kind": job.kind, "status": job.status,
         "percent": job.percent, "message": job.message, "error": job.error,
@@ -160,12 +212,27 @@ def status(project_id: int, db: Session = Depends(get_session)):
         "clip_engines": [{"key": k, "label": config.CLIP_ENGINE_LABELS.get(k, k)}
                          for k in config.CLIP_ENGINES],
         "aspect_ratio": p.aspect_ratio, "flow_mode": p.flow_mode,
-        "blend_seconds": p.blend_seconds, "slow_speed": p.slow_speed,
-        # Nhãn vai trò 3 ảnh (0 bìa, 1 nhân vật chính, 2 linh thú) cho UI.
-        "image_roles": {str(k): v for k, v in config.IMAGE_ROLES.items()},
+        "blend_seconds": p.blend_seconds,
+        # Chỉ cảnh vật ghép ở tốc độ thật (không làm chậm như đứng hình).
+        "slow_speed": (config.SCENERY_PLAYBACK_SPEED if cast_mode == "scenery"
+                       else p.slow_speed),
+        # Nhãn vai trò 3 ảnh (0 bìa, 1 nhân vật chính, 2 linh thú) cho UI —
+        # chế độ chỉ cảnh vật: bảng bối cảnh + bảng ánh sáng.
+        "image_roles": {str(k): v for k, v in config.image_roles(cast_mode).items()},
+        "cast_mode": cast_mode,
+        "intro_mode": config.normalize_intro_mode(getattr(project, "intro_mode", None)),
     }
     from backend.video.flow_manual import manual_state
     media["manual"] = manual_state(project_id)
+    # Thumbnail: engine đang dùng (ai | pil) + cấu hình Thumbnail AI + mtime
+    # (cache-buster để UI tải ảnh mới sau khi vẽ lại).
+    from backend.video import thumbnail_ai
+    final_d = config.final_dir(project_id, project.name)
+    media["thumbnail_ai"] = thumbnail_ai.status(final_d)
+    try:
+        media["thumbnail_mtime"] = int((final_d / "thumbnail.png").stat().st_mtime)
+    except OSError:
+        media["thumbnail_mtime"] = None
     return media
 
 
@@ -380,18 +447,45 @@ def regen_motions(project_id: int, db: Session = Depends(get_session)):
     return {"status": "submitted", "kind": "motions"}
 
 
+class ThumbnailBody(BaseModel):
+    # "chatgpt" = ChatGPT web vẽ ảnh + chữ (tài khoản ChatGPT của bạn, mặc định)
+    # | "ai" = model ảnh qua API (tốn phí) | "pil" = chữ font
+    engine: str = "chatgpt"
+
+
+@router.post("/thumbnail")
+def make_thumbnail(project_id: int, body: ThumbnailBody = ThumbnailBody(),
+                   db: Session = Depends(get_session)):
+    """Vẽ lại final/thumbnail.png từ ảnh bìa. engine="chatgpt" mở ChatGPT web
+    (chưa đăng nhập → kéo cửa sổ lên chờ bạn TỰ đăng nhập); "ai" gọi model ảnh
+    qua API (tốn phí, người dùng bấm). Lỗi/chữ sai → tự dùng chữ font."""
+    from backend.video import thumbnail_ai
+    project = _project_or_404(db, project_id)
+    _guard_busy()
+    if not (config.images_dir(project_id, project.name) / "0.png").exists():
+        raise HTTPException(400, "Chưa có ảnh bìa (ảnh 0) — hãy tạo ảnh trước.")
+    engine = body.engine if body.engine in ("chatgpt", "ai", "pil") else "chatgpt"
+    if engine == "ai" and not thumbnail_ai.load_settings().ready:
+        raise HTTPException(400, "Chưa nhập API key Thumbnail AI — mở ⚙️ Cài đặt → "
+                                 "Thumbnail AI để dán key.")
+    video_job_manager.submit(project_id, "thumbnail", service.make_thumbnail,
+                             project.name, engine)
+    return {"status": "submitted", "kind": "thumbnail", "engine": engine}
+
+
 @router.post("/upload-youtube")
 def upload_youtube(project_id: int, db: Session = Depends(get_session)):
-    """Đăng NHÁP video final.mp4 lên YouTube qua GPMLogin (thủ công). Chọn kênh
-    theo (instrument, music_style) của project. KHÔNG publish — chỉ lưu nháp."""
+    """Đăng NHÁP video final.mp4 lên YouTube qua GPMLogin (thủ công). Kênh = kênh
+    đã chọn cho project (chưa chọn → khớp instrument + music_style). KHÔNG publish."""
     project = _project_or_404(db, project_id)
     _guard_busy()
     final = config.final_dir(project_id, project.name) / "final.mp4"
     if not final.exists():
         raise HTTPException(400, "Chưa có final.mp4 — hãy render video trước.")
-    if not (project.instrument or "").strip() or not (project.music_style or "").strip():
-        raise HTTPException(
-            400, "Chưa nhập 'nhạc cụ' và 'phong cách nhạc' cho project.")
+    if not service.channel_for(project.channel_id, project.instrument or "",
+                               project.music_style or ""):
+        raise HTTPException(400, service._no_channel_error(
+            project.instrument or "", project.music_style or ""))
     video_job_manager.submit(project_id, "upload", service.step_upload_youtube_and_short,
                              project.name, project.instrument, project.music_style)
     return {"status": "submitted", "kind": "upload"}
@@ -406,9 +500,10 @@ def upload_short(project_id: int, db: Session = Depends(get_session)):
     final = config.final_dir(project_id, project.name) / "final.mp4"
     if not final.exists():
         raise HTTPException(400, "Chưa có final.mp4 — hãy render video trước.")
-    if not (project.instrument or "").strip() or not (project.music_style or "").strip():
-        raise HTTPException(
-            400, "Chưa nhập 'nhạc cụ' và 'phong cách nhạc' cho project.")
+    if not service.channel_for(project.channel_id, project.instrument or "",
+                               project.music_style or ""):
+        raise HTTPException(400, service._no_channel_error(
+            project.instrument or "", project.music_style or ""))
     video_job_manager.submit(project_id, "upload_short", service.step_upload_short,
                              project.name, project.instrument, project.music_style)
     return {"status": "submitted", "kind": "upload_short"}
@@ -488,7 +583,7 @@ def resume(project_id: int, db: Session = Depends(get_session)):
 
 @router.post("/open-browser")
 def open_browser(project_id: int, site: str = "flow", db: Session = Depends(get_session)):
-    """Mở cửa sổ Flow/Gemini bằng đúng profile tool dùng để theo dõi/đăng nhập/kiểm tra.
+    """Mở cửa sổ Flow/Gemini/ChatGPT bằng đúng profile tool dùng để theo dõi/đăng nhập/kiểm tra.
     Chạy trên worker video duy nhất → bị khoá khi đang có tác vụ video."""
     from backend.video import monitor_browser
     _project_or_404(db, project_id)

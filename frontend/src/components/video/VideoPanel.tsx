@@ -5,11 +5,13 @@ import {
   useThumbnailFonts, useSetThumbnailFont, thumbnailFontPreviewUrl, useSetClipEngine,
   usePreparePrompts, usePromptManifest,
   useUploadYoutube, useUploadShort, useShortSettings, useSaveShortSettings,
-  useYoutubeHistory, useOpenVideoBrowser, useCloseVideoBrowser,
+  useYoutubeHistory, useOpenVideoBrowser, useCloseVideoBrowser, useMakeThumbnail,
   videoDownloadUrl, videoThumbnailUrl, videoImageUrl, videoClipUrl,
 } from "../../api/video";
 import { useProject, useUpdateProject } from "../../api/projects";
 import ManualClipsPanel from "./ManualClipsPanel";
+import { apiErrorText, useChannelMappings } from "../../api/youtube";
+import { vndText, ChatGPTLoginPanel } from "../settings/ThumbnailAiSettings";
 
 function fmtDur(sec?: number | null): string {
   if (!sec || sec <= 0) return "—";
@@ -64,6 +66,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
   const regenMotions = useRegenMotions(projectId);
   const uploadYoutube = useUploadYoutube(projectId);
   const uploadShort = useUploadShort(projectId);
+  const makeThumb = useMakeThumbnail(projectId);
   const { data: shortCfg } = useShortSettings(projectId);
   const saveShortCfg = useSaveShortSettings(projectId);
   const { data: ytHistory, refetch: refetchYtHistory } = useYoutubeHistory(projectId);
@@ -84,23 +87,23 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
       refetchPrompts();
     }
   }, [jobStatus, refetchYtHistory, refetchPrompts]);
-  // Nhạc cụ + phong cách nhạc (dùng để tra kênh YouTube khi đăng nháp).
-  const [instrument, setInstrument] = useState("");
-  const [musicStyle, setMusicStyle] = useState("");
-  const savedInstrument = project?.instrument ?? "";
-  const savedMusicStyle = project?.music_style ?? "";
-  useEffect(() => { setInstrument(savedInstrument); }, [savedInstrument, projectId]);
-  useEffect(() => { setMusicStyle(savedMusicStyle); }, [savedMusicStyle, projectId]);
+  // Kênh YouTube đăng nháp: người dùng chọn (kênh nào cũng nhận nhạc cụ nào);
+  // chưa chọn thì backend tự khớp theo nhạc cụ + thể loại (project cũ).
+  const { data: channelMappings } = useChannelMappings();
+  const chosenChannelId = project?.channel_id ?? null;
+  const effectiveChannelId = project?.effective_channel_id ?? null;
+  const effectiveChannelName = project?.effective_channel_name ?? "";
   const autoUpload = project?.auto_upload ?? false;
-  const ytFieldsDirty =
-    instrument.trim() !== savedInstrument.trim() ||
-    musicStyle.trim() !== savedMusicStyle.trim();
-  const ytFieldsSet = !!savedInstrument.trim() && !!savedMusicStyle.trim();
+  const ytChannelSet = effectiveChannelId != null;
   const autoVideo = project?.auto_video ?? false;
   const videoStyle = project?.video_style ?? "2d";
   const styleList = styleData?.styles ?? [];
   const currentStyle = styleList.find((s) => s.key === videoStyle);
   const ideaDirty = idea.trim() !== savedIdea.trim();
+  // Lựa chọn của project: nội dung video + kiểu intro 00:00.
+  const castMode = project?.cast_mode ?? "character_pet";
+  const introMode = project?.intro_mode ?? "thumbnail";
+  const scenery = castMode === "scenery";
 
   if (isLoading || !st) {
     return <p className="text-gray-400">Đang tải trạng thái video…</p>;
@@ -113,6 +116,27 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
   const imagesDone = st.image_count >= p.image_count;
   const clipsDone  = st.clip_count >= p.total_clips;
   const hasAudio   = !!st.audio_path;
+  const thumbAi    = st.thumbnail_ai ?? null;
+  const hasCover   = (st.image_indices ?? []).includes(0);
+  // Bộ ảnh đã chuẩn bị theo chế độ khác lựa chọn hiện tại → cần «Làm lại từ đầu».
+  const castStale  = st.image_count > 0 && !!p.cast_mode && p.cast_mode !== castMode;
+  const aiPrice    = thumbAi?.price_usd != null
+    ? `~$${thumbAi.price_usd}/ảnh ${vndText(thumbAi.price_usd)}` : "giá theo model";
+  function makeAiThumbnail() {
+    if (!thumbAi) return;
+    const ok = window.confirm(
+      `Tạo thumbnail bằng ${thumbAi.model_label}?
+
+` +
+      `Tốn phí API: ${aiPrice} (tối đa 2 lượt nếu chữ sai chính tả). ` +
+      "Lỗi / chữ sai → tự quay về chữ font (miễn phí).");
+    if (ok) makeThumb.mutate({ engine: "ai" });
+  }
+  const thumbEngineText = (e?: string) =>
+    e === "chatgpt" ? "🤖 Vẽ bằng ChatGPT" : e === "ai" ? "🎨 Vẽ bằng AI (API)" : "🔤 Chữ vẽ bằng font";
+  const browserName: Record<string, string> = {
+    "browser-flow": "Flow", "browser-gemini": "Gemini", "browser-chatgpt": "ChatGPT",
+  };
 
   const btn = "rounded-lg px-4 py-2.5 text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed";
   const primary = `${btn} bg-accent text-white hover:bg-accent-hover`;
@@ -126,10 +150,12 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
     rebuild: "Đang tạo lại video từ ảnh",
     motions: "Đang sinh lại prompt cảnh (clip)",
     upload: "Đang đăng nháp lên YouTube",
+    thumbnail: "Đang tạo thumbnail (ChatGPT / AI / font)",
     upload_short: "Đang tạo & đăng nháp YouTube Short",
     continue: "Đang chạy tiếp chu trình (phần thiếu → ghép → nháp YouTube → Short)",
     "browser-flow": "Cửa sổ Flow đang mở",
     "browser-gemini": "Cửa sổ Gemini đang mở",
+    "browser-chatgpt": "Cửa sổ ChatGPT đang mở",
     "clips-manual": "Chế độ thủ công — chờ bạn tạo clip trên Flow",
   };
 
@@ -249,16 +275,17 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
           )}
         </Section>
 
-        <Section title="Theo dõi trình duyệt (Flow / Gemini)">
+        <Section title="Theo dõi trình duyệt (Flow / Gemini / ChatGPT)">
           <p className="mb-3 text-xs text-gray-400">
-            Mở đúng cửa sổ + profile tool dùng cho Flow / Gemini (Gemini = máy ảnh dự phòng) — xem tài khoản,
-            tự đăng nhập hoặc kiểm tra cảnh báo. Tool không tự nhập mật khẩu.
+            Mở đúng cửa sổ + profile tool dùng cho Flow / Gemini (Gemini = máy ảnh dự phòng) /
+            ChatGPT (vẽ thumbnail) — xem tài khoản, tự đăng nhập hoặc kiểm tra cảnh báo. Tool
+            không tự nhập mật khẩu.
           </p>
           {browserOpen ? (
             <button className={`${btn} border border-red-500/30 bg-red-950/30 text-red-300 hover:bg-red-950/50`}
                     disabled={closeBrowser.isPending}
                     onClick={() => closeBrowser.mutate(undefined)}>
-              ✕ Đóng trình duyệt {job?.kind === "browser-gemini" ? "Gemini" : "Flow"}
+              ✕ Đóng trình duyệt {browserName[job?.kind ?? ""] ?? "Flow"}
             </button>
           ) : (
             <div className="flex flex-wrap gap-2">
@@ -269,6 +296,10 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
               <button className={ghost} disabled={busy || openBrowser.isPending}
                       onClick={() => openBrowser.mutate("gemini")}>
                 🌐 Mở UI Gemini
+              </button>
+              <button className={ghost} disabled={busy || openBrowser.isPending}
+                      onClick={() => openBrowser.mutate("chatgpt")}>
+                🤖 Mở UI ChatGPT
               </button>
             </div>
           )}
@@ -289,12 +320,18 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
             {st.thumbnail_path && (
               <div className="mb-3">
                 <img
-                  src={videoThumbnailUrl(projectId, st.thumbnail_path ?? "")}
+                  src={videoThumbnailUrl(projectId, st.thumbnail_mtime ?? bust)}
                   alt="Thumbnail (kèm chữ)"
                   className="w-full rounded-lg border border-white/10"
                 />
+                {thumbAi && (
+                  <p className="mt-1 text-[11px] text-gray-500">
+                    {thumbEngineText(thumbAi.engine)}
+                    {thumbAi.note && <> · {thumbAi.note}</>}
+                  </p>
+                )}
                 <a
-                  href={videoThumbnailUrl(projectId, st.thumbnail_path ?? "")}
+                  href={videoThumbnailUrl(projectId, st.thumbnail_mtime ?? bust)}
                   className={`${ghost} mt-2 inline-block`}
                   download
                 >
@@ -323,7 +360,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
               `Model: ${p.model}`,
               `Tỉ lệ ${p.aspect_ratio}`,
               `${p.clip_seconds}s/clip`,
-              `${p.image_count} ảnh (bìa + 2 bảng nhân vật) → ${p.total_clips} clip`,
+              `${p.image_count} ảnh (bìa + ${p.cast_mode === "scenery" ? "bảng bối cảnh + bảng ánh sáng" : "2 bảng nhân vật"}) → ${p.total_clips} clip`,
               `Shuffle T+${p.t_window}`,
               `Fade ${p.blend_seconds}s · slow ${p.slow_speed}x`,
             ].map((t) => (
@@ -357,6 +394,11 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
                     <span className="flex items-center gap-1.5 text-sm font-semibold">
                       <span>{active ? "●" : "○"}</span>
                       {s.label}
+                      {fontData?.recipe?.look_styles?.includes(s.key) && (
+                        <span className="text-[10px] font-normal text-accent">
+                          (hợp phong cách kênh)
+                        </span>
+                      )}
                     </span>
                     <span className="mt-0.5 block text-[11px] text-gray-400">{s.desc}</span>
                   </span>
@@ -371,15 +413,183 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
           </p>
         </Section>
 
+        <Section title="Intro mở đầu video (00:00)">
+          <div className="grid grid-cols-2 gap-2">
+            {([
+              ["thumbnail", "🖼️ Thumbnail động", "Mặc định — mở đầu bằng chính ảnh thumbnail (chữ AI thiết kế), đẩy máy chậm rồi hoà tan vào clip đầu"],
+              ["font", "🔤 Chữ font có sẵn", "Tuỳ chọn — chồng tiêu đề bằng font máy lên clip đầu (kiểu cũ)"],
+            ] as const).map(([key, label, desc]) => {
+              const active = introMode === key;
+              return (
+                <button
+                  key={key}
+                  disabled={busy || updateProject.isPending}
+                  onClick={() => updateProject.mutate({ intro_mode: key })}
+                  className={`rounded-lg border px-3 py-2 text-left transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                    active
+                      ? "border-accent bg-accent/15 text-white"
+                      : "border-white/10 bg-background text-gray-300 hover:bg-white/5"
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5 text-sm font-semibold">
+                    <span>{active ? "●" : "○"}</span>{label}
+                  </span>
+                  <span className="mt-0.5 block text-[11px] text-gray-400">{desc}</span>
+                </button>
+              );
+            })}
+          </div>
+          <p className="mt-2 text-xs text-gray-500">
+            Áp dụng ở lần <b>ghép video</b> kế tiếp. Ghép video luôn tạo thumbnail trước; nếu
+            chưa có thumbnail thì intro tự dùng chữ font.
+          </p>
+        </Section>
+
+        <Section title="Thumbnail — ảnh + chữ">
+          <p className="mb-2 text-xs text-gray-500">
+            <b>🤖 ChatGPT</b> (mặc định): ChatGPT web vẽ lại ảnh bìa kèm tiêu đề + dòng phụ theo
+            kiểu chữ của project — dùng tài khoản ChatGPT bạn đã đăng nhập, không tốn phí API.{" "}
+            <b>🎨 API</b>: model ảnh qua API (tốn phí). <b>🔤 Font</b>: vẽ chữ bằng font máy
+            (miễn phí). Không ghép lại video — {introMode === "thumbnail" && <>intro dùng thumbnail
+            nên bấm «Ghép video» để mở đầu bằng bản mới; </>}bấm «Đăng nháp YouTube» nếu muốn cập
+            nhật bản nháp.
+          </p>
+          <div className="mb-2 rounded-lg border border-emerald-500/20 bg-background px-3 py-2">
+            <ChatGPTLoginPanel compact />
+          </div>
+          {thumbAi && (
+            <div className="mb-2 rounded-lg border border-white/10 bg-background px-3 py-2 text-[11px] text-gray-400">
+              Máy vẽ khi ghép video:{" "}
+              <b className="text-gray-200">
+                {thumbAi.default_engine === "api" ? "API model ảnh"
+                  : thumbAi.default_engine === "pil" ? "Chữ font" : "ChatGPT web"}
+              </b>
+              {thumbAi.default_engine !== "pil" && (
+                <> · dự phòng API:{" "}
+                  {thumbAi.ai_active ? <b className="text-green-400">Bật</b>
+                    : <b>Tắt{!thumbAi.ai_ready && " (chưa có key)"}</b>}
+                </>
+              )}
+              <span className="block">
+                API: <b className="text-gray-200">{thumbAi.model_label}</b> · {aiPrice}
+              </span>
+              {thumbAi.last_ai && (
+                <span className="block">
+                  Bản AI gần nhất{thumbAi.last_ai.label ? ` (${thumbAi.last_ai.label})` : ""}:{" "}
+                  {new Date(thumbAi.last_ai.created_at).toLocaleString("vi-VN")}
+                  {" · "}{thumbAi.last_ai.attempts} lượt
+                  {thumbAi.last_ai.verified ? " · chữ đã kiểm tra khớp" : ""}
+                </span>
+              )}
+            </div>
+          )}
+          <div className="flex flex-wrap gap-2">
+            <button
+              className={primary}
+              disabled={busy || !hasCover || makeThumb.isPending}
+              onClick={() => makeThumb.mutate({ engine: "chatgpt" })}
+              title="Mở ChatGPT web (profile của tool) và vẽ thumbnail kèm chữ"
+            >
+              🤖 Tạo thumbnail bằng ChatGPT
+            </button>
+            <button
+              className={ghost}
+              disabled={busy || !hasCover || !thumbAi?.ai_ready || makeThumb.isPending}
+              onClick={makeAiThumbnail}
+              title={!thumbAi?.ai_ready ? "Chưa có key — mở ⚙️ Cài đặt → Thumbnail AI" : undefined}
+            >
+              🎨 Tạo bằng API (tốn phí)
+            </button>
+            <button
+              className={ghost}
+              disabled={busy || !hasCover || makeThumb.isPending}
+              onClick={() => makeThumb.mutate({ engine: "pil" })}
+            >
+              🔤 Vẽ lại chữ bằng font (miễn phí)
+            </button>
+          </div>
+          {!hasCover && (
+            <p className="mt-2 text-xs text-gray-500">Cần có ảnh bìa (ảnh 0) trước.</p>
+          )}
+          {hasCover && thumbAi && thumbAi.chatgpt_logged_in === false && (
+            <p className="mt-2 text-xs text-amber-300/80">
+              Chưa đăng nhập ChatGPT — bấm «🤖 Mở ChatGPT để đăng nhập» ở trên. Nếu bấm tạo khi
+              chưa đăng nhập, tool mở cửa sổ và chờ bạn tự đăng nhập (tối đa 10 phút).
+            </p>
+          )}
+          {makeThumb.error && (
+            <p className="mt-2 text-xs text-red-300">{apiErrorText(makeThumb.error)}</p>
+          )}
+        </Section>
+
         <Section title="Font chữ thumbnail">
           <p className="mb-2 text-xs text-gray-500">
-            Font của tiêu đề trên <b>thumbnail</b> và <b>đoạn intro</b> video. Ảnh mẫu dùng
-            chính tên và ảnh bìa của project này. Lựa chọn áp dụng cho <b>mọi project</b>{" "}
-            ở lần ghép video kế tiếp.
+            Chữ trên <b>thumbnail</b>: ChatGPT (hoặc model ảnh) TỰ thiết kế — mỗi video một
+            kiểu chữ + một style thumbnail riêng. Font bên dưới dùng cho <b>đoạn intro</b> khi
+            chọn «🔤 Chữ font có sẵn», chữ hook <b>Short</b> và thumbnail dự phòng (PIL). Khoá 1 font tay → thumbnail
+            AI cũng vẽ theo đúng font đó. Áp dụng ở lần ghép video kế tiếp.
           </p>
+          {fontData?.recipe && (
+            <div className="mb-2 rounded-lg border border-white/10 bg-background px-3 py-2 text-[11px] text-gray-400">
+              <div className="text-xs font-semibold text-gray-200">
+                {fontData.recipe.look_icon} Phong cách kênh: {fontData.recipe.look_label}
+              </div>
+              {fontData.recipe.ai_text && fontData.recipe.ai_lettering_label ? (
+                <>
+                  Thumbnail: <b>AI tự thiết kế chữ</b> — kiểu chữ{" "}
+                  <b>«{fontData.recipe.ai_lettering_label}»</b> · style{" "}
+                  <b>«{fontData.recipe.ai_design_label}»</b> · bố cục{" "}
+                  <b>{fontData.recipe.layout}</b> · chuyển cảnh{" "}
+                  <b>{fontData.recipe.transition}</b>
+                </>
+              ) : (
+                <>
+                  Chữ: <b>{fontData.recipe.layout}</b> · <b>{fontData.recipe.treatment}</b> · màu{" "}
+                  <b>{fontData.recipe.palette}</b> · chuyển cảnh <b>{fontData.recipe.transition}</b>
+                </>
+              )}
+              {fontData.recipe.subtitle && <> · dòng phụ «{fontData.recipe.subtitle}»</>}
+              {fontData.recipe.legacy && (
+                <span className="block text-amber-300/80">
+                  Ảnh bìa vẽ theo bố cục cũ (chừa trái) → chữ giữ bên trái; «Tạo lại từ đầu»
+                  để có bố cục mới.
+                </span>
+              )}
+            </div>
+          )}
           <div className="grid max-h-[28rem] grid-cols-2 gap-2 overflow-y-auto pr-1">
+            {fontData?.recipe && (
+              <button
+                key="__auto"
+                disabled={setFont.isPending}
+                onClick={() => setFont.mutate("auto")}
+                className={`overflow-hidden rounded-lg border text-left transition-colors disabled:opacity-60 ${
+                  fontData.auto
+                    ? "border-accent ring-2 ring-accent"
+                    : "border-white/10 hover:border-white/30"
+                }`}
+              >
+                {fontData.auto_font && (
+                  <img
+                    src={thumbnailFontPreviewUrl(projectId, fontData.auto_font, bust)}
+                    alt="Mẫu font tự động"
+                    loading="lazy"
+                    className="aspect-video w-full bg-background object-cover"
+                  />
+                )}
+                <span className="block bg-background px-2 py-1.5">
+                  <span className="flex items-center gap-1 text-xs font-semibold text-gray-200">
+                    <span>{fontData.auto ? "●" : "○"}</span>
+                    🎲 Tự động theo kênh
+                  </span>
+                  <span className="block text-[11px] text-gray-500">
+                    Thumbnail: AI tự thiết kế chữ · intro/Short: font tự bốc hợp kênh, tránh lặp
+                  </span>
+                </span>
+              </button>
+            )}
             {(fontData?.fonts ?? []).map((f) => {
-              const active = fontData?.selected === f.key;
+              const active = !fontData?.auto && fontData?.selected === f.key;
               return (
                 <button
                   key={f.key}
@@ -401,7 +611,9 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
                     <span className="flex items-center gap-1 text-xs font-semibold text-gray-200">
                       <span>{active ? "●" : "○"}</span>
                       {f.label}
-                      {f.key === fontData?.default && (
+                      {fontData?.suggested?.includes(f.key) ? (
+                        <span className="text-[10px] font-normal text-accent">(hợp kênh)</span>
+                      ) : !fontData?.recipe && f.key === fontData?.default && (
                         <span className="text-[10px] font-normal text-gray-500">(mặc định)</span>
                       )}
                     </span>
@@ -418,14 +630,60 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
         </Section>
 
         <Section title="Ý tưởng của bạn">
+          <div className="mb-2 grid grid-cols-2 gap-2">
+            {([
+              ["character_pet", "👤 Nhân vật + linh thú/thú nuôi", "Mặc định — nhân vật chính + bạn đồng hành đồng bộ xuyên suốt"],
+              ["scenery", "🏞️ Chỉ cảnh vật", "Không nhân vật, không con vật — khung cảnh ĐỘNG theo ý tưởng (nước chảy, mây trôi, gió, máy quay chuyển động bình thường)"],
+            ] as const).map(([key, label, desc]) => {
+              const active = castMode === key;
+              return (
+                <button
+                  key={key}
+                  disabled={busy || updateProject.isPending}
+                  onClick={() => updateProject.mutate({ cast_mode: key })}
+                  className={`rounded-lg border px-3 py-2 text-left transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                    active
+                      ? "border-accent bg-accent/15 text-white"
+                      : "border-white/10 bg-background text-gray-300 hover:bg-white/5"
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5 text-sm font-semibold">
+                    <span>{active ? "●" : "○"}</span>{label}
+                  </span>
+                  <span className="mt-0.5 block text-[11px] text-gray-400">{desc}</span>
+                </button>
+              );
+            })}
+          </div>
+          {castStale && (
+            <p className="mb-2 text-xs text-amber-300/80">
+              ⚠️ Bộ ảnh hiện tại được vẽ theo chế độ{" "}
+              «{p.cast_mode === "scenery" ? "🏞️ Chỉ cảnh vật" : "👤 Nhân vật + linh thú"}» — bấm{" "}
+              <b>Làm lại từ đầu</b> (bước ① ảnh) để vẽ lại theo lựa chọn mới.
+            </p>
+          )}
           <textarea
             value={idea}
             onChange={(e) => setIdea(e.target.value)}
             disabled={busy}
             rows={4}
-            placeholder="Ví dụ: Một chú cáo nhỏ đi lang thang trong rừng mùa thu, dừng lại uống trà bên suối lúc hoàng hôn…"
+            placeholder={scenery
+              ? "Ví dụ: Rừng trúc xanh sau mưa, suối nhỏ chảy qua đá rêu, sương sớm và nắng xuyên qua lá…"
+              : "Ví dụ: Một chú cáo nhỏ đi lang thang trong rừng mùa thu, dừng lại uống trà bên suối lúc hoàng hôn…"}
             className="w-full resize-y rounded-lg border border-white/10 bg-background px-3 py-2 text-sm text-gray-200 placeholder:text-gray-600 focus:border-accent focus:outline-none disabled:opacity-50"
           />
+          {scenery ? (
+          <p className="mt-2 text-xs text-gray-500">
+            AI sẽ bám theo ý tưởng để viết prompt cho từng cảnh — tỉ lệ <b>16:9</b>, phong cách{" "}
+            <b>{currentStyle?.label ?? videoStyle}</b>, <b>không nhân vật, không con vật</b>.
+            AI vẽ <b>bảng thiết kế bối cảnh</b> và <b>bảng ánh sáng / không khí</b> của nơi chốn
+            trong ý tưởng rồi đưa cả hai vào {p.clip_engine_label ?? "Flow/Veo"} làm nguyên liệu
+            cho {p.total_clips} clip — mỗi clip một góc khác của cùng khung cảnh, là{" "}
+            <b>cảnh động</b> chứ không phải ảnh tĩnh: nước chảy, mây trôi, gió lùa cây cỏ, mưa /
+            tuyết / cánh hoa rơi, ánh sáng đổi, máy quay chuyển động mượt (dolly, lia, cẩu…),
+            ghép ở tốc độ thật. Ảnh bìa không chứa chữ; thumbnail có chữ được tạo khi ghép video.
+          </p>
+          ) : (
           <p className="mt-2 text-xs text-gray-500">
             AI sẽ bám theo ý tưởng để viết prompt cho từng cảnh — mặc định tỉ lệ
             <b> 16:9</b>, phong cách <b>{currentStyle?.label ?? videoStyle}</b>,
@@ -433,9 +691,10 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
             AI vẽ <b>bảng phân tích nhân vật chính</b> và <b>bảng linh thú</b> (có nhãn chữ tiếng Anh,
             turnaround trước/nghiêng/sau, biểu cảm, chú thích chi tiết, dải màu) rồi đưa cả hai vào
             {p.clip_engine_label ?? "Flow/Veo"} làm nguyên liệu cho {p.total_clips} clip khác bối cảnh. Nếu ý tưởng chưa có linh thú,
-            AI tự nghĩ một con hợp bối cảnh. Riêng ảnh bìa không chứa chữ; tiêu đề được ghép vào đầu
-            video và xuất thumbnail riêng khi ghép.
+            AI tự nghĩ một con hợp bối cảnh. Riêng ảnh bìa không chứa chữ; thumbnail có chữ được
+            tạo khi ghép video và {introMode === "thumbnail" ? "mở đầu video từ 00:00" : "intro dùng chữ font"}.
           </p>
+          )}
           <p className="mt-1 text-xs text-gray-600">
             Để trống → dùng bộ prompt mặc định. Cần cấu hình API key ở
             ⚙️ Settings để AI viết prompt.
@@ -593,7 +852,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
               </div>
               <button className={`${ghost} w-full`} disabled={busy || !clipsDone || !hasAudio}
                       onClick={() => assemble.mutate(undefined)}>
-                Ghép video (clip 00 một lần · T+{p.t_window} · fade {p.blend_seconds}s)
+                Ghép video ({introMode === "thumbnail" ? "intro thumbnail → " : ""}clip 00 một lần · T+{p.t_window} · fade {p.blend_seconds}s)
               </button>
             </div>
           </div>
@@ -602,67 +861,52 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
         <Section title="Đăng nháp lên YouTube (qua GPMLogin)">
           <p className="mb-3 text-xs text-gray-500">
             Sau khi có <code className="text-gray-400">final.mp4</code>, tool mở đúng
-            profile GPMLogin (theo <b>nhạc cụ</b> + <b>phong cách nhạc</b> bên dưới),
+            profile GPMLogin của <b>kênh YouTube</b> chọn bên dưới,
             AI đọc thumbnail để viết title/description (nhắc tên kênh, tránh trùng),
             đặt cấu hình chuẩn (không dành cho trẻ em · không quảng cáo · có yếu tố AI ·
             ngôn ngữ Anh–Mỹ) rồi <b>lưu bản nháp</b>. <b>KHÔNG bao giờ publish</b> —
             bạn tự đăng khi muốn.
           </p>
 
-          <div className="grid grid-cols-2 gap-2">
-            <label className="block">
-              <span className="mb-1 block text-[11px] uppercase tracking-wide text-gray-500">
-                Nhạc cụ
-              </span>
-              <input
-                type="text"
-                value={instrument}
-                onChange={(e) => setInstrument(e.target.value)}
-                disabled={busy}
-                placeholder="vd: flute, piano, guitar"
-                className="w-full rounded-lg border border-white/10 bg-background px-3 py-2 text-sm text-gray-200 placeholder:text-gray-600 focus:border-accent focus:outline-none disabled:opacity-50"
-              />
-            </label>
-            <label className="block">
-              <span className="mb-1 block text-[11px] uppercase tracking-wide text-gray-500">
-                Phong cách nhạc
-              </span>
-              <input
-                type="text"
-                value={musicStyle}
-                onChange={(e) => setMusicStyle(e.target.value)}
-                disabled={busy}
-                placeholder="vd: ambient, lofi, healing"
-                className="w-full rounded-lg border border-white/10 bg-background px-3 py-2 text-sm text-gray-200 placeholder:text-gray-600 focus:border-accent focus:outline-none disabled:opacity-50"
-              />
-            </label>
-          </div>
-
-          <div className="mt-3 flex items-center gap-2">
-            <button
-              className={`${btn} bg-surface-2 text-gray-200 hover:bg-white/10`}
-              disabled={updateProject.isPending || !ytFieldsDirty}
-              onClick={() =>
+          <label className="block">
+            <span className="mb-1 block text-[11px] uppercase tracking-wide text-gray-500">
+              Kênh YouTube đăng nháp
+            </span>
+            <select
+              value={chosenChannelId != null ? String(chosenChannelId) : ""}
+              disabled={busy || updateProject.isPending}
+              onChange={(e) =>
                 updateProject.mutate({
-                  instrument: instrument.trim(),
-                  music_style: musicStyle.trim(),
+                  channel_id: e.target.value ? Number(e.target.value) : null,
                 })
               }
+              className="w-full rounded-lg border border-white/10 bg-background px-3 py-2 text-sm text-gray-200 focus:border-accent focus:outline-none disabled:opacity-50"
             >
-              💾 Lưu nhạc cụ / phong cách
-            </button>
-            {ytFieldsDirty && (
-              <span className="text-xs text-yellow-300">Có thay đổi chưa lưu</span>
-            )}
-          </div>
+              <option value="">🤖 Tự chọn kênh theo nhạc cụ</option>
+              {(channelMappings ?? []).map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.channel_name || `(kênh #${m.id} chưa đặt tên)`}
+                  {m.look_label ? ` — ${m.look_label}` : ""}
+                </option>
+              ))}
+            </select>
+          </label>
           <p className="mt-1 text-xs text-gray-600">
-            Cặp (nhạc cụ · phong cách) được dùng để tra <b>bảng ánh xạ kênh</b> trong
-            ⚙️ Settings → chọn đúng profile GPMLogin + hashtag + ngôn ngữ.
+            {chosenChannelId != null && effectiveChannelId != null ? (
+              <>✅ Lưu nháp lên kênh <b className="text-gray-400">«{effectiveChannelName || `#${effectiveChannelId}`}»</b>{" "}
+                — nhạc cụ / thể loại nào cũng được.</>
+            ) : effectiveChannelId != null ? (
+              <>Tự chọn → kênh <b className="text-gray-400">«{effectiveChannelName || `#${effectiveChannelId}`}»</b>{" "}
+                (khớp nhạc cụ <i>{project?.instrument}</i> · <i>{project?.music_style}</i>). Chọn kênh khác ở trên nếu muốn.</>
+            ) : (
+              <>Kênh quyết định profile GPMLogin + hashtag + ngôn ngữ (⚙️ Settings →
+                YouTube/GPMLogin). <b>Kênh nào cũng nhận nhạc cụ nào</b> — chỉ cần chọn kênh.</>
+            )}
           </p>
 
           <button
             className={`${primary} mt-3 w-full`}
-            disabled={busy || !st.final_exists || !ytFieldsSet || ytFieldsDirty}
+            disabled={busy || !st.final_exists || !ytChannelSet}
             onClick={() => {
               if (confirm("Mở GPMLogin, đăng NHÁP video lên YouTube (không publish)?")) {
                 uploadYoutube.mutate(undefined);
@@ -673,7 +917,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
           </button>
           <button
             className={`${ghost} mt-2 w-full`}
-            disabled={busy || !st.final_exists || !ytFieldsSet || ytFieldsDirty}
+            disabled={busy || !st.final_exists || !ytChannelSet}
             onClick={() => {
               if (confirm(
                 "Cắt 1 đoạn DỌC 9:16 ở GIỮA video → YouTube Short, AI viết tiêu đề/hook/mô tả ngắn, " +
@@ -689,14 +933,9 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
               ⚠️ Chưa có final.mp4 — hãy render video trước.
             </p>
           )}
-          {st.final_exists && !ytFieldsSet && (
+          {st.final_exists && !ytChannelSet && (
             <p className="mt-1 text-xs text-yellow-300">
-              ⚠️ Hãy nhập &amp; lưu <b>nhạc cụ</b> và <b>phong cách nhạc</b> trước.
-            </p>
-          )}
-          {st.final_exists && ytFieldsSet && ytFieldsDirty && (
-            <p className="mt-1 text-xs text-yellow-300">
-              ⚠️ Lưu thay đổi nhạc cụ/phong cách trước khi đăng.
+              ⚠️ Hãy <b>chọn kênh YouTube</b> ở trên trước khi đăng.
             </p>
           )}
 
@@ -713,7 +952,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
               <br />
               <span className="text-gray-500">
                 Khi <code className="text-gray-400">final.mp4</code> được tạo, hệ thống
-                tự đăng nháp (chỉ chạy nếu đã có nhạc cụ/phong cách + ánh xạ kênh).
+                tự đăng nháp (chỉ chạy khi đã có kênh YouTube — chọn ở trên).
               </span>
             </span>
           </label>
@@ -797,7 +1036,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
             <li>Lần đầu, cửa sổ trình duyệt sẽ mở ra để bạn <b>tự đăng nhập Gemini & Flow</b> (session được lưu lại).</li>
             <li>Automation Gemini/Flow là best-effort — nếu báo lỗi "không tìm thấy selector", cập nhật trong <code className="text-gray-400">backend/video/config.py</code>.</li>
             <li>Chỉ chạy 1 tác vụ video tại một thời điểm.</li>
-            <li>Đăng YouTube cần bật <b>Local API</b> trong GPMLogin và mỗi profile đã đăng nhập sẵn kênh. Cấu hình ánh xạ kênh ở ⚙️ Settings.</li>
+            <li>Đăng YouTube cần bật <b>Local API</b> trong GPMLogin và mỗi profile đã đăng nhập sẵn kênh. Thêm kênh ở ⚙️ Settings, chọn kênh cho project ở mục «Đăng nháp YouTube».</li>
           </ul>
         </Section>
       </div>

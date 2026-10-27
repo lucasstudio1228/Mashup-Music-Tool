@@ -61,9 +61,14 @@ def run():
           cfg.model == "gpt-4o-mini" and
           cfg.is_configured() is True)
     results.append(("APIConfig reads env vars", ok))
-    del os.environ["OPENAI_API_KEY"]
+    # APIConfig cố tình rơi về ANTHROPIC_API_KEY (tương thích ngược), nên muốn
+    # thử nhánh "không có key" phải xoá CẢ HAI — máy thật có .env sẽ còn
+    # ANTHROPIC_API_KEY và nhánh này không bao giờ chạy tới.
+    saved = {k: os.environ.pop(k) for k in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+             if k in os.environ}
     cfg2 = APIConfig()
     results.append(("APIConfig.is_configured() False when no key", not cfg2.is_configured()))
+    os.environ.update(saved)
 
     # Report
     print("\n=== PHASE 1 VERIFICATION ===")

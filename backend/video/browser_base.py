@@ -88,6 +88,86 @@ def _seed_profile(src: Path, dst: Path) -> None:
         dst.mkdir(parents=True, exist_ok=True)
 
 
+# ── Playwright sync: tối đa 1 phiên sống / luồng ─────────────────
+# sync_playwright().start() đặt event loop của nó làm «loop đang chạy» của CẢ
+# LUỒNG cho tới khi stop(). Phiên nào bị RÒ (vd __enter__ lỗi sau khi đã start
+# → __exit__ không chạy) sẽ đầu độc luồng: mọi lần start sau trong luồng đó ném
+# «It looks like you are using Playwright Sync API inside the asyncio loop».
+# Worker Video/Suno chỉ có 1 luồng dùng chung → 1 lần rò làm hỏng MỌI job sau
+# (2026-10-25: lô 17 hỏng cả 3 sản phẩm, clip Muse + Suno). Mọi chỗ mở
+# Playwright đi qua start_playwright(): ghi sổ phiên sống theo luồng và dọn
+# phiên rò trước khi mở phiên mới (2 phiên cùng luồng vốn không chạy được).
+_pw_local = threading.local()
+# Phiên dừng dở (stop lỗi giữa chừng): giữ tham chiếu mãi để greenlet treo của
+# nó KHÔNG bị GC — GC ném GreenletExit vào nó, chạy finally của run_forever và
+# gỡ «loop đang chạy» của phiên MỚI cùng luồng.
+_zombies: list = []
+
+
+def _live_sessions() -> list:
+    live = getattr(_pw_local, "live", None)
+    if live is None:
+        live = _pw_local.live = []
+    return live
+
+
+def _clear_stale_loop(loop) -> bool:
+    """Gỡ «loop đang chạy» của luồng nếu đó là loop của phiên Playwright đã
+    dừng/rò (không đụng loop khác, vd loop của uvicorn)."""
+    import asyncio
+    try:
+        cur = asyncio._get_running_loop()
+    except Exception:
+        return False
+    if cur is None or cur is not loop:
+        return False
+    asyncio.events._set_running_loop(None)
+    return True
+
+
+def reap_leaked_playwright(reason: str = "") -> int:
+    """Dừng mọi phiên Playwright còn sống trong luồng hiện tại. Trả số phiên đã
+    dọn. Gọi trước khi mở phiên mới và khi 1 job worker kết thúc."""
+    live = _live_sessions()
+    n = len(live)
+    for pw, _loop in reversed(list(live)):
+        try:
+            pw.stop()          # wrapper của start_playwright → tự rời sổ + gỡ loop
+        except Exception as e:  # noqa: BLE001
+            print(f"  ⚠️ Không dừng gọn được phiên Playwright rò: {e}")
+    live.clear()
+    if n:
+        print(f"  🧹 Đã dọn {n} phiên Playwright bị bỏ ngỏ trong luồng "
+              f"{threading.current_thread().name}" + (f" ({reason})" if reason else ""))
+    return n
+
+
+def start_playwright():
+    """sync_playwright().start() an toàn cho luồng worker dùng chung."""
+    reap_leaked_playwright("trước khi mở phiên mới")
+    from playwright.sync_api import sync_playwright
+    pw = sync_playwright().start()
+    cm_stop = pw.stop                    # = PlaywrightContextManager.__exit__
+    loop = getattr(getattr(cm_stop, "__self__", None), "_loop", None)
+    live = _live_sessions()
+    entry = (pw, loop)
+    live.append(entry)
+
+    def stop(*_args):
+        try:
+            cm_stop()
+        except BaseException:
+            _zombies.append(entry)
+            raise
+        finally:
+            if entry in live:
+                live.remove(entry)
+            _clear_stale_loop(loop)
+
+    pw.stop = stop
+    return pw
+
+
 class BrowserSession:
     """Bọc 1 persistent browser context. Dùng như context manager."""
 
@@ -110,7 +190,7 @@ class BrowserSession:
 
     def __enter__(self) -> "BrowserSession":
         try:
-            from playwright.sync_api import sync_playwright
+            import playwright.sync_api  # noqa: F401
         except Exception as e:
             raise RuntimeError(
                 "Chưa cài Playwright. Trong .venv chạy:\n"
@@ -133,6 +213,16 @@ class BrowserSession:
             except Exception:
                 self._old_policy = None
 
+        try:
+            self._launch()
+        except BaseException:
+            # __exit__ KHÔNG chạy khi __enter__ raise → tự dọn (dừng Playwright,
+            # trả policy), kẻo phiên rò đầu độc luồng worker (xem start_playwright).
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def _launch(self) -> None:
         # Trình duyệt ngoài (vd Cốc Cốc): Google Flow CHẶN Chromium bundled của
         # Playwright («hoạt động bất thường») nhưng chấp nhận Cốc Cốc.
         exe = config.resolve_browser_exe(self.site)
@@ -144,7 +234,7 @@ class BrowserSession:
             print(f"  🌐 Trình duyệt: {exe}")
 
         self.profile_dir.mkdir(parents=True, exist_ok=True)
-        self._pw = sync_playwright().start()
+        self._pw = start_playwright()
 
         # Tự tải Chromium riêng nếu chưa có (chỉ 1 lần) → dự phòng khi không có
         # trình duyệt ngoài.
@@ -152,10 +242,6 @@ class BrowserSession:
             try:
                 _install_chromium()
             except Exception as e:
-                try:
-                    self._pw.stop()
-                except Exception:
-                    pass
                 raise RuntimeError(
                     "Chưa tải được Chromium cho tool. Hãy chạy thủ công 1 lần:\n"
                     "  .venv\\Scripts\\playwright.exe install chromium\n"
@@ -196,10 +282,6 @@ class BrowserSession:
                 continue
 
         if last_err is not None or self.context is None:
-            try:
-                self._pw.stop()
-            except Exception:
-                pass
             raise RuntimeError(
                 "Không mở được trình duyệt cho automation. Hãy tải trình duyệt "
                 "cho Playwright (1 lần):\n"
@@ -209,20 +291,31 @@ class BrowserSession:
 
         self.context.set_default_timeout(BROWSER.action_timeout_ms)
         self.context.set_default_navigation_timeout(BROWSER.nav_timeout_ms)
-        return self
 
     def __exit__(self, *exc):
+        # Dọn dẹp KHÔNG được ném lỗi: trình duyệt đã sập/bị đóng tay thì
+        # context.close() lỗi — vẫn PHẢI dừng Playwright (không thì luồng worker
+        # bị đầu độc) và không che mất lỗi gốc của job.
+        ctx, pw = self.context, self._pw
+        self.context, self._pw = None, None
         try:
-            if self.context:
-                self.context.close()
+            if ctx:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
         finally:
-            if self._pw:
-                self._pw.stop()
+            if pw:
+                try:
+                    pw.stop()
+                except Exception as e:      # noqa: BLE001
+                    print(f"  ⚠️ Dừng Playwright lỗi: {e}")
             # Khôi phục policy Selector cho phần còn lại của tiến trình.
             try:
                 import asyncio as _asyncio
                 if self._old_policy is not None:
                     _asyncio.set_event_loop_policy(self._old_policy)
+                    self._old_policy = None
             except Exception:
                 pass
 

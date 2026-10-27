@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { useSettings, useUpdateSettings, useTestApi } from '../../api/settings';
 import type { AppSettingsUpdate, ApiTestResult } from '../../types';
 import { YoutubeGpmSettings } from './YoutubeGpmSettings';
+import { ThumbnailAiSettings } from './ThumbnailAiSettings';
 
 interface Props {
   open: boolean;
@@ -214,6 +215,9 @@ export function SettingsModal({ open, onClose }: Props) {
                 )}
               </div>
             )}
+
+            {/* Thumbnail AI (ảnh + chữ qua API) */}
+            <ThumbnailAiSettings />
 
             {/* YouTube / GPMLogin */}
             <YoutubeGpmSettings />

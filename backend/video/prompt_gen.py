@@ -24,6 +24,7 @@ khi mở công cụ tạo media, không thay ý tưởng bằng cảnh mặc đ�
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Optional
 
@@ -35,9 +36,37 @@ from .translate import TranslationError, non_english_fields, to_english
 # config.VideoParams.scene_clips.
 DEFAULT_SCENE_COUNT = 20
 
-# Tỉ lệ cảnh tối thiểu phải nhắc ĐÚNG nhạc cụ của project (người dùng chốt: làm
-# nhạc piano thì nhân vật phải đánh piano, không phải gõ laptop/ôm guitar).
-MIN_INSTRUMENT_SCENE_RATIO = 0.6
+# HOẠT ĐỘNG của nhân vật qua N cảnh. Trước 2026-10-25 luật là ≥60% cảnh phải
+# CHƠI nhạc cụ → 20 clip gần như cùng một tư thế; người dùng: "tạo nhiều hoạt
+# động khác chứ không phải chỉ mỗi chơi nhạc cụ". Giờ chỉ 20–30% cảnh chơi nhạc
+# cụ (cảnh 0 = clip intro luôn chơi, khớp ảnh bìa), còn lại mỗi cảnh MỘT hoạt
+# động đời thường êm KHÁC nhau. Nhạc cụ vẫn khoá đúng loại (piano là piano).
+PLAYING_SCENE_RATIO = (0.2, 0.3)
+# Trong các cảnh KHÔNG chơi nhạc cụ, tối thiểu chừng này phần có hoạt động khác nhau.
+MIN_DISTINCT_ACTIVITY_RATIO = 0.75
+# Gợi ý cho AI (chậm, êm, an toàn với bộ lọc Veo: không lửa/khói/hơi nước).
+CALM_ACTIVITIES = (
+    "reading a book", "writing in a journal", "sketching in a sketchbook",
+    "painting a small watercolour", "watering potted plants", "tending a herb garden",
+    "arranging wildflowers in a vase", "pouring tea into a small cup",
+    "walking slowly along a path", "strolling along the shore",
+    "gazing at the view from a quiet spot", "gentle stretching or slow tai chi",
+    "meditating with eyes closed", "petting or brushing the companion",
+    "feeding the companion", "fishing with a bamboo rod", "rowing a small wooden boat",
+    "picking fruit or berries into a basket", "gathering herbs or flowers",
+    "sweeping fallen leaves", "hanging laundry in the breeze", "folding paper cranes",
+    "knitting a scarf", "brush calligraphy", "flying a kite", "skipping stones on water",
+    "feeding koi or birds", "stacking a small stone cairn",
+    "washing vegetables in a stream", "writing a letter", "resting in a hammock",
+    "watching rain from a window", "stargazing on a blanket",
+)
+
+
+def playing_scene_range(n: int) -> tuple[int, int]:
+    """(tối thiểu, tối đa) số cảnh nhân vật CHƠI nhạc cụ trong n cảnh."""
+    lo = max(1, math.ceil(n * PLAYING_SCENE_RATIO[0] - 1e-9))
+    hi = max(lo, math.floor(n * PLAYING_SCENE_RATIO[1] + 1e-9))
+    return lo, hi
 
 
 def _instrument_coverage(scenes: dict[str, str] | None, spec) -> float:
@@ -45,6 +74,97 @@ def _instrument_coverage(scenes: dict[str, str] | None, spec) -> float:
         return 1.0
     hits = sum(1 for v in scenes.values() if music_spec.mentions_instrument(v, spec))
     return hits / max(1, len(scenes))
+
+
+def _scene_items(raw) -> list[dict]:
+    """'scenes' (list/dict như AI trả) → [{prompt, activity, flag}] theo thứ tự."""
+    if isinstance(raw, dict):
+        raw = [raw[k] for k in sorted(raw, key=lambda k: int(k) if str(k).isdigit() else 10**6)]
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for it in raw:
+        if isinstance(it, dict):
+            prompt, act, flag = it.get("prompt"), it.get("activity"), it.get("plays_instrument")
+        else:
+            prompt, act, flag = it, "", None
+        out.append({"prompt": prompt if isinstance(prompt, str) else "",
+                    "activity": act.strip() if isinstance(act, str) else "", "flag": flag})
+    return out
+
+
+def _play_re(spec) -> re.Pattern:
+    names = {spec["label"].lower(), *(a.lower() for a in spec.get("aliases", []))}
+    names -= _AMBIGUOUS_ALIASES
+    alt = "|".join(sorted((re.escape(x) for x in names if x), key=len, reverse=True))
+    return re.compile(rf"\bplay(?:s|ing|ed)?\s+(?:on\s+)?(?:(?:the|a|an|her|his|their)\s+)?"
+                      rf"(?:[\w-]+\s+){{0,2}}(?:{alt})s?\b", re.I)
+
+
+def _plays_in(item: dict, spec) -> bool:
+    """Cảnh này nhân vật CHƠI nhạc cụ? Theo cờ plays_instrument của AI; thiếu cờ
+    → prompt có nhắc nhạc cụ; cờ false mà prompt vẫn ghi "playing the piano" → chơi."""
+    flag = item.get("flag")
+    if isinstance(flag, str):
+        flag = flag.strip().lower() in ("true", "yes", "y", "1")
+    if flag is True:
+        return True
+    text = f"{item.get('activity', '')} {item.get('prompt', '')}"
+    if flag is None:
+        return bool(spec) and music_spec.mentions_instrument(text, spec)
+    return bool(spec) and bool(_play_re(spec).search(text))
+
+
+_ACT_STOP = {"the", "a", "an", "her", "his", "their", "she", "he", "they", "character",
+             "main", "while", "and", "with", "on", "in", "at", "by", "to", "of", "is",
+             "are", "very", "quiet", "calm", "slow", "gentle", "soft", "lazy", "peaceful"}
+
+
+def _activity_key(text: str) -> str:
+    """Động từ chính của hoạt động ("reading a book" → "read") để so trùng."""
+    for w in re.findall(r"[a-z]+", (text or "").lower()):
+        if w in _ACT_STOP or w.endswith("ly"):
+            continue
+        return w[:-3] if w.endswith("ing") and len(w) > 5 else w
+    return ""
+
+
+def _activity_report(raw, spec, n: int) -> dict:
+    """Kiểm bộ cảnh: số cảnh chơi nhạc cụ nằm trong khoảng cho phép + các cảnh
+    còn lại có hoạt động KHÁC nhau. `off` = độ lệch (0 = đạt) để chọn bộ tốt nhất."""
+    items = _scene_items(raw)[:n]
+    plays = [_plays_in(it, spec) for it in items]
+    n_play = sum(plays)
+    # AI bỏ trường "activity" → đoán từ câu đầu prompt (hồ sơ cũ).
+    keys = [_activity_key(it["activity"] or it["prompt"])
+            for it, p in zip(items, plays) if not p]
+    distinct = len({k for k in keys if k})
+    lo, hi = playing_scene_range(n) if spec else (0, n)
+    need = math.ceil(len(keys) * MIN_DISTINCT_ACTIVITY_RATIO) if keys else 0
+    probs = []
+    if spec and not lo <= n_play <= hi:
+        probs.append(f"{n_play}/{n} cảnh chơi {spec['label']} (cần {lo}–{hi})")
+    if distinct < need:
+        probs.append(f"chỉ {distinct} hoạt động khác nhau ở {len(keys)} cảnh không chơi "
+                     f"nhạc (cần ≥{need})")
+    off = max(0, lo - n_play) + max(0, n_play - hi) + max(0, need - distinct)
+    return {"playing": n_play, "distinct": distinct, "problem": "; ".join(probs), "off": off}
+
+
+def _activity_summary(rep: dict, spec) -> str:
+    return ((f", {rep['playing']} cảnh chơi {spec['label']}" if spec else "")
+            + f", {rep['distinct']} hoạt động khác")
+
+
+def _playing_first(raw, spec):
+    """Cảnh 0 = clip INTRO (phát 1 lần đầu video, khớp ảnh bìa đang chơi nhạc cụ)
+    → đưa cảnh chơi nhạc cụ đầu tiên lên vị trí 0."""
+    if not spec or not isinstance(raw, list):
+        return raw
+    for i, it in enumerate(_scene_items(raw)):
+        if _plays_in(it, spec):
+            return raw if i == 0 else [raw[i], *raw[:i], *raw[i + 1:]]
+    return raw
 
 
 def _scene_bodies(raw) -> dict[str, str]:
@@ -277,6 +397,9 @@ def _instrument_identity(spec) -> str:
         line += (f" The {name} is a large fixed instrument: the character sits at it "
                  f"and never holds, lifts or carries it"
                  f"{'; ' + spec['placement'] if spec.get('placement') else ''}.")
+    # Từ 2026-10-25 chỉ 20–30% cảnh chơi nhạc cụ; khối này dán vào MỌI cảnh.
+    line += (" Show the character playing it only when the SCENE says so; otherwise "
+             "follow the SCENE's activity.")
     return line
 
 
@@ -441,20 +564,42 @@ def _style_notes(style: str) -> tuple[str, str]:
 def _instrument_prompt_parts(spec, n: int) -> tuple[str, str, str]:
     """(khối luật, vế chuyển động cảnh, vế thumbnail) theo nhạc cụ project."""
     if not spec:
-        return ("", "character micro-motions (fingers pressing flute holes, shoulders "
-                    "breathing very gently, eyelids blinking)", "")
+        return ("", "the character doing this scene's own calm ACTIVITY with slow, "
+                    "natural, anatomically correct hand motion, shoulders breathing very "
+                    "gently, eyelids softly blinking", "")
     name = spec["label"].lower()
-    need = max(1, -(-n * int(MIN_INSTRUMENT_SCENE_RATIO * 10) // 10))
+    lo, hi = playing_scene_range(n)
     block = (f"\n{music_spec.visual_instrument_rules(spec)}\n"
              f"The project NAME and DESCRIPTION define the mood, setting and story; "
-             f"the {spec['label']} defines what the character does: they PLAY it.\n")
-    scene = (f"the character PLAYING the {name} — {spec['motion']}; eyelids "
-             f"softly blinking. In AT LEAST {need} of the {n} "
-             f"scenes the character is actively playing the {name} ({spec['pose']}) and "
-             f"the word \"{name}\" appears in the prompt; in the others the {name} is "
-             f"clearly visible beside them")
+             f"the {spec['label']} is the music of the video: the character plays it in "
+             f"SOME scenes and spends the other scenes on calm everyday activities.\n")
+    away = (f"the {name} is absent or simply stands nearby, never carried"
+            if not spec["portable"] else f"the {name} is set down beside them so both "
+            "hands are free")
+    scene = (f"the character doing this scene's ACTIVITY with slow natural motion — in "
+             f"{lo} to {hi} of the {n} scenes (scene 1 always among them) the activity is "
+             f"PLAYING the {name} ({spec['pose']}; {spec['motion']}) and the word "
+             f"\"{name}\" appears in the prompt; in EVERY other scene the character does a "
+             f"DIFFERENT calm everyday activity (see ACTIVITIES) with relaxed, anatomically "
+             f"correct hands and {away}; eyelids softly blinking")
     thumb = f" The character is playing the {name} ({spec['pose']})."
     return block, scene, thumb
+
+
+def _activities_rule(spec, n: int) -> str:
+    """Luật ĐA DẠNG HOẠT ĐỘNG cho N cảnh (gửi kèm lời nhắc viết cảnh)."""
+    lo, hi = playing_scene_range(n)
+    playing = (f"{lo} to {hi} of the {n} scenes (scene 1 among them) show the character "
+               f"PLAYING the {spec['label'].lower()}; " if spec else "")
+    return (
+        f"ACTIVITIES — VARIETY IS REQUIRED: {playing}every other scene gives the character "
+        "a DIFFERENT calm everyday activity that suits its setting — never the same "
+        "activity twice and never just sitting and posing. Ideas to pick from and adapt "
+        f"(or invent others that fit the idea): {', '.join(CALM_ACTIVITIES)}. The companion "
+        "takes part naturally (watching, walking alongside, resting nearby, being petted). "
+        "Objects an activity needs (book, brush, watering can, cup, basket, rod, oar…) are "
+        "simple, held naturally with correct hands, and appear only in that scene. Every "
+        "activity is slow, gentle and needs no flame or heat (no cooking, no candle lighting).")
 
 
 # ── Bạn đồng hành (ảnh 2): thú cưng thật hay linh thú — theo BỐI CẢNH ─────
@@ -516,15 +661,31 @@ def _is_spirit(pet_kind: str, pet_text: str) -> bool:
 def _build_user_prompt(idea: str, title: str, keywords: str,
                        scene_count: int, aspect_ratio: str,
                        style: str, instrument_spec=None,
-                       companion_mode: str = "auto") -> str:
-    """Lời nhắc chính: yêu cầu AI trả hồ sơ nhân vật + bạn đồng hành + N bối cảnh."""
+                       companion_mode: str = "auto",
+                       thumbnail_directive: str = "") -> str:
+    """Lời nhắc chính: yêu cầu AI trả hồ sơ nhân vật + bạn đồng hành + N bối cảnh.
+    `thumbnail_directive` (thumbnail_recipe.composition_directive) đổi bố cục ảnh
+    bìa theo công thức riêng của video; rỗng → bố cục cũ (nhân vật phải, chữ trái)."""
     n = scene_count
+    if thumbnail_directive:
+        thumb_layout = (f"Follow this composition exactly — {thumbnail_directive}\n"
+                        f"   Aspect ratio {aspect_ratio}.")
+        thumb_json = ("70-120 word thumbnail prompt, NO text, following the THUMBNAIL "
+                      "COMPOSITION above (shot, placement, empty title area, lighting)")
+    else:
+        thumb_layout = ("Place the characters off-centre to the RIGHT, leaving clean negative space on\n"
+                        f"   the LEFT HALF. Aspect ratio {aspect_ratio}.")
+        thumb_json = "70-120 word thumbnail prompt, NO text, negative space on the left half"
     medium, style_note = _style_notes(style)
     inst = instrument_spec
     inst_block, inst_scene, inst_thumb = _instrument_prompt_parts(inst, n)
     inst_line = (f"EXACTLY the {inst['label']} above (never another instrument)"
                  if inst else "the specific instrument (flute, piano…)")
     companion_rule = _companion_rule(companion_mode)
+    activities = _activities_rule(inst, n)
+    lo, hi = playing_scene_range(n)
+    plays_req = (f" {lo}–{hi} items have \"plays_instrument\": true (item 1 among them);"
+                 if inst else "")
     return f"""USER IDEA: "{idea}"
 {inst_block}
 Project title (for the thumbnail): "{title}"
@@ -580,6 +741,7 @@ Design a chill / relaxing / meditation "{medium}" consisting of:
    • {n} CLEARLY DISTINCT locations/landscapes (different terrain, weather,
      time of day, altitude/camera distance). Never repeat a location.
    • KEEP the character, outfit, instrument, companion and main palette unchanged.
+   • {activities}
 
 5. SCENE PROMPTS (80–140 words each) — prompts for a VIDEO model (image-to-
    video, 8 seconds, ingredients = the 2 character sheets). Each prompt MUST have:
@@ -602,8 +764,7 @@ Design a chill / relaxing / meditation "{medium}" consisting of:
 6. THUMBNAIL — 70–120 words: the same character + companion, eye-catching,
    emotionally rich composition.{inst_thumb} ABSOLUTELY NO text/title/typography/logo/
    watermark in the image (the title "{title}" will be added later by software).
-   Place the characters off-centre to the RIGHT, leaving clean negative space on
-   the LEFT HALF. Aspect ratio {aspect_ratio}.
+   {thumb_layout}
 
 7. CONTENT SAFETY (the video model's safety filter rejects the whole clip
    otherwise): the main character is a peaceful ADULT (25+), never a child or
@@ -642,13 +803,14 @@ Return ONLY valid JSON (no explanation, no markdown):
   "pet_scale": "SIZE MAP comparing scale: human {{height}} versus companion {{height/length}}, described in one sentence",
   "pet_traits": ["3-5 personality traits (symbolic meanings only for a spirit creature), each 'UPPERCASE LABEL — short description'"],
   "palette": ["#RRGGBB — English colour name — role (character colour / companion colour / background colour / accent colour)"],
-  "thumbnail": "70-120 word thumbnail prompt, NO text, negative space on the left half",
+  "thumbnail": "{thumb_json}",
   "scenes": [
-    {{"setting": "short setting name", "prompt": "80-140 word scene prompt covering all 7 layers a–g"}}
+    {{"setting": "short setting name", "activity": "short activity, e.g. reading a book", "plays_instrument": false, "prompt": "80-140 word scene prompt covering all 7 layers a–g"}}
   ]
 }}
-Required: "scenes" has EXACTLY {n} items, each with non-empty "setting" and
-"prompt", {n} DIFFERENT "setting" values. "palette" has 5–7 items. "main_insets"
+Required: "scenes" has EXACTLY {n} items, each with non-empty "setting",
+"activity" and "prompt", {n} DIFFERENT "setting" values;{plays_req} every other
+item has a DIFFERENT "activity". "palette" has 5–7 items. "main_insets"
 and "pet_insets" have 5–8 items each. Do not leave any key above empty. All
 values in ENGLISH."""
 
@@ -677,13 +839,11 @@ def _build_scenes_user_prompt(idea: str, style: str, character_sheet: str,
     n = scene_count
     _, style_note = _style_notes(style)
     inst_block, inst_scene, _ = _instrument_prompt_parts(instrument_spec, n)
-    if instrument_spec:
-        inst_scene = inst_scene.replace("the character PLAYING", "(a) the character PLAYING")
-    else:
-        inst_scene = ("(a) character micro-motion matching the action (e.g.\n"
-                      "   playing the flute: fingertips lightly pressing the holes, shoulders and chest\n"
-                      "   rising and falling VERY GENTLY, clear air around the flute, eyelids\n"
-                      "   softly blinking)")
+    inst_scene = "(a) " + inst_scene
+    activities = _activities_rule(instrument_spec, n)
+    lo, hi = playing_scene_range(n)
+    plays_req = (f" {lo}–{hi} items have \"plays_instrument\": true (item 1 among them);"
+                 if instrument_spec else "")
     avoid_block = ""
     if avoid:
         joined = "; ".join(str(a).strip() for a in avoid if str(a).strip())
@@ -722,8 +882,10 @@ MANDATORY RULES for every prompt (80–140 words):
    EXTREMELY slow pan/push-in). No fade-in/fade-out.
 6. SHUFFLE-SAFE: the clips will be randomly shuffled ⇒ every scene must stand
    alone, never continue another scene, no order-dependent events.
+   {activities}
 7. PHRASE EVERYTHING POSITIVELY and keep it SAFE: describe what should happen
-   (calm steady pose, natural hands on the instrument, one continuous shot). NEVER write negative lists and NEVER mention smoke, steam, vapour,
+   (calm steady pose, natural hands on the instrument or on the activity's
+   object, one continuous shot). NEVER write negative lists and NEVER mention smoke, steam, vapour,
    fire, distortion, extra limbs, head spinning, blood or injuries —
    the safety filter rejects the clip on those words even when negated.
    Weapons are allowed when the character sheet / idea includes them — keep
@@ -735,10 +897,11 @@ MANDATORY RULES for every prompt (80–140 words):
 ═══ OUTPUT ═══ Return ONLY JSON (no explanation, no markdown):
 {{
   "scenes": [
-    {{"setting": "short setting name", "prompt": "80-140 word scene prompt"}}
+    {{"setting": "short setting name", "activity": "short activity, e.g. watering plants", "plays_instrument": false, "prompt": "80-140 word scene prompt"}}
   ]
 }}
-Required: "scenes" has EXACTLY {n} items, {n} DIFFERENT "setting" values, no empty item."""
+Required: "scenes" has EXACTLY {n} items, {n} DIFFERENT "setting" values;{plays_req}
+every other item has a DIFFERENT "activity"; no empty item."""
 
 
 def generate_scene_prompts(
@@ -751,11 +914,19 @@ def generate_scene_prompts(
     log=None,
     avoid: list[str] | None = None,
     instrument: str = "",
+    cast_mode: str = "character_pet",
 ) -> Optional[dict[str, str]]:
     """Sinh (hoặc sinh LẠI) bộ prompt cảnh cho các clip từ HAI character sheet.
 
     Dùng khi muốn đổi bối cảnh mà KHÔNG tạo lại ảnh. Trả dict đủ `scene_count`
-    khoá "0".."N-1", hoặc None nếu lỗi/không đủ."""
+    khoá "0".."N-1", hoặc None nếu lỗi/không đủ.
+    cast_mode="scenery": hai khoá là khối nơi chốn + không khí (không nhân vật)."""
+    if cast_mode == "scenery":
+        from . import scenery_prompts
+        return scenery_prompts.generate_scene_prompts(
+            character_sheet, pet_sheet, idea, style, api_config, scene_count,
+            log=log, avoid=avoid, instrument=instrument)
+
     def _log(m: str):
         if log:
             try:
@@ -831,30 +1002,28 @@ def generate_scene_prompts(
             last_reason = f"prompt cảnh còn chữ không phải tiếng Anh ({', '.join(bad[:4])})"
             _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — thử lại…")
             continue
-        scenes = _scene_dict(data.get("scenes"), n, ident, pet_sheet)
+        raw = _playing_first(data.get("scenes"), spec)
+        scenes = _scene_dict(raw, n, ident, pet_sheet)
         if scenes is None:
             last_reason = f"JSON prompt cảnh thiếu/không đủ {n} mục hợp lệ"
             _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — thử lại…")
             continue
-        bodies = _scene_bodies(data.get("scenes"))
-        cover = _instrument_coverage(bodies, spec)
-        misuse = _misuse_count(bodies, spec)
-        if cover < MIN_INSTRUMENT_SCENE_RATIO or misuse:
-            if best is None or (misuse, -cover) < (best[2], -best[1]):
-                best = (data.get("scenes"), cover, misuse)
+        misuse = _misuse_count(_scene_bodies(raw), spec)
+        report = _activity_report(raw, spec, n)
+        if report["off"] or misuse:
+            if best is None or (misuse, report["off"]) < (best[2], best[1]["off"]):
+                best = (raw, report, misuse)
             last_reason = (f"{misuse} cảnh tả {spec['label']} sai thực tế (cầm/bê/đặt "
-                           "trên bàn)" if misuse else
-                           f"chỉ {cover:.0%} cảnh có nhân vật chơi {spec['label']} "
-                           f"(cần ≥{MIN_INSTRUMENT_SCENE_RATIO:.0%})")
+                           "trên bàn)" if misuse else report["problem"])
             _log(f"[{attempt}/{_MAX_ATTEMPTS}] {last_reason} — viết lại…")
             continue
         _log(f"Đã sinh {n} prompt cảnh (tiếng Anh) từ hai character sheet ({model}"
-             f"{f', {cover:.0%} cảnh chơi ' + spec['label'] if spec else ''}).")
+             f"{_activity_summary(report, spec)}).")
         return scenes
     if best is not None:
         scenes = _scene_dict(_without_misuse(best[0], spec), n, ident, pet_sheet)
         if scenes:
-            _log(f"Dùng bộ cảnh tốt nhất ({best[1]:.0%} cảnh chơi {spec['label']}"
+            _log(f"Dùng bộ cảnh tốt nhất ({_activity_summary(best[1], spec)[2:]}"
                  f"{f', đã bỏ câu tả sai ở {best[2]} cảnh' if best[2] else ''}); khối "
                  "danh tính đầu mỗi prompt vẫn khoá đúng nhạc cụ.")
             return scenes
@@ -950,6 +1119,8 @@ def generate_prompts(
     creative_brief: str = "",
     metadata_out: Optional[dict] = None,
     instrument: str = "",
+    thumbnail_directive: str = "",
+    cast_mode: str = "character_pet",
 ) -> Optional[tuple[dict[str, str], dict[str, str]]]:
     """
     Trả về (prompts, motions) hoặc None nếu không dùng được AI.
@@ -961,7 +1132,15 @@ def generate_prompts(
     settings để caller lưu vào prompts.json làm khoá continuity.
     `api_config` là instance APIConfig (có api_key/base_url/model).
     `log` (tùy chọn): callable(msg) để ghi log tiến trình.
+    `cast_mode`="scenery" → CHỈ CẢNH VẬT (video/scenery_prompts.py).
     """
+    if cast_mode == "scenery":
+        from . import scenery_prompts
+        return scenery_prompts.generate_prompts(
+            idea, title, keywords, scene_count, aspect_ratio, style, api_config,
+            log=log, creative_brief=creative_brief, metadata_out=metadata_out,
+            instrument=instrument, thumbnail_directive=thumbnail_directive)
+
     def _log(m: str):
         if log:
             try:
@@ -1015,7 +1194,8 @@ def generate_prompts(
              "không linh thú.")
     user_msg = _build_user_prompt(idea, title, keywords, scene_count,
                                   aspect_ratio, style, instrument_spec=spec,
-                                  companion_mode=companion_mode)
+                                  companion_mode=companion_mode,
+                                  thumbnail_directive=thumbnail_directive)
     user_msg += ("\nSHARED CREATIVE BRIEF (reference data; the user's specific "
                  "requirements take priority over these palette/lighting "
                  "suggestions):\n" + creative_brief)
@@ -1162,17 +1342,16 @@ def generate_prompts(
         }
 
         # Caller bổ sung prompt cảnh riêng nếu thiếu; chưa đủ thì không chạy media.
-        motions = _scene_dict(data.get("scenes"), scene_count, ident, pet_sheet) or {}
-        bodies = _scene_bodies(data.get("scenes"))
-        cover = _instrument_coverage(bodies, spec)
-        misuse = _misuse_count(bodies, spec)
-        if motions and (cover < MIN_INSTRUMENT_SCENE_RATIO or misuse):
+        raw_scenes = _playing_first(data.get("scenes"), spec)
+        motions = _scene_dict(raw_scenes, scene_count, ident, pet_sheet) or {}
+        misuse = _misuse_count(_scene_bodies(raw_scenes), spec)
+        report = _activity_report(raw_scenes, spec, scene_count)
+        if motions and (report["off"] or misuse):
             # Hồ sơ nhân vật dùng được; chỉ bộ cảnh chưa đạt → để workflow viết
             # lại bộ cảnh (generate_scene_prompts có cùng kiểm tra).
             _log(f"{misuse} cảnh tả {spec['label']} sai thực tế — sẽ viết lại bộ cảnh."
-                 if misuse else
-                 f"Chỉ {cover:.0%} cảnh có nhân vật chơi {spec['label']} — sẽ viết "
-                 "lại bộ cảnh.")
+                 if misuse else f"Bộ cảnh chưa đủ đa dạng ({report['problem']}) — sẽ "
+                 "viết lại bộ cảnh.")
             motions = {}
         if len(motions) == scene_count:
             _log(f"Đã sinh 3 prompt ảnh (2 bảng phân tích nhân vật + ảnh bìa) "
@@ -1185,7 +1364,7 @@ def generate_prompts(
                 character_sheet=sheet, pet_sheet=pet_sheet, pet_name=pet_name,
                 pet_kind="spirit creature" if spirit else "pet", palette=palette,
                 character_bible=_text(data.get("character_bible")),
-                settings=_settings_of(data.get("scenes")))
+                settings=_settings_of(raw_scenes))
         return out, motions
 
     _log(f"AI không sinh được prompt sau {_MAX_ATTEMPTS} lần thử "

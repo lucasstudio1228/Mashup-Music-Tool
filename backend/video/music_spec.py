@@ -368,8 +368,9 @@ def visual_instrument_rules(spec: Optional[dict]) -> str:
         f"FIXED LEAD INSTRUMENT (chosen by the user — NON-NEGOTIABLE): {label.upper()} — "
         f"{spec['visual']}. The main character is a {label.lower()} player. "
         f"Correct playing position: {spec['pose']}. Playing motion: {spec['motion']}.{carry} "
-        f"Use ONLY this instrument everywhere (character sheet, thumbnail, every scene); "
-        f"never swap it for another instrument (no {', '.join(other_instruments(spec))}).")
+        f"Whenever an instrument appears (character sheet, thumbnail, the scenes where the "
+        f"character plays) it is ONLY this one; never swap it for another instrument "
+        f"(no {', '.join(other_instruments(spec))}).")
 
 
 # ══════════════════════════════════════════════════════════════════

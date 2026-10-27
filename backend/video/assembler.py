@@ -40,7 +40,8 @@ def _probe_resolution(path: str) -> tuple[int, int]:
 
 
 def overlay_title_on_clip(clip_path: str, title: str, subtitle: str,
-                          out_path: str, log=None) -> bool:
+                          out_path: str, log=None, *, style: Optional[dict] = None,
+                          bg_hint: Optional[str] = None) -> bool:
     """Chồng tiêu đề (giống thumbnail) lên TOÀN BỘ clip intro → `out_path`.
 
     Cần thiết vì clip_00 do Veo tạo LẠI cảnh từ ảnh 0 nên chữ nướng sẵn trong
@@ -71,7 +72,7 @@ def overlay_title_on_clip(clip_path: str, title: str, subtitle: str,
 
     png = Path(out_path).with_suffix(".title.png")
     if not thumbnail.render_title_overlay_png(
-            w, h, title, subtitle or "", png, log=log):
+            w, h, title, subtitle or "", png, log=log, style=style, bg_hint=bg_hint):
         return False
 
     # Cần độ dài clip để co lịch animation cho vừa clip ngắn. Lỗi probe → 8s.
@@ -98,14 +99,24 @@ def overlay_title_on_clip(clip_path: str, title: str, subtitle: str,
         d *= k; hold *= k; d_out *= k
     slide = max(12, int(h * 0.045))           # quãng trượt lên (px)
     out_st = d + hold                         # fade-out bắt đầu ngay sau lúc giữ
-    y_expr = f"if(lt(t\\,{d})\\,{slide}*(1-t/{d})\\,0)"
+    # Hướng trượt theo bố cục chữ: trái → từ trái vào, phải → từ phải vào,
+    # trên → rơi xuống, dưới / kiểu cũ → trượt lên.
+    layout = (style or {}).get("layout") if style else None
+    move = f"{slide}*(1-t/{d})"
+    x_expr, y_expr = "0", f"if(lt(t\\,{d})\\,{move}\\,0)"
+    if layout == "left":
+        x_expr, y_expr = f"if(lt(t\\,{d})\\,-{move}\\,0)", "0"
+    elif layout == "right":
+        x_expr, y_expr = f"if(lt(t\\,{d})\\,{move}\\,0)", "0"
+    elif layout == "top":
+        y_expr = f"if(lt(t\\,{d})\\,-{move}\\,0)"
     r = _run([
         "ffmpeg", "-y", "-i", clip_path, "-loop", "1", "-i", str(png),
         "-filter_complex",
         f"[1:v]scale={w}:{h},format=rgba,"
         f"fade=t=in:st=0:d={d}:alpha=1,"
         f"fade=t=out:st={out_st:.3f}:d={d_out}:alpha=1[t];"
-        f"[0:v][t]overlay=x=0:y={y_expr}:shortest=1:format=auto",
+        f"[0:v][t]overlay=x={x_expr}:y={y_expr}:shortest=1:format=auto",
         "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
         "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out_path),
     ])
@@ -187,6 +198,28 @@ def _mux_visual_list(list_path: Path, audio_path: str, out_path: Path,
         raise RuntimeError(f"ffmpeg mux visual list lỗi: {r.stderr.strip()[-400:]}")
 
 
+# Kiểu chuyển cảnh xfade cho phép (phong cách kênh chọn trong số này).
+# "softfade" = hoà tan ÊM: crossfade có easing smoothstep (vào/ra từ từ, không
+# giật ở đầu/cuối như fade tuyến tính). Từ 2026-10-25 mọi look dùng kiểu này
+# (người dùng: hblur/trượt ngang/nháy đen "gấp quá, không chill"); các kiểu cũ
+# giữ lại cho tương thích.
+XFADE_TRANSITIONS = ("softfade", "fade", "fadegrays", "fadeblack", "fadewhite",
+                     "hblur", "smoothleft", "smoothright", "dissolve")
+# P của xfade chạy 1 → 0 (1 = còn nguyên clip A). s = smoothstep(P).
+_SOFTFADE_EXPR = "A*(P*P*(3-2*P))+B*(1-P*P*(3-2*P))"
+# Crossfade không được dài quá ~nửa clip (2 lần hoà tan chồng nhau trong 1 clip).
+_MAX_BLEND_FRACTION = 0.45
+
+
+def _xfade(transition: str, duration: float, offset: float) -> str:
+    """Chuỗi filter xfade cho 1 lần chuyển cảnh."""
+    if transition == "softfade":
+        kind = f"custom:expr={_SOFTFADE_EXPR}"
+    else:
+        kind = transition
+    return f"xfade=transition={kind}:duration={duration}:offset={offset:.3f}"
+
+
 def assemble_video_blend(
     clip_sequence: list[str],
     audio_path: str,
@@ -198,13 +231,23 @@ def assemble_video_blend(
     height: int = 1080,
     fps: int = 30,
     progress_cb: Optional[Callable[[str, float], None]] = None,
+    grade: str = "",
+    transition: str = "softfade",
+    lead_image: Optional[str] = None,
+    lead_seconds: float = 7.0,
 ) -> dict:
     """
     Phát clip đầu đúng một lần làm intro. Các clip còn lại tạo thành visual
     cycle khép kín bằng `xfade` + làm chậm, rồi lặp đến đúng độ dài audio.
 
-    - Mỗi clip: setpts=PTS/slow_speed (chậm lại) + chuẩn hoá về width×height@fps.
-    - Nối bằng xfade fade dài `blend_seconds` giữa 2 clip liên tiếp → chuyển mượt.
+    - Mỗi clip: setpts=PTS/slow_speed (chậm lại) + chuẩn hoá về width×height@fps
+      (+ `grade` = chuỗi filter màu ffmpeg theo phong cách kênh, rỗng = giữ màu).
+    - Nối bằng xfade `transition` dài `blend_seconds` giữa 2 clip liên tiếp
+      (tự rút ngắn nếu vượt 45% clip ngắn nhất).
+    - `lead_image` (intro_mode="thumbnail"): video MỞ ĐẦU bằng chính ảnh
+      thumbnail (frame 00:00 = thumbnail nguyên vẹn, chữ AI giữ nguyên), đẩy máy
+      rất chậm (Ken Burns 1.0 → 1.06, smoothstep) trong `lead_seconds` giây rồi
+      hoà tan vào clip 00. Ảnh không qua `grade` để giống hệt thumbnail.
     """
     if not clip_sequence:
         raise ValueError("clip_sequence rỗng.")
@@ -223,31 +266,61 @@ def assemble_video_blend(
     n = len(clip_sequence)
     if n < 2:
         raise ValueError("Cần ít nhất 2 clip: 1 intro và 1 clip cho cycle.")
-    D = max(0.1, float(blend_seconds))
     _p(f"Đo độ dài {n} clip", 10.0)
     intro_clip = clip_sequence[0]
     cycle_clips = clip_sequence[1:]
     intro_dur = probe_duration(intro_clip) / slow_speed
     cycle_durs = [probe_duration(c) / slow_speed for c in cycle_clips]
+    D = max(0.1, min(float(blend_seconds),
+                     _MAX_BLEND_FRACTION * min([intro_dur, *cycle_durs])))
+    lead = lead_image if lead_image and Path(lead_image).exists() else None
+    L = max(float(lead_seconds or 0.0), D / _MAX_BLEND_FRACTION) if lead else 0.0
 
+    grade = (grade or "").strip().strip(",")
+    transition = transition if transition in XFADE_TRANSITIONS else "softfade"
     norm = (f"setpts=PTS/{slow_speed},"
             f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
-            f"fps={fps},format=yuv420p,settb=AVTB")
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
+            f"fps={fps}," + (f"{grade}," if grade else "")
+            + "format=yuv420p,settb=AVTB")
     # 1) Intro: clip_00 -> fade vào clip đầu cycle. Cắt đúng lúc clip cycle
     # đạt source-time D; visual cycle bên dưới cũng bắt đầu tại frame đó.
+    # Có lead_image: [thumbnail L giây] → fade → clip_00 → fade → clip đầu cycle.
     intro_script = out.parent / "_intro_filter.txt"
     intro_video = out.parent / "_visual_intro.mp4"
-    intro_parts = [f"[0:v]{norm}[v0]", f"[1:v]{norm}[v1]"]
+    if lead:
+        frames = max(int(round(L * fps)), 2)
+        x = f"min(on/{frames - 1},1)"
+        zoom = f"1+0.06*{x}*{x}*(3-2*{x})"
+        intro_parts = [
+            f"[0:v]scale={width * 2}:{height * 2}:force_original_aspect_ratio=increase"
+            ":flags=lanczos,"
+            f"crop={width * 2}:{height * 2},setsar=1,"
+            f"zoompan=z='{zoom}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+            f":d=1:s={width}x{height}:fps={fps},"
+            f"trim=end_frame={frames},setpts=PTS-STARTPTS,"
+            "format=yuv420p,settb=AVTB[vl]",
+            f"[1:v]{norm}[v0]", f"[2:v]{norm}[v1]",
+            f"[vl][v0]{_xfade(transition, D, L - D)}[il]",
+        ]
+        intro_total = L + intro_dur - D
+        intro_parts.append(
+            f"[il][v1]{_xfade(transition, D, max(0.0, intro_total - D))}[ix]")
+        intro_inputs = ["-loop", "1", "-framerate", str(fps), "-t", f"{L:.3f}",
+                        "-i", str(lead), "-i", intro_clip, "-i", cycle_clips[0]]
+        _p(f"Tạo intro: thumbnail {L:.0f}s (đẩy máy chậm) → clip 00 (chỉ một lần)", 20.0)
+    else:
+        intro_parts = [f"[0:v]{norm}[v0]", f"[1:v]{norm}[v1]"]
+        intro_total = intro_dur
+        intro_parts.append(
+            f"[v0][v1]{_xfade(transition, D, max(0.0, intro_dur - D))}[ix]")
+        intro_inputs = ["-i", intro_clip, "-i", cycle_clips[0]]
+        _p("Tạo intro từ clip 00 (chỉ một lần)", 20.0)
     intro_parts.append(
-        f"[v0][v1]xfade=transition=fade:duration={D}:"
-        f"offset={max(0.0, intro_dur - D):.3f}[ix]")
-    intro_parts.append(
-        f"[ix]trim=start=0:end={intro_dur:.3f},setpts=PTS-STARTPTS[vout]")
+        f"[ix]trim=start=0:end={intro_total:.3f},setpts=PTS-STARTPTS[vout]")
     intro_script.write_text(";".join(intro_parts) + "\n", encoding="utf-8")
-    _p("Tạo intro từ clip 00 (chỉ một lần)", 20.0)
     r = _run([
-        "ffmpeg", "-y", "-i", intro_clip, "-i", cycle_clips[0],
+        "ffmpeg", "-y", *intro_inputs,
         "-filter_complex_script", str(intro_script),
         "-map", "[vout]", "-an",
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
@@ -270,9 +343,7 @@ def assemble_video_blend(
     for k in range(1, m + 1):
         offset = max(0.0, running - D)
         outlbl = f"x{k}"
-        parts.append(
-            f"[{prev}][v{k}]xfade=transition=fade:"
-            f"duration={D}:offset={offset:.3f}[{outlbl}]")
+        parts.append(f"[{prev}][v{k}]{_xfade(transition, D, offset)}[{outlbl}]")
         prev = outlbl
         running = running + cycle_input_durs[k] - D
 
@@ -303,7 +374,7 @@ def assemble_video_blend(
         raise RuntimeError(f"ffmpeg tạo visual cycle lỗi: {r.stderr.strip()[-500:]}")
 
     # 3) Danh sách hình: intro đúng một lần, sau đó chỉ lặp cycle 01..N.
-    repeats = max(1, math.ceil(max(target_seconds - intro_dur, 0.0)
+    repeats = max(1, math.ceil(max(target_seconds - intro_total, 0.0)
                                / cycle_seconds) + 1)
     visual_list = out.parent / "_visual_list.txt"
     _write_concat_list([str(intro_video)] + [str(cycle_video)] * repeats,
@@ -320,7 +391,9 @@ def assemble_video_blend(
 
     dur = probe_duration(str(out))
     _p("Hoàn thành", 100.0)
-    return {"output": str(out), "duration": dur, "clip_count": n}
+    return {"output": str(out), "duration": dur, "clip_count": n,
+            "lead_image": str(lead) if lead else None,
+            "lead_seconds": round(L, 3) if lead else 0.0}
 
 
 def assemble_video(

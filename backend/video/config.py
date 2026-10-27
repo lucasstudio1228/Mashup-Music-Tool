@@ -87,6 +87,21 @@ THUMBNAIL_REF_NOTE = (
     "fur/scale colours, proportions and palette), but as ONE complete illustrated "
     "scene, NOT a design sheet, NO text labels.")
 
+# Chế độ CHỈ CẢNH VẬT (cast_mode="scenery"): ảnh 1/2 là bảng thiết kế BỐI CẢNH
+# thay cho bảng nhân vật — tên file 0/1/2.png và luồng chạy giữ nguyên.
+IMAGE_ROLES_SCENERY: dict[int, str] = {
+    IMG_THUMBNAIL:  "Ảnh bìa (thumbnail)",
+    IMG_MAIN_SHEET: "Bảng thiết kế bối cảnh (world sheet)",
+    IMG_PET_SHEET:  "Bảng ánh sáng & không khí (mood sheet)",
+}
+THUMBNAIL_REF_NOTE_SCENERY = (
+    " || REFERENCE (mandatory): the two attached images are the ENVIRONMENT "
+    "DESIGN SHEET and the ATMOSPHERE / LIGHT SHEET of this place — generate a NEW "
+    "image that shows EXACTLY that same place (identical landmarks, architecture, "
+    "vegetation, water, materials, palette and light), but as ONE complete "
+    "illustrated scene, NOT a design sheet, NO text labels, NO people, NO "
+    "characters, NO animals.")
+
 # Bộ prompt luôn dùng KHOÁ CHUỖI (prompts.json là JSON).
 IMG_THUMBNAIL_KEY  = str(IMG_THUMBNAIL)
 IMG_MAIN_SHEET_KEY = str(IMG_MAIN_SHEET)
@@ -120,7 +135,7 @@ class VideoParams:
 
     # Ghép/mix: blend (crossfade) + làm chậm
     t_window:        int   = 10             # T+10: không lặp trong 10 clip kế
-    blend_seconds:   float = 1.0            # thời lượng crossfade blend giữa 2 clip
+    blend_seconds:   float = 3.0            # crossfade êm (softfade) giữa 2 clip
     slow_speed:      float = 0.7            # tốc độ phát (0.7 = chậm lại, mượt)
 
     @property
@@ -596,6 +611,181 @@ INGREDIENT_LOCK_FULL = (
     "character."
 )
 
+# ── Chế độ dàn cảnh + intro (theo project) ──────────────────────
+# cast_mode: "character_pet" (MẶC ĐỊNH — nhân vật chính + linh thú/thú nuôi) hoặc
+# "scenery" (chỉ cảnh vật: không nhân vật, không con vật). intro_mode:
+# "thumbnail" (MẶC ĐỊNH — intro 00:00 dựng từ chính ảnh thumbnail đã vẽ chữ AI)
+# hoặc "font" (chữ font có sẵn đè lên clip 00 như trước).
+CAST_MODES = ("character_pet", "scenery")
+DEFAULT_CAST_MODE = "character_pet"
+INTRO_MODES = ("thumbnail", "font")
+DEFAULT_INTRO_MODE = "thumbnail"
+# Giây đầu video giữ ẢNH thumbnail (Ken Burns chậm) trước khi tan vào clip 00.
+INTRO_THUMBNAIL_SECONDS = 7.0
+
+
+def normalize_cast_mode(value: str | None) -> str:
+    v = (value or "").strip().lower()
+    return v if v in CAST_MODES else DEFAULT_CAST_MODE
+
+
+def normalize_intro_mode(value: str | None) -> str:
+    v = (value or "").strip().lower()
+    return v if v in INTRO_MODES else DEFAULT_INTRO_MODE
+
+
+# Dấu nhận biết hồ sơ CHỈ CẢNH VẬT nằm ngay trong prompt (driver nhận ra lúc gửi
+# mà không cần tra DB): mọi prompt ảnh/clip của chế độ này đều chứa chuỗi này.
+SCENERY_MARK = "SCENERY-ONLY FILM"
+
+
+def is_scenery_prompt(text: str | None) -> bool:
+    return SCENERY_MARK in (text or "")
+
+
+def images_cast_mode(img_dir) -> str:
+    """cast_mode của BỘ ẢNH đã chuẩn bị (images/prompts.json) — nguồn sự thật cho
+    driver clip + thumbnail (ảnh đã vẽ theo hồ sơ nào thì clip theo hồ sơ đó)."""
+    try:
+        data = json.loads((Path(img_dir) / "prompts.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return DEFAULT_CAST_MODE
+    return normalize_cast_mode(data.get("cast_mode") if isinstance(data, dict) else None)
+
+
+def thumbnail_ref_note(prompt: str | None) -> str:
+    """Câu tham chiếu gắn vào prompt ảnh bìa 0 (đính kèm ảnh 1 + 2)."""
+    return THUMBNAIL_REF_NOTE_SCENERY if is_scenery_prompt(prompt) else THUMBNAIL_REF_NOTE
+
+
+def wrap_world_sheet_style(prompt: str, style: str | None = None) -> str:
+    """Bọc ẢNH 1 & 2 của chế độ chỉ cảnh vật — BẢNG THIẾT KẾ BỐI CẢNH (giống
+    wrap_sheet_style nhưng cho nơi chốn: không nhân vật, không con vật)."""
+    s = style_info(style)
+    return (
+        f"{SCENERY_MARK} — ENVIRONMENT DESIGN SHEET (location concept-art sheet) "
+        "— THIS IS A DESIGN DOCUMENT OF A PLACE, NOT A FILM FRAME. One single "
+        "sheet on a uniform flat light background with several framed panels. "
+        f"The scenery in the panels is drawn in this style: {s['brief']}.\n\n"
+        f"{prompt}"
+        " || It MUST be an ENVIRONMENT DESIGN SHEET: document layout, several "
+        "framed panels of THE SAME place on one sheet, WITH short uppercase "
+        "English text labels and callout lines, and a colour-palette strip. "
+        "ABSOLUTELY NO people, NO human figures or silhouettes, NO characters, "
+        "NO animals, NO creatures, NO pets in any panel. Every panel shows THE "
+        "SAME location with the same landmarks, materials and palette."
+    )
+
+
+INGREDIENT_LOCK_SCENERY = (
+    f"{SCENERY_MARK}: the two ingredient images are ENVIRONMENT DESIGN SHEETS "
+    "(design documents of one place), NOT film frames: use them only to get the "
+    "EXACT look of the place — landmarks, architecture, vegetation, water, "
+    "materials, colours and light. Build ONE continuous film shot of that place "
+    "with NO people, NO characters, NO animals, NO creatures. ABSOLUTELY NO "
+    "side-by-side panels, no text labels, no colour-swatch strip, no flat "
+    "studio backdrop."
+)
+
+# 2026-10-27: cảnh vật phải ĐỘNG như phim thường (nước chảy, mây trôi, gió, mưa/
+# tuyết, máy quay chuyển động mượt) — KHÔNG khoá máy / siêu chậm như ảnh tĩnh.
+INTRO_MOTION_PROMPT_SCENERY = (
+    f"{SCENERY_MARK}. Bring the THUMBNAIL reference image (the full scene, not "
+    "the design sheets) to life as the opening shot: start exactly on its "
+    "composition, framing, scenery, lighting and color palette; use the two "
+    "environment sheets only to keep the place consistent. Chill cinematic "
+    "film, a LIVING scene, never a still image: the whole place is clearly in "
+    "motion — flowing water and ripples, clouds moving across the sky, wind "
+    "through leaves, branches and grass, drifting mist, falling petals, "
+    "flickering lantern light, moving light and shadows — while the camera makes "
+    "one smooth, natural push-in or gentle drift at a normal, unhurried speed; "
+    "seamless, no scene cut, no people, no characters, no animals, no text"
+)
+
+FLOW_MOTION_PROMPT_SCENERY = (
+    f"{SCENERY_MARK}, chill cinematic film, a LIVING scene, never a still image: "
+    "clearly visible natural motion — flowing water and ripples, clouds moving "
+    "across the sky, wind through trees, leaves and grass, drifting mist, falling "
+    "petals, moving light and shadows; one smooth, natural cinematic camera move "
+    "at a normal, unhurried speed; preserve the exact same place, landmarks and "
+    "color palette; one continuous shot, no scene cut, no camera shake, no "
+    "people, no characters, no animals"
+)
+
+# Câu chuyển động gắn vào MỌI prompt clip cảnh vật lúc gửi (cả hồ sơ cũ).
+SCENERY_LIVING_MOTION = (
+    "LIVING SCENE, never a still image: the place is clearly in motion (flowing "
+    "water, moving clouds, wind through trees and grass, drifting mist, falling "
+    "petals or leaves, moving light and shadows) and the camera makes one smooth, "
+    "natural cinematic move at a normal, unhurried speed.")
+
+MOTION_NEGATIVE_SCENERY = (
+    " || STRICTLY FORBIDDEN (avoid absolutely): NO people, NO human figures, "
+    "faces, hands or silhouettes, NO characters, NO animals, NO pets, NO "
+    "creatures appearing at any moment; NO frozen frame or still-image look; NO "
+    "morphing of buildings, trees or terrain; NO new objects popping in; NO scene "
+    "cuts, NO flicker, NO jerky or sudden motion; NO camera shake; NO text, logo "
+    "or watermark. negative prompt: no person, no people, no human, no character, "
+    "no silhouette, no animal, no bird close-up, no pet, no creature, no frozen "
+    "frame, no static image, no morphing, no scene cut, no flicker, no text. Keep "
+    "the place physically plausible and fully consistent with the environment "
+    "sheets."
+)
+
+# Hồ sơ cảnh vật viết trước 2026-10-27 còn câu khoá máy / siêu chậm → đổi sang
+# máy quay chuyển động mượt lúc gửi (không cần viết lại prompt).
+_STATIC_SCENERY_RULES = (
+    (re.compile(r"\b(camera\s*:\s*)(?:a\s+)?(?:locked(?:[\s-]+off)?|static|fixed)"
+                r"(?:\s+(?:camera|shot))?", re.I),
+     lambda m: m.group(1) + "one smooth cinematic move"),
+    (re.compile(r"\b(?:the\s+)?camera\s+(?:is\s+|stays\s+|remains\s+)?locked(?:[\s-]+off)?"
+                r"(?:\s+or\s+moves\s+extremely\s+slowly)?", re.I),
+     "the camera moves smoothly"),
+    (re.compile(r"\b(?:a\s+)?(?:locked(?:[\s-]+off)?|static|fixed|still)\s+camera\b", re.I),
+     "a smoothly moving camera"),
+    # «A still frame of…», «Still view of…», «locked shot» (không đụng «no …»).
+    (re.compile(r"(?<!no )(?<!never )\b(an?\s+)?(?:locked(?:[\s-]+off)?|static|still)\s+"
+                r"(?:frame|view|shot)\b", re.I),
+     lambda m: "A gliding shot" if m.group(0)[:1].isupper() else "a gliding shot"),
+    (re.compile(r"[,;]?\s*no\s+zoom,?\s+pan\s+or\s+orbit\b", re.I), ""),
+    (re.compile(r"\b(an?\s+)?(?:extremely|ultra|very)[\s-]+slow(ly)?\b", re.I),
+     lambda m: "smoothly" if m.group(2) else ("a smooth" if m.group(1) else "smooth")),
+    (re.compile(r"\bslow[\s-]+motion\b", re.I), "natural motion"),
+    (re.compile(r"\bambient\s+motion\s+only\b", re.I), "living natural motion"),
+    (re.compile(r"\bonly\s+(?:soft\s+|gentle\s+|subtle\s+)?ambient\s+motion\b", re.I),
+     "clearly visible natural motion"),
+)
+
+
+def liven_scenery_motion(text: str) -> str:
+    """Bỏ chỉ dẫn khoá máy / siêu chậm trong prompt clip cảnh vật cũ."""
+    out = text or ""
+    for rx, repl in _STATIC_SCENERY_RULES:
+        out = rx.sub(repl, out)
+    return re.sub(r"[ \t]{2,}", " ", out)
+
+
+# Ghép video chỉ cảnh vật: phát ĐÚNG tốc độ thật (phong cách kênh thường làm chậm
+# 0.7x — với cảnh vật làm clip trông như đứng hình).
+SCENERY_PLAYBACK_SPEED = 1.0
+
+
+def intro_motion_prompt(cast_mode: str | None) -> str:
+    return INTRO_MOTION_PROMPT_SCENERY if cast_mode == "scenery" else INTRO_MOTION_PROMPT
+
+
+def flow_motion_prompt(cast_mode: str | None) -> str:
+    return FLOW_MOTION_PROMPT_SCENERY if cast_mode == "scenery" else FLOW_MOTION_PROMPT
+
+
+def motion_negative(prompt: str | None) -> str:
+    """Khối phủ định cuối prompt clip — theo hồ sơ (dấu SCENERY_MARK trong prompt)."""
+    return MOTION_NEGATIVE_SCENERY if is_scenery_prompt(prompt) else MOTION_NEGATIVE
+
+
+def image_roles(cast_mode: str | None) -> dict:
+    return IMAGE_ROLES_SCENERY if cast_mode == "scenery" else IMAGE_ROLES
+
 # "full" (mặc định) = prompt đầy đủ ở trên; "safe" = bản gọn veo_safety.
 CLIP_PROMPT_MODES = ("full", "safe")
 DEFAULT_CLIP_PROMPT_MODE = "full"
@@ -681,7 +871,10 @@ def resolve_browser_exe(site: str | None = None) -> str | None:
 # Dùng khi profile cũ đã bị Google gắn cờ «hoạt động bất thường»: profile SẠCH
 # (đăng nhập tay lại 1 lần) thường gỡ được, mà không cần stealth/anti-detect.
 # Override qua "profile_dir_by_site" trong video_overrides.json.
-SITE_PROFILE: dict[str, str] = {}
+#   • chatgpt: profile RIÊNG (2026-10-23, thumbnail ảnh + chữ) — người dùng tự
+#     đăng nhập 1 lần qua nút «Mở ChatGPT để đăng nhập»; không đụng profile
+#     Gemini/Flow (có chat cá nhân).
+SITE_PROFILE: dict[str, str] = {"chatgpt": ".browser_profile_chatgpt"}
 
 
 def site_profile_dir(site: str | None) -> Path | None:
@@ -789,8 +982,36 @@ CHATGPT_SELECTORS: dict[str, list[str]] = {
     ],
     "send_button": [
         "button[data-testid='send-button']",
+        "#composer-submit-button",
         "button[aria-label*='Send']",
         "button[aria-label*='Gửi']",
+    ],
+    # Đang trả lời / đang vẽ (nút dừng thay chỗ nút gửi)
+    "stop_button": [
+        "button[data-testid='stop-button']",
+        "button[aria-label*='Stop']",
+        "button[aria-label*='Dừng']",
+    ],
+    # Ô đính kèm (ẩn) trong khung soạn — ưu tiên ô nhận ảnh
+    "file_input": [
+        "input[type='file'][accept*='image']",
+        "form input[type='file']",
+        "input[type='file']",
+    ],
+    # CHƯA đăng nhập: nút Log in / Đăng nhập (tool chỉ NHẬN DIỆN, không bấm)
+    "login_button": [
+        "button[data-testid='login-button']",
+        "a[data-testid='login-button']",
+        "button:has-text('Log in')",
+        "button:has-text('Đăng nhập')",
+    ],
+    # ĐÃ đăng nhập: nút hồ sơ tài khoản
+    "profile_button": [
+        "[data-testid='accounts-profile-button']",
+        "button[data-testid='profile-button']",
+        "[data-testid='user-menu']",
+        "button[aria-label*='profile' i]",
+        "button[aria-label*='hồ sơ' i]",
     ],
     # Ảnh sinh ra trong luồng hội thoại
     "generated_image": [

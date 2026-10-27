@@ -400,7 +400,7 @@ def generate_clips_gemini(
     # Prompt dự phòng khi Gemini TỪ CHỐI prompt cảnh: câu chuyển động chung, gọn.
     wrap = flow_driver._style_wrapper(style)
     variants = flow_driver._fallback_variants(
-        config.load_overrides().get("flow_motion_prompt") or config.FLOW_MOTION_PROMPT)
+        flow_driver.motion_base(config.images_cast_mode(img_dir)))
     flow_driver.assert_english_prompts(list(prompts.items()))
 
     def _is_done(k: int) -> bool:

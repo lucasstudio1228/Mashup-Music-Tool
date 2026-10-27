@@ -352,6 +352,55 @@ class PacingTests(unittest.TestCase):
         self.assertEqual(d.page.clicks, 0)          # KHÔNG bấm vào captcha
 
 
+class RaiseWindowTests(unittest.TestCase):
+    """Captcha → kéo CỬA SỔ Suno lên trên cùng (lần đầu + mỗi lần nhắc có bíp),
+    không bấm gì vào trang."""
+
+    def setUp(self):
+        p = patch.dict(sys.modules, {"winsound": None})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_alert_with_beep_raises_window(self):
+        d = drv(lambda t: (0, NONE))
+        with patch("backend.video.window_focus.raise_page_window",
+                   return_value="foreground") as rp:
+            d._alert_human("captcha", None, beep=True)
+            d._alert_human("vẫn chờ", None, beep=False)
+        rp.assert_called_once_with(d.page)
+        self.assertEqual(d.page.front, 1)            # nhắc không bíp: chỉ chuyển tab
+        self.assertEqual(d.page.clicks, 0)
+
+    def test_raise_never_raises_and_restores_title(self):
+        from backend.video import window_focus as wf
+
+        class TitlePage:
+            def __init__(self):
+                self.title, self.front = "Create | Suno", 0
+
+            def bring_to_front(self):
+                self.front += 1
+
+            def evaluate(self, js, arg):
+                if js == wf._MARK_JS:
+                    old, self.title = self.title, f"{arg} {self.title}"
+                    return old
+                mark, old = arg
+                if self.title.startswith(mark):
+                    self.title = old
+
+            def wait_for_timeout(self, ms):
+                pass
+
+        page = TitlePage()
+        with patch.object(wf, "_find_hwnd", return_value=None), \
+                patch.object(wf, "_cdp_unminimize"):
+            self.assertEqual(wf.raise_page_window(page), "tab-only")
+        self.assertEqual(page.title, "Create | Suno")
+        self.assertEqual(page.front, 1)
+        self.assertEqual(wf.raise_page_window(object()), "tab-only")   # trang hỏng
+
+
 class BatchStopTests(unittest.TestCase):
     def test_submission_uncertain_and_captcha_stop_whole_batch(self):
         self.assertTrue(bsvc._needs_human(ss.SUBMISSION_UNCERTAIN, "x"))

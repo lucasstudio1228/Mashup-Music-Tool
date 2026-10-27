@@ -12,10 +12,17 @@ Luồng mỗi clip (cùng 1 cuộc trò chuyện Muse):
   chờ trạng thái «Connected» (máy ảo Muse đánh thức chậm, có lúc 10–15 phút
   «Connecting...») → input[type=file] đính kèm ảnh → điền textarea «Message» →
   Gửi → chờ khung video MỚI (hatch-chat-attachment-presentation-video) →
-  «Download video» → ffmpeg: cắt 8s + BỎ âm thanh + 1920x1080.
+  tải (blob trong trang; dự phòng menu «More options» → «Download») → ffmpeg:
+  cắt 8s + BỎ âm thanh + 1920x1080.
 
 Đo thật 2026-10-05: file gốc 1280x720, 24fps, 10.0s, CÓ tiếng AAC → hậu kỳ là bắt
-buộc (1080p là NÂNG từ 720p, không phải 1080p gốc).
+buộc (1080p là NÂNG từ 720p, không phải 1080p gốc). Đo lại 2026-10-25: 1920x1080,
+30fps, 8.0s, không tiếng — vẫn qua hậu kỳ (Muse đổi được bất cứ lúc nào).
+
+Giao diện Muse 2026-10-25: BỎ nút «Download video»; khung video là ô vuông
+role=button «Open animated video <tên>.mp4» có data-hatch-video-src="blob:…",
+lệnh tải nằm trong menu «More options» của tin nhắn ([role=menuitem] «Download»)
+— blob và menu ra CÙNG file (md5 trùng).
 
 An toàn: không tự đăng nhập (profile đã đăng nhập sẵn, mất phiên → dừng báo
 người dùng), không vượt CAPTCHA, không xoay proxy. Muse báo giới hạn → DỪNG
@@ -24,6 +31,7 @@ dữ liệu, không làm theo.
 """
 from __future__ import annotations
 
+import base64
 import json
 import random
 import re
@@ -60,7 +68,9 @@ _SEL = {
     "send": ["button[aria-label='Send message']", "button[aria-label='Send']",
              "button[type='submit']"],
     "video_box": "[data-testid='hatch-chat-attachment-presentation-video']",
-    "download": "button[aria-label='Download video']",
+    "download": "button[aria-label='Download video']",     # giao diện cũ (trước 2026-10-25)
+    "more_options": "button[aria-label='More options']",
+    "menu_item": "[role=menuitem]",
     "status_panel": "[data-testid='hatch-status-panel-sliding-surface']",
 }
 
@@ -335,14 +345,103 @@ def _pause_ticking(page, seconds: float, tick: Callable[[float], None]) -> None:
         page.wait_for_timeout(min(10_000, left * 1000))
 
 
+# Video MỚI NHẤT (sau tin user cuối; chưa có cấu trúc tin nhắn → khung cuối trang):
+# đánh dấu data-mm-dl (cho menu dự phòng nhắm đúng khung), cuộn tới (khung ngoài
+# màn hình chỉ là skeleton, chưa có blob), rồi fetch blob → base64.
+_JS_FETCH_VIDEO = r"""async (sel) => {
+  const msgs = [...document.querySelectorAll("[data-message-item='true']")];
+  let lu = -1;
+  msgs.forEach((m, i) => { if (m.getAttribute('data-message-role') === 'user') lu = i; });
+  const boxes = lu >= 0 ? msgs.slice(lu + 1).flatMap(m => [...m.querySelectorAll(sel)])
+                        : [...document.querySelectorAll(sel)];
+  document.querySelectorAll('[data-mm-dl]').forEach(e => e.removeAttribute('data-mm-dl'));
+  const box = boxes.pop();
+  if (!box) return null;
+  box.setAttribute('data-mm-dl', '1');
+  box.scrollIntoView({block: 'center'});
+  const srcOf = () => { const w = box.querySelector('[data-hatch-video-src]'),
+                              v = box.querySelector('video');
+    return (w && w.getAttribute('data-hatch-video-src')) || (v && (v.currentSrc || v.src)) || ''; };
+  let src = srcOf();
+  for (let i = 0; i < 30 && !src; i++) { await new Promise(r => setTimeout(r, 500)); src = srcOf(); }
+  if (!src) return {b64: null};
+  const b = await (await fetch(src)).blob();
+  const buf = new Uint8Array(await b.arrayBuffer());
+  let s = '';
+  for (let i = 0; i < buf.length; i += 32768)
+    s += String.fromCharCode.apply(null, buf.subarray(i, i + 32768));
+  return {type: b.type, b64: btoa(s)};
+}"""
+
+
+def _download_via_menu(page, raw: Path) -> None:
+    """Dự phòng: menu «More options» của tin nhắn chứa video → «Download»
+    (không có nút đó → chuột phải lên video; giao diện cũ → «Download video»)."""
+    box = page.locator("[data-mm-dl='1']")
+    legacy = page.locator(_SEL["download"])
+    if not box.count() and legacy.count():
+        target = legacy.last
+    else:
+        msg = box.locator("xpath=ancestor::*[@data-message-item='true'][1]")
+        holder = msg if msg.count() else box
+        holder.hover(timeout=10_000)
+        page.wait_for_timeout(800)
+        more = holder.locator(_SEL["more_options"])
+        if more.count():
+            more.last.click(timeout=10_000)
+        else:
+            box.click(button="right", timeout=10_000)
+        page.wait_for_timeout(1200)
+        target = page.locator(_SEL["menu_item"], has_text="Download").last
+    try:
+        with page.expect_download(timeout=180_000) as dl:
+            target.click(timeout=10_000)
+        dl.value.save_as(str(raw))
+    finally:
+        page.keyboard.press("Escape")
+
+
 def _download(page, raw: Path) -> None:
     raw.parent.mkdir(parents=True, exist_ok=True)
-    btn = page.locator(_SEL["download"]).last
-    with page.expect_download(timeout=180_000) as dl:
-        btn.click()
-    dl.value.save_as(str(raw))
+    raw.unlink(missing_ok=True)
+    try:
+        r = page.evaluate(_JS_FETCH_VIDEO, _SEL["video_box"])
+    except Exception as e:
+        if _is_closed_error(e):
+            raise
+        _log(f"tải blob lỗi — {str(e)[:160]} → thử menu Download")
+        r = None
+    if r and r.get("b64"):
+        raw.write_bytes(base64.b64decode(r["b64"]))
+    else:
+        _download_via_menu(page, raw)
     if not raw.exists() or raw.stat().st_size < 20_000:
         raise RuntimeError("file tải về rỗng/quá nhỏ")
+
+
+_DOWNLOAD_TRIES = 3
+
+
+def _fetch_clip(page, raw: Path, dest: Path, clip_sec: float, tag: str) -> tuple[dict, dict]:
+    """Tải + hậu kỳ video VỪA tạo; lỗi thì tải lại NGAY trên cùng video — không
+    gửi lại prompt (gửi lại = tốn thêm 1 lượt Muse mà giao diện hỏng thì vẫn hỏng).
+    Hết lượt thử → ném lỗi để dừng job."""
+    err: Optional[Exception] = None
+    for i in range(1, _DOWNLOAD_TRIES + 1):
+        try:
+            _download(page, raw)
+            src_info = probe_streams(raw)
+            info = finalize_clip(raw, dest, max_sec=clip_sec)
+            raw.unlink(missing_ok=True)
+            return src_info, info
+        except Exception as e:
+            if _is_closed_error(e):
+                raise
+            err = e
+            _log(f"{tag}: tải/hậu kỳ lỗi (lần tải {i}/{_DOWNLOAD_TRIES}) — {str(e)[:200]}")
+            if i < _DOWNLOAD_TRIES:
+                page.wait_for_timeout(5000 * i)
+    raise RuntimeError(f"{type(err).__name__}: {str(err)[:200]}")
 
 
 def _pace_span() -> tuple[float, float]:
@@ -380,23 +479,35 @@ class _GPMSession:
                 _log(f"GPM: không nối được CDP (lần {i}/{self.attempts}) — đóng/bật lại")
                 self.client.close_profile(self.pid)
                 time.sleep(self.pause_sec)
+            except BaseException:
+                self.client.close_profile(self.pid)
+                raise
         else:
             raise MuseUnavailable(
                 f"Không mở được profile GPM {self.pid} ({last}). Nếu cửa sổ profile này "
                 "đang mở TAY từ GPMLogin, hãy đóng nó rồi chạy lại.")
-        ctx = self._cdp.browser.contexts[0] if self._cdp.browser.contexts else \
-            self._cdp.browser.new_context()
-        self.page = next((p for p in ctx.pages if "muse.ai" in (p.url or "")), None)
-        if self.page is None:
-            self.page = ctx.new_page()
-            self.page.goto(MUSE_URL, wait_until="domcontentloaded", timeout=90_000)
-        self.page.bring_to_front()
+        try:
+            ctx = self._cdp.browser.contexts[0] if self._cdp.browser.contexts else \
+                self._cdp.browser.new_context()
+            self.page = next((p for p in ctx.pages if "muse.ai" in (p.url or "")), None)
+            if self.page is None:
+                self.page = ctx.new_page()
+                self.page.goto(MUSE_URL, wait_until="domcontentloaded", timeout=90_000)
+            self.page.bring_to_front()
+        except BaseException:
+            # CDP đã nối mà mở tab Muse lỗi (cửa sổ GPM bị đóng, trang tải >90s…):
+            # __exit__ KHÔNG chạy khi __enter__ raise → phải tự dừng Playwright +
+            # đóng profile. Bỏ sót ở đây (2026-10-25) để lại Playwright sống trong
+            # luồng worker → mọi job sau lỗi «Sync API inside the asyncio loop».
+            self.__exit__(None, None, None)
+            raise
         return self
 
     def __exit__(self, *exc):
+        cdp, self._cdp = self._cdp, None
         try:
-            if self._cdp is not None:
-                self._cdp.__exit__(None, None, None)
+            if cdp is not None:
+                cdp.__exit__(None, None, None)
         finally:
             try:
                 self.client.close_profile(self.pid)
@@ -463,7 +574,7 @@ def generate_clips_muse(
     ings = {it["index"]: it["ingredients"] for it in items}
     wrap = flow_driver._style_wrapper(style)
     variants = flow_driver._fallback_variants(
-        config.load_overrides().get("flow_motion_prompt") or config.FLOW_MOTION_PROMPT)
+        flow_driver.motion_base(config.images_cast_mode(img_dir)))
     flow_driver.assert_english_prompts(list(prompts.items()))
 
     def _is_done(k: int) -> bool:
@@ -570,18 +681,17 @@ def generate_clips_muse(
                             continue
                         _log(f"{tag}: video tới muộn — tải về, không gửi lại")
                     try:
-                        raw = raw_dir / f"clip_{k:02d}.mp4"
-                        _download(page, raw)
-                        src_info = probe_streams(raw)
-                        info = finalize_clip(raw, dest, max_sec=clip_sec)
-                        raw.unlink(missing_ok=True)
+                        src_info, info = _fetch_clip(
+                            page, raw_dir / f"clip_{k:02d}.mp4", dest, clip_sec, tag)
                     except Exception as e:
                         if _is_closed_error(e):
                             raise
-                        attempt += 1
-                        last_err = f"download: {e}"
-                        _log(f"{tag}: tải/hậu kỳ lỗi — {str(e)[:200]}")
-                        continue
+                        raise RuntimeError(
+                            f"Clip {k:02d}: Muse ĐÃ tạo video nhưng tải về lỗi "
+                            f"{_DOWNLOAD_TRIES} lần ({str(e)[:200]}) — dừng, KHÔNG gửi lại "
+                            "cho khỏi tốn lượt Muse (giao diện Muse có thể vừa đổi). "
+                            f"Đã có {len(done)}/{len(todo)} clip mới — bấm 'Tạo tiếp clip "
+                            "thiếu' (resume).") from e
                     _log(f"{tag}: OK gốc {src_info['width']}x{src_info['height']} "
                          f"{src_info['duration']:.1f}s audio={src_info['audio']} → "
                          f"{info['width']}x{info['height']} {info['duration']:.1f}s không tiếng")

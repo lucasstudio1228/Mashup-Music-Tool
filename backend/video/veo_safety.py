@@ -16,25 +16,40 @@ from __future__ import annotations
 
 import re
 
+from .config import SCENERY_MARK, liven_scenery_motion
+
 # Câu khoá nguyên liệu NGẮN (thay câu dài cũ trong prompt_gen._with_ingredient_lock).
 INGREDIENT_LOCK = (
     "Ingredients 1 and 2 are character reference sheets: use them only for the "
     "look of the main character (1) and the companion creature (2), and show "
     "both inside one natural film scene, not the sheet layout.")
+# Chế độ CHỈ CẢNH VẬT: 2 nguyên liệu là bảng bối cảnh + bảng ánh sáng (giữ dấu
+# SCENERY_MARK để bộ bọc prompt vẫn nhận ra hồ sơ cảnh vật).
+SCENERY_LOCK = (
+    f"{SCENERY_MARK}: ingredients 1 and 2 are environment reference sheets of one "
+    "place: use them only for the look of that place, and show it as one natural "
+    "film shot, empty and peaceful, not the sheet layout.")
 
 # Đuôi TÍCH CỰC thay MOTION_NEGATIVE: tả điều muốn có thay vì kể điều cấm.
 SAFE_TAIL = (
     " Calm, gentle and natural: relaxed steady pose, natural hands and "
     "proportions, the flute held still with clear air around the face and "
     "instrument, smooth slow motion, one continuous shot, no on-screen text.")
+SAFE_TAIL_SCENERY = (
+    " Calm and natural: the place stays empty and peaceful yet clearly alive, "
+    "never a still image — flowing water, moving clouds, wind through leaves and "
+    "grass, drifting mist and moving light — with one smooth cinematic camera "
+    "move at a normal speed, one continuous shot, no on-screen text.")
 
 # Phần mở đầu/đuôi cũ đã nhúng sẵn trong manifest → bỏ khi dựng lại.
 _OLD_HEAD_RE = re.compile(
-    r"The two ingredient images are CHARACTER MODEL SHEETS.*?duplicated\s+character\.",
+    r"The two ingredient images are CHARACTER MODEL SHEETS.*?duplicated\s+character\."
+    r"|SCENERY-ONLY FILM: the two ingredient images are ENVIRONMENT DESIGN SHEETS"
+    r".*?flat\s+studio\s+backdrop\.",
     re.S | re.I)
 _OLD_SUFFIX_RE = re.compile(
     r"\s*One single continuous shot, no cuts\. Do not reproduce the reference "
-    r"sheets:.*?identity unchanged\.", re.S | re.I)
+    r"sheets:.*?(?:identity|place) unchanged\.", re.S | re.I)
 _OLD_NEGATIVE_RE = re.compile(r"\s*\|\|\s*STRICTLY FORBIDDEN.*$", re.S | re.I)
 _NEG_PROMPT_RE = re.compile(r"\s*negative prompt:.*$", re.S | re.I)
 
@@ -99,7 +114,7 @@ def split_manifest_prompt(text: str) -> tuple[str, str]:
     t = _OLD_SUFFIX_RE.sub("", t)
     t = _OLD_HEAD_RE.sub("", t).strip()
     identity = ""
-    m = re.search(r"IDENTITY TO KEEP:\s*(.*?)(?:\n\s*\n|\bSCENE:)", t, re.S)
+    m = re.search(r"(?:IDENTITY|WORLD) TO KEEP:\s*(.*?)(?:\n\s*\n|\bSCENE:)", t, re.S)
     if m:
         identity = m.group(1).strip()
     if "SCENE:" in t:
@@ -113,22 +128,27 @@ def safe_clip_prompt(raw: str, style_motion: str = "", *,
                      with_lock: bool = True) -> str:
     """Prompt cuối cùng gửi Veo: gọn, không từ khoá nhạy cảm, tả tích cực."""
     identity, scene = split_manifest_prompt(raw)
-    had_lock = bool(identity) or "CHARACTER MODEL SHEETS" in (raw or "")
+    scenery = SCENERY_MARK in (raw or "")
+    had_lock = (bool(identity) or "CHARACTER MODEL SHEETS" in (raw or "")
+                or "ENVIRONMENT DESIGN SHEETS" in (raw or ""))
+    if scenery:
+        scene = liven_scenery_motion(scene)
     scene = _clip(sanitize(scene), MAX_SCENE_CHARS)
     parts = []
     style_motion = sanitize(style_motion)
     if style_motion and not scene.lower().startswith(style_motion.lower()):
         parts.append(style_motion.rstrip(".") + ".")
     if with_lock and had_lock:
-        parts.append(INGREDIENT_LOCK)
+        parts.append(SCENERY_LOCK if scenery else INGREDIENT_LOCK)
     if identity:
-        parts.append("Identity: " + _clip(sanitize(identity), MAX_IDENTITY_CHARS))
+        parts.append(("Place: " if scenery else "Identity: ")
+                     + _clip(sanitize(identity), MAX_IDENTITY_CHARS))
     parts.append(("Scene: " if had_lock else "") + scene)
     out = " ".join(p.strip() for p in parts if p.strip())
     out = out.rstrip()
     if not out.endswith("."):
         out += "."
-    return out + SAFE_TAIL
+    return out + (SAFE_TAIL_SCENERY if scenery else SAFE_TAIL)
 
 
 # Từ khoá còn sót mà bộ lọc hay chặn — dùng cho test/cổng kiểm tra.

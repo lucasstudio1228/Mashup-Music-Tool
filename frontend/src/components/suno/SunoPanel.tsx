@@ -417,7 +417,8 @@ export default function SunoPanel({ projectId }: { projectId: number }) {
               {channel.matched ? (
                 <p className="text-green-400">
                   🎯 Kênh YouTube: <b>{channel.channel_name || "(chưa đặt tên)"}</b>
-                  {" "}— nhạc cụ <b>{channel.instrument}</b> / phong cách{" "}
+                  {channel.confidence === "chosen" ? " (kênh bạn chọn)" : " (tự chọn)"}
+                  {" "}— nhạc cụ <b>{channel.instrument}</b> / thể loại{" "}
                   <b>{channel.music_style}</b>.
                 </p>
               ) : (

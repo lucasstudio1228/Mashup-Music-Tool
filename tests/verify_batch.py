@@ -299,8 +299,12 @@ def test_retry_then_skip():
 
 
 def test_flow_block_stops_batch():
-    """Flow gắn cờ «hoạt động bất thường» (chặn mức TÀI KHOẢN) → thử lại tại chỗ
-    rồi DỪNG lô, KHÔNG bỏ qua sang sản phẩm kế (sẽ đốt thêm credit Suno vô ích)."""
+    """Flow gắn cờ «hoạt động bất thường» (chặn mức TÀI KHOẢN) → DỪNG lô NGAY,
+    KHÔNG thử lại tại chỗ và KHÔNG bỏ qua sang sản phẩm kế.
+
+    Không thử lại là CỐ Ý (batch_service._account_block): cờ bám theo profile nên
+    chạy lại chỉ làm cờ bám chặt hơn, còn chạy sản phẩm kế thì đốt thêm 15 credit
+    Suno mà vẫn không ra video. Người dùng xử lý cờ rồi mới «Tiếp tục lô»."""
     ran = []
 
     def fake_run(project_id, progress_cb, dry_run=False, overrides=None, resume=False):
@@ -326,13 +330,12 @@ def test_flow_block_stops_batch():
         st = _wait_terminal(key, timeout=120.0)
         results.append(("Flow chặn tài khoản → status='blocked'",
                         st["status"] == "blocked", st["status"]))
-        results.append(("Có thử lại tại chỗ trước khi dừng",
-                        ran.count(pids[0]) == batch_service._MAX_RETRY_PER_PRODUCT + 1,
-                        f"{ran.count(pids[0])} lượt"))
+        results.append(("KHÔNG thử lại tại chỗ (cờ sẽ bám chặt hơn)",
+                        ran.count(pids[0]) == 1, f"{ran.count(pids[0])} lượt"))
         results.append(("KHÔNG chạy sang sản phẩm 2", pids[1] not in ran,
                         f"ran={ran}"))
-        results.append(("Message nêu rõ Flow chặn tài khoản",
-                        "Flow/Google chặn" in (st["message"] or ""),
+        results.append(("Message nêu rõ chặn ở mức tài khoản",
+                        "mức tài khoản" in (st["message"] or ""),
                         (st["message"] or "")[:80]))
     finally:
         _cleanup(key)

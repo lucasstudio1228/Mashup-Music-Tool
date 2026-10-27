@@ -20,14 +20,29 @@ def _counts(session: Session, project_id: int) -> tuple[int, int]:
     return len(tracks), len(mixes)
 
 
+def _effective_channel(session: Session, project: Project) -> dict:
+    """Kênh dùng khi đăng nháp: kênh đã chọn, chưa chọn thì khớp nhạc cụ + thể loại."""
+    from backend.models import ChannelMapping
+    from backend.video.service import match_channel
+    if project.channel_id:
+        m = session.get(ChannelMapping, project.channel_id)
+        if m:
+            return m.model_dump()
+    rows = [m.model_dump() for m in session.exec(select(ChannelMapping)).all()]
+    return match_channel(rows, project.instrument or "", project.music_style or "") or {}
+
+
 def to_response(session: Session, project: Project) -> ProjectResponse:
     track_count, mix_count = _counts(session, project.id)
+    channel = _effective_channel(session, project)
     return ProjectResponse(
         id=project.id, name=project.name, description=project.description,
         created_at=project.created_at,
         track_count=track_count, mix_count=mix_count,
         video_idea=project.video_idea, auto_video=project.auto_video,
         video_style=project.video_style,
+        intro_mode=getattr(project, "intro_mode", None) or "thumbnail",
+        cast_mode=getattr(project, "cast_mode", None) or "character_pet",
         instrument=project.instrument, music_style=project.music_style,
         auto_upload=project.auto_upload,
         music_source=getattr(project, "music_source", "local"),
@@ -35,7 +50,17 @@ def to_response(session: Session, project: Project) -> ProjectResponse:
         batch_id=getattr(project, "batch_id", None),
         mix_duration_minutes=project.mix_duration_minutes or 120.0,
         mix_crossfade_seconds=project.mix_crossfade_seconds or 5.0,
+        channel_id=project.channel_id,
+        effective_channel_id=channel.get("id"),
+        effective_channel_name=channel.get("channel_name") or "",
     )
+
+
+def _check_channel(session: Session, channel_id) -> None:
+    """Kênh chọn cho project phải là 1 dòng trong ⚙️ Cài đặt → YouTube/GPMLogin."""
+    from backend.models import ChannelMapping
+    if channel_id is not None and session.get(ChannelMapping, channel_id) is None:
+        raise HTTPException(400, f"Kênh YouTube #{channel_id} không tồn tại — chọn lại kênh.")
 
 
 _IDEA_FIELDS = ("video_idea", "suno_idea")
@@ -172,6 +197,11 @@ def create_project(data: ProjectCreate, session: Session = Depends(get_session))
     values = _ideas_to_english(data.model_dump())
     values["instrument"] = _canonical_instrument(values.get("instrument", ""))
     values["music_style"] = (values.get("music_style") or "").strip()
+    _check_channel(session, values.get("channel_id"))
+    from backend.video import channel_looks
+    values["video_style"] = channel_looks.resolve_video_style(
+        values.get("video_style"), values["instrument"], values["music_style"],
+        channel_id=values.get("channel_id"))
     project = Project(**values)
     session.add(project)
     session.commit()
@@ -191,8 +221,9 @@ def create_batch(data: BatchCreate):
             count=data.count, instrument=data.instrument,
             music_style=data.music_style, video_style=data.video_style,
             theme=data.theme, target_tracks=data.target_tracks,
+            intro_mode=data.intro_mode, cast_mode=data.cast_mode,
             max_create_actions=data.max_create_actions,
-            channel_name=data.channel_name,
+            channel_name=data.channel_name, channel_id=data.channel_id,
             mix_duration_minutes=data.mix_duration_minutes,
         )
     except RuntimeError as exc:
@@ -288,6 +319,11 @@ def update_project(project_id: int, data: ProjectUpdate,
                    session: Session = Depends(get_session)):
     project = get_project_or_404(session, project_id)
     values = data.model_dump(exclude_unset=True)
+    if "channel_id" in values:
+        _check_channel(session, values["channel_id"])
+    for key in ("intro_mode", "cast_mode"):
+        if key in values and values[key] is None:
+            values.pop(key)                    # null = giữ nguyên lựa chọn cũ
     new_name = values.pop("name", None)
     if new_name is not None and new_name.strip() != (project.name or ""):
         # Tên gắn với thư mục media + chữ ký prompt → đi qua luồng đổi tên an toàn.

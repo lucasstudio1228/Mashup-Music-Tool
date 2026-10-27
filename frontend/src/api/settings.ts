@@ -5,6 +5,11 @@ import type {
   AppSettingsUpdate,
   ApiTestRequest,
   ApiTestResult,
+  ChatGPTWindowStatus,
+  ThumbAISettings,
+  ThumbAISettingsUpdate,
+  ThumbAITestRequest,
+  ThumbAITestResult,
 } from '../types';
 
 export function useSettings() {
@@ -42,3 +47,66 @@ export function useTestApi() {
     },
   });
 }
+
+// ── Thumbnail AI (key RIÊNG cho model ảnh, vd. ShopAIKey) ─────────
+export function useThumbAISettings() {
+  return useQuery<ThumbAISettings>({
+    queryKey: ['settings', 'thumbnail-ai'],
+    queryFn: async () => {
+      const res = await api.get('/api/settings/thumbnail-ai');
+      return res.data;
+    },
+    staleTime: 60_000,
+  });
+}
+
+export function useUpdateThumbAISettings() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (data: ThumbAISettingsUpdate) => {
+      const res = await api.patch('/api/settings/thumbnail-ai', data);
+      return res.data as ThumbAISettings;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['settings', 'thumbnail-ai'] });
+      queryClient.invalidateQueries({ queryKey: ['video'] });
+    },
+  });
+}
+
+/** Kiểm tra key MIỄN PHÍ (GET /v1/models) — không tạo ảnh, không tốn phí. */
+export function useTestThumbAI() {
+  return useMutation({
+    mutationFn: async (data: ThumbAITestRequest) => {
+      const res = await api.post('/api/settings/thumbnail-ai/test', data, {
+        timeout: 45_000,
+      });
+      return res.data as ThumbAITestResult;
+    },
+  });
+}
+
+// ── ChatGPT web (máy vẽ thumbnail mặc định) — cửa sổ để bạn TỰ đăng nhập ──
+export function useChatGPTWindow() {
+  return useQuery<ChatGPTWindowStatus>({
+    queryKey: ['settings', 'thumbnail-chatgpt'],
+    queryFn: async () => (await api.get('/api/settings/thumbnail-chatgpt')).data,
+    refetchInterval: (query) => (query.state.data?.open ? 3000 : false),
+  });
+}
+
+function useChatGPTWindowAction(action: 'open' | 'close') {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async () =>
+      (await api.post(`/api/settings/thumbnail-chatgpt/${action}`)).data as ChatGPTWindowStatus,
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['settings', 'thumbnail-chatgpt'] });
+      queryClient.invalidateQueries({ queryKey: ['settings', 'thumbnail-ai'] });
+      queryClient.invalidateQueries({ queryKey: ['global-tasks'] });
+    },
+  });
+}
+
+export const useOpenChatGPT = () => useChatGPTWindowAction('open');
+export const useCloseChatGPT = () => useChatGPTWindowAction('close');

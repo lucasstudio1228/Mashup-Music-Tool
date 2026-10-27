@@ -10,6 +10,7 @@ An toàn (mục K của spec):
   • /pause: dừng ở checkpoint gần nhất, giữ state để /resume.
   • /cancel: huỷ hẳn batch (terminal).
 """
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -190,16 +191,19 @@ def suno_generate_styles(project_id: int, body: GenStylesBody,
 
 def _classify_and_prepare(db: Session, project: Project, title: str, idea: str,
                           styles: str, api_config) -> dict:
-    """Chọn kênh YouTube khớp nhất trong các ChannelMapping đã cấu hình; lưu
-    instrument/music_style vào project; bật auto_video + auto_upload để luồng
-    một-chạm đi hết tới lưu nháp YouTube. Trả dict cho UI hiển thị (kèm cảnh báo
-    nếu chưa cấu hình / không khớp)."""
+    """Kênh YouTube của project: người dùng ĐÃ CHỌN kênh (project.channel_id) →
+    dùng đúng kênh đó, không phân loại, không đổi nhạc cụ/thể loại (kênh nào
+    cũng nhận nhạc cụ nào — 2026-10-25). Chưa chọn → AI chọn kênh khớp nhất
+    trong các ChannelMapping rồi GHI channel_id. Bật auto_video + auto_upload để
+    luồng một-chạm đi hết tới lưu nháp YouTube. Trả dict cho UI hiển thị (kèm
+    cảnh báo nếu chưa cấu hình / không khớp)."""
     from backend.models import ChannelMapping
     from backend.video.channel_match import classify_channel
     from backend.video.music_spec import same_instrument
 
     mappings = [
-        {"instrument": m.instrument, "music_style": m.music_style,
+        {"id": getattr(m, "id", None), "instrument": m.instrument or "",
+         "music_style": m.music_style or "",
          "channel_name": m.channel_name, "gpm_profile_id": m.gpm_profile_id}
         for m in db.exec(select(ChannelMapping).order_by(ChannelMapping.id)).all()
     ]
@@ -210,10 +214,18 @@ def _classify_and_prepare(db: Session, project: Project, title: str, idea: str,
 
     matched: Optional[dict] = None
     warning: Optional[str] = None
-    if not mappings:
+    chosen_id = getattr(project, "channel_id", None)
+    chosen = next((m for m in mappings if chosen_id and m["id"] == chosen_id), None)
+    if chosen:
+        matched = {**chosen, "match_confidence": "chosen"}
+    elif chosen_id:
+        warning = ("Kênh YouTube đã chọn cho project này không còn trong ⚙️ Settings → "
+                   "YouTube/GPMLogin. Chọn lại kênh (tab Video hoặc ✏️ Sửa project); "
+                   "Suno/Mix/Video vẫn chạy, tool dừng ở bước đăng nháp.")
+    elif not mappings:
         warning = ("Chưa cấu hình kênh YouTube nào. Vào ⚙️ Settings → "
-                   "YouTube/GPMLogin thêm dòng (nhạc cụ + phong cách → profile) "
-                   "thì tool mới đăng nháp đúng kênh. Suno/Mix/Video vẫn chạy.")
+                   "YouTube/GPMLogin thêm kênh (tên kênh → profile GPMLogin) rồi "
+                   "chọn kênh cho project thì tool mới đăng nháp. Suno/Mix/Video vẫn chạy.")
     else:
         user_inst = (project.instrument or "").strip()
         pool = mappings
@@ -227,18 +239,40 @@ def _classify_and_prepare(db: Session, project: Project, title: str, idea: str,
                 pool = exact
         matched = classify_channel(title, idea, styles, pool, api_config) if pool else None
         if matched:
-            # Cùng nhạc cụ → lấy đúng chuỗi trong ánh xạ để bước đăng nháp tra khớp.
-            project.instrument = matched.get("instrument", "")
-            project.music_style = matched.get("music_style", "")
+            # Ghi luôn kênh đã chọn → bước đăng nháp/thumbnail dùng đúng kênh này.
+            if matched.get("id"):
+                project.channel_id = matched["id"]
         elif user_inst and not pool:
-            warning = (f"Chưa có kênh YouTube nào cho nhạc cụ «{user_inst}». Thêm dòng "
-                       "ánh xạ ở ⚙️ Settings → YouTube/GPMLogin. Suno/Mix/Video vẫn chạy "
-                       "đúng nhạc cụ; tool dừng ở bước đăng nháp để không đăng nhầm kênh.")
+            warning = (f"Chưa chọn kênh YouTube và không kênh nào gợi ý nhạc cụ «{user_inst}». "
+                       "Chọn kênh ở tab Video (mục «Đăng nháp YouTube») hoặc ✏️ Sửa project — "
+                       "kênh nào cũng nhận nhạc cụ nào. Suno/Mix/Video vẫn chạy đúng nhạc cụ; "
+                       "tool dừng ở bước đăng nháp để không đăng nhầm kênh.")
         else:
             warning = ("Không xác định chắc chắn kênh YouTube cho project này. "
-                       "Kiểm tra nhạc cụ trong Tên project, hoặc thêm dòng ánh xạ "
-                       "phù hợp ở ⚙️ Settings. Tool sẽ dừng ở bước đăng nháp để "
-                       "không đăng nhầm kênh.")
+                       "Chọn kênh ở tab Video (mục «Đăng nháp YouTube») hoặc ✏️ Sửa "
+                       "project. Tool sẽ dừng ở bước đăng nháp để không đăng nhầm kênh.")
+
+    if matched:
+        # Nhạc cụ/thể loại là của NGƯỜI DÙNG — chỉ điền khi đang trống.
+        if not (project.instrument or "").strip():
+            project.instrument = matched.get("instrument", "")
+        if not (project.music_style or "").strip():
+            project.music_style = matched.get("music_style", "")
+        # Mỗi kênh 1 phong cách riêng: chưa có ảnh mà phong cách ảnh đang là
+        # của kênh khác → chuyển sang phong cách của kênh này.
+        try:
+            from backend.video import channel_looks
+            new_style = channel_looks.realign_style(
+                project.id, project.name, project.video_style,
+                project.instrument, project.music_style,
+                channel_id=matched.get("id"))
+            if new_style and new_style != project.video_style:
+                logging.getLogger(__name__).info(
+                    "Project %s: phong cách ảnh %s → %s (theo phong cách kênh)",
+                    project.id, project.video_style, new_style)
+                project.video_style = new_style
+        except Exception as exc:
+            logging.getLogger(__name__).warning("realign_style lỗi: %s", exc)
 
     db.add(project)
     db.commit()

@@ -35,6 +35,11 @@ class _Loc:
     def first(self):
         return self
 
+    def nth(self, i: int):
+        # _status_text xét vài phần tử khớp đầu tiên (group.nth(i)) — chỉ có 1
+        # phần tử nên nth(0) chính là nó, ngoài ra coi như không khớp.
+        return self if i == 0 else _Loc(None)
+
     def count(self):
         return 1 if self._text is not None else 0
 
@@ -63,6 +68,11 @@ class FakePage:
 
     def wait_for_timeout(self, ms: int):
         self.waits += 1
+
+    def evaluate(self, js: str, arg=None):
+        # Lưới cuối của _status_text (quét chữ trong dialog) — ở trang giả thì
+        # selector luôn đọc được nên nhánh này phải trả rỗng.
+        return ""
 
 
 def _p(msg, pct):  # progress_cb giả

@@ -125,7 +125,11 @@ class CharacterSheetTests(unittest.TestCase):
         text = prompt_gen._build_user_prompt('{"instrument": "Piano"}', "T", "k", 20,
                                              "16:9", "2d", instrument_spec=spec)
         self.assertIn("FIXED LEAD INSTRUMENT", text)
-        self.assertIn("AT LEAST 12 of the 20", text)
+        # Từ 2026-10-25: chỉ 20–30% cảnh chơi nhạc cụ, còn lại hoạt động khác nhau.
+        self.assertIn("4 to 6 of the 20", text)
+        self.assertIn("ACTIVITIES — VARIETY IS REQUIRED", text)
+        self.assertIn('"plays_instrument"', text)
+        self.assertNotIn("AT LEAST", text)
         self.assertIn("The character is playing the piano", text)
         self.assertNotIn("flute holes", text)
 
@@ -138,6 +142,100 @@ class CharacterSheetTests(unittest.TestCase):
         scenes = {"0": "plays the piano", "1": "walks", "2": "piano by the window"}
         self.assertAlmostEqual(prompt_gen._instrument_coverage(scenes, spec), 2 / 3)
         self.assertEqual(prompt_gen._instrument_coverage(scenes, None), 1.0)
+
+
+def _scenes(acts, playing=(0,), prompt=None):
+    """Bộ cảnh giả: cảnh trong `playing` chơi piano, còn lại theo `acts`."""
+    out, it = [], iter(acts)
+    for i in range(len(acts) + len(playing)):
+        if i in playing:
+            out.append({"setting": f"s{i}", "activity": "playing the piano",
+                        "plays_instrument": True,
+                        "prompt": f"She plays the piano softly by window {i}."})
+        else:
+            act = next(it)
+            out.append({"setting": f"s{i}", "activity": act, "plays_instrument": False,
+                        "prompt": (prompt or "She is {act} in quiet place {i}.").format(
+                            act=act, i=i)})
+    return out
+
+
+_ACTS = ["reading a book", "watering plants", "walking along a path", "pouring tea",
+         "sketching in a sketchbook", "petting the cat", "fishing with a bamboo rod",
+         "folding paper cranes", "stretching gently", "feeding koi", "knitting a scarf",
+         "sweeping leaves", "flying a kite", "gathering herbs", "writing a letter",
+         "stargazing on a blanket"]
+
+
+class ActivityVarietyTests(unittest.TestCase):
+    """Người dùng 2026-10-25: «tạo nhiều hoạt động khác chứ không phải chỉ mỗi
+    chơi nhạc cụ» → 20–30% cảnh chơi nhạc cụ, còn lại mỗi cảnh 1 hoạt động."""
+    piano = music_spec.find_instrument("Piano")
+
+    def test_playing_scene_range(self):
+        self.assertEqual(prompt_gen.playing_scene_range(20), (4, 6))
+        self.assertEqual(prompt_gen.playing_scene_range(10), (2, 3))
+        self.assertEqual(prompt_gen.playing_scene_range(4), (1, 1))
+        self.assertEqual(prompt_gen.playing_scene_range(1), (1, 1))
+
+    def test_varied_set_passes(self):
+        raw = _scenes(_ACTS, playing=(0, 5, 11, 17))
+        rep = prompt_gen._activity_report(raw, self.piano, 20)
+        self.assertEqual((rep["playing"], rep["off"], rep["problem"]), (4, 0, ""))
+        self.assertEqual(rep["distinct"], 16)
+
+    def test_all_playing_is_rejected(self):
+        raw = _scenes([], playing=tuple(range(20)))
+        rep = prompt_gen._activity_report(raw, self.piano, 20)
+        self.assertGreater(rep["off"], 0)
+        self.assertIn("20/20 cảnh chơi Piano", rep["problem"])
+
+    def test_repeated_activity_is_rejected(self):
+        raw = _scenes(["reading a book", "reading a novel", "reading poetry"] * 5
+                      + ["watering plants"], playing=(0, 6, 12, 18))
+        rep = prompt_gen._activity_report(raw, self.piano, 20)
+        self.assertEqual(rep["distinct"], 2)
+        self.assertIn("hoạt động khác nhau", rep["problem"])
+
+    def test_flag_false_but_text_plays_counts_as_playing(self):
+        raw = _scenes(_ACTS[:3], playing=(0,),
+                      prompt="She is playing the old piano again, scene {i} ({act}).")
+        rep = prompt_gen._activity_report(raw, self.piano, 4)
+        self.assertEqual(rep["playing"], 4)
+        # Không có cờ: nhắc tới piano = coi là chơi (cách cũ).
+        legacy = [{"setting": "a", "prompt": "The piano stands by the window."},
+                  {"setting": "b", "prompt": "She reads on the sofa."}]
+        items = prompt_gen._scene_items(legacy)
+        self.assertEqual([prompt_gen._plays_in(x, self.piano) for x in items], [True, False])
+
+    def test_playing_scene_moved_to_intro_slot(self):
+        raw = _scenes(_ACTS[:3], playing=(2,))
+        out = prompt_gen._playing_first(raw, self.piano)
+        self.assertTrue(out[0]["plays_instrument"])
+        self.assertEqual([x["setting"] for x in out], ["s2", "s0", "s1", "s3"])
+        self.assertIs(prompt_gen._playing_first(out, self.piano), out)
+
+    def test_identity_line_lets_scene_decide_activity(self):
+        line = prompt_gen._instrument_identity(self.piano)
+        self.assertIn("only when the SCENE says so", line)
+
+    def test_scene_prompts_rewritten_until_varied(self):
+        same = _scenes([], playing=tuple(range(4)))
+        varied = _scenes(_ACTS[:3], playing=(1,))
+        client = _fake_client({"scenes": same}, {"scenes": varied})
+        logs = []
+        with patch("openai.OpenAI", return_value=client), \
+                patch.object(prompt_gen, "to_english", side_effect=lambda t, *a, **k: t):
+            out = prompt_gen.generate_scene_prompts(
+                "adult woman, lavender sweater", "grey cat", '{"instrument": "Piano"}',
+                "2d", API, scene_count=4, log=logs.append, instrument="Piano")
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        self.assertIn("plays the piano", out["0"])            # cảnh chơi đàn lên clip intro
+        self.assertIn("reading a book", out["1"])
+        self.assertTrue(any("4/4 cảnh chơi Piano" in m for m in logs), logs)
+        sent = client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("ACTIVITIES — VARIETY IS REQUIRED", sent)
+        self.assertIn("1 to 1 of the 4", sent)
 
 
 def _profile(**over):
@@ -167,8 +265,15 @@ def _profile(**over):
                     "#9AA0A6 — grey — companion"],
         "thumbnail": ("She sits on the piano bench by a rainy window playing the upright "
                       "piano, the grey cat curled on the rug, neon city glow."),
-        "scenes": [{"setting": f"room {i}", "prompt": f"She plays the piano keys softly, scene {i}."}
-                   for i in range(4)],
+        "scenes": [
+            {"setting": "balcony", "activity": "watering plants", "plays_instrument": False,
+             "prompt": "She waters the potted basil on the balcony, the cat watching."},
+            {"setting": "window", "activity": "playing the piano", "plays_instrument": True,
+             "prompt": "She plays the piano keys softly by the rainy window."},
+            {"setting": "sofa", "activity": "reading a book", "plays_instrument": False,
+             "prompt": "She reads a paperback on the sofa, the cat asleep beside her."},
+            {"setting": "street", "activity": "walking slowly", "plays_instrument": False,
+             "prompt": "She walks slowly along the wet neon street with an umbrella."}],
     }
     base.update(over)
     return base
@@ -320,7 +425,65 @@ class ClassifyRespectsInstrumentTests(unittest.TestCase):
         pool = cc.call_args.args[3]
         self.assertEqual([m["channel_name"] for m in pool], ["Piano Ch"])
         self.assertEqual(out["channel_name"], "Piano Ch")
-        self.assertEqual(project.instrument, "Lofi Piano")
+        # Nhạc cụ của người dùng giữ nguyên; kênh ghi qua channel_id (2026-10-25).
+        self.assertEqual(project.instrument, "Piano")
+        self.assertEqual(project.music_style, "Lofi")
+
+    def test_auto_match_records_channel_id(self):
+        from backend.routers import suno as suno_router
+        project = SimpleNamespace(id=7, name="P", video_style="", instrument="",
+                                  music_style="", channel_id=None,
+                                  auto_upload=False, auto_video=False)
+        db = MagicMock()
+        db.exec.return_value.all.return_value = [SimpleNamespace(
+            id=4, instrument="Guitar", music_style="Lofi", channel_name="G",
+            gpm_profile_id="g")]
+        with patch("backend.video.channel_looks.realign_style", return_value=None) as ra:
+            out = suno_router._classify_and_prepare(db, project, "T", "", "", None)
+        self.assertTrue(out["matched"])
+        self.assertEqual(project.channel_id, 4)
+        # Trống thì điền gợi ý từ kênh.
+        self.assertEqual((project.instrument, project.music_style), ("Guitar", "Lofi"))
+        self.assertEqual(ra.call_args.kwargs["channel_id"], 4)
+
+    def test_chosen_channel_any_instrument(self):
+        """Kênh đã chọn nhận nhạc cụ/thể loại BẤT KỲ — không phân loại, không đổi."""
+        from backend.routers import suno as suno_router
+        project = SimpleNamespace(id=8, name="P", video_style="", instrument="Shakuhachi",
+                                  music_style="Chinese Zen Music", channel_id=2,
+                                  auto_upload=False, auto_video=False)
+        db = MagicMock()
+        db.exec.return_value.all.return_value = [
+            SimpleNamespace(id=1, instrument="Piano", music_style="Lofi",
+                            channel_name="Piano Ch", gpm_profile_id="p"),
+            SimpleNamespace(id=2, instrument="Guitar", music_style="Lofi",
+                            channel_name="Guitar Ch", gpm_profile_id="g")]
+        with patch("backend.video.channel_match.classify_channel") as cc, \
+                patch("backend.video.channel_looks.realign_style", return_value=None):
+            out = suno_router._classify_and_prepare(db, project, "T", "", "", None)
+        cc.assert_not_called()
+        self.assertTrue(out["matched"])
+        self.assertIsNone(out["warning"])
+        self.assertEqual(out["channel_name"], "Guitar Ch")
+        self.assertEqual(out["confidence"], "chosen")
+        self.assertEqual((project.instrument, project.music_style),
+                         ("Shakuhachi", "Chinese Zen Music"))
+        self.assertEqual(project.channel_id, 2)
+
+    def test_chosen_channel_deleted_warns(self):
+        from backend.routers import suno as suno_router
+        project = SimpleNamespace(id=9, name="P", video_style="", instrument="Piano",
+                                  music_style="Lofi", channel_id=99,
+                                  auto_upload=False, auto_video=False)
+        db = MagicMock()
+        db.exec.return_value.all.return_value = [SimpleNamespace(
+            id=1, instrument="Piano", music_style="Lofi", channel_name="Piano Ch",
+            gpm_profile_id="p")]
+        with patch("backend.video.channel_match.classify_channel") as cc:
+            out = suno_router._classify_and_prepare(db, project, "T", "", "", None)
+        cc.assert_not_called()
+        self.assertFalse(out["matched"])
+        self.assertIn("Chọn lại kênh", out["warning"])
 
     def test_no_channel_for_instrument_keeps_choice(self):
         from backend.routers import suno as suno_router

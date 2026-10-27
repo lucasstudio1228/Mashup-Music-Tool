@@ -416,27 +416,29 @@ class _CDPPlaywright:
                     _asyncio.WindowsProactorEventLoopPolicy())
             except Exception:
                 self._old_policy = None
-        from playwright.sync_api import sync_playwright
-        self._pw = sync_playwright().start()
-        # GPMLogin trả cổng debug NGAY khi bật profile, nhưng Chrome cần vài giây
-        # mới mở cổng → thử lại tối đa 60s thay vì chết ngay vì ECONNREFUSED.
-        deadline = time.time() + self.connect_sec
-        last_exc = None
-        while True:
-            try:
-                self.browser = self._pw.chromium.connect_over_cdp(
-                    self.cdp_endpoint, timeout=30_000)
-                return self
-            except Exception as exc:
-                last_exc = exc
-                if time.time() >= deadline:
-                    break
-                time.sleep(3)
-        self._pw.stop()
-        self._restore_policy()      # __exit__ không chạy khi __enter__ raise
-        raise CDPConnectError(
-            f"Không kết nối được trình duyệt GPMLogin ({self.cdp_endpoint}) sau "
-            f"{int(self.connect_sec)} giây: {last_exc}")
+        from .browser_base import start_playwright
+        try:
+            self._pw = start_playwright()
+            # GPMLogin trả cổng debug NGAY khi bật profile, nhưng Chrome cần vài giây
+            # mới mở cổng → thử lại tối đa 60s thay vì chết ngay vì ECONNREFUSED.
+            deadline = time.time() + self.connect_sec
+            last_exc = None
+            while True:
+                try:
+                    self.browser = self._pw.chromium.connect_over_cdp(
+                        self.cdp_endpoint, timeout=30_000)
+                    return self
+                except Exception as exc:
+                    last_exc = exc
+                    if time.time() >= deadline:
+                        break
+                    time.sleep(3)
+            raise CDPConnectError(
+                f"Không kết nối được trình duyệt GPMLogin ({self.cdp_endpoint}) sau "
+                f"{int(self.connect_sec)} giây: {last_exc}")
+        except BaseException:
+            self.__exit__(None, None, None)     # __exit__ không chạy khi __enter__ raise
+            raise
 
     def _restore_policy(self):
         try:
@@ -450,16 +452,16 @@ class _CDPPlaywright:
     def __exit__(self, *exc):
         # KHÔNG close browser (đó là trình duyệt của profile — để gpm_client
         # close_profile lo). Chỉ dừng playwright + khôi phục event loop policy.
+        # Không ném lỗi: kết nối CDP đã chết thì stop() có thể lỗi — vẫn phải
+        # nhả luồng (xem browser_base.start_playwright).
+        pw, self._pw = self._pw, None
         try:
-            if self._pw:
-                self._pw.stop()
+            if pw:
+                pw.stop()
+        except Exception as e:      # noqa: BLE001
+            print(f"  ⚠️ Dừng Playwright (CDP) lỗi: {e}")
         finally:
-            try:
-                import asyncio as _asyncio
-                if self._old_policy is not None:
-                    _asyncio.set_event_loop_policy(self._old_policy)
-            except Exception:
-                pass
+            self._restore_policy()
 
 
 def _read_video_url(page) -> str:

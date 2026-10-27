@@ -16,7 +16,17 @@ export interface Project {
   batch_id?: string | null; // nhóm project cùng 1 lô sản xuất hàng loạt
   mix_duration_minutes?: number;  // tổng thời lượng mix = độ dài video
   mix_crossfade_seconds?: number;
+  channel_id?: number | null;          // kênh YouTube người dùng chọn (null = tự tra)
+  effective_channel_id?: number | null; // kênh sẽ dùng (đã chọn, hoặc tự khớp)
+  effective_channel_name?: string;
+  intro_mode?: IntroMode;   // intro 00:00: "thumbnail" (mặc định) | "font"
+  cast_mode?: CastMode;     // "character_pet" (mặc định) | "scenery" (chỉ cảnh vật)
 }
+
+// Intro: ảnh thumbnail động mở đầu từ 00:00 (mặc định) hoặc chữ font có sẵn.
+export type IntroMode = "thumbnail" | "font";
+// Video: nhân vật + linh thú/thú nuôi (mặc định) hoặc chỉ cảnh vật.
+export type CastMode = "character_pet" | "scenery";
 
 // ---------- Sản xuất hàng loạt (batch) ----------
 export interface BatchCreate {
@@ -24,11 +34,14 @@ export interface BatchCreate {
   instrument: string;       // nhạc cụ — giữ nguyên cả lô (bắt buộc)
   music_style: string;      // thể loại nhạc — giữ nguyên cả lô (bắt buộc)
   channel_name?: string;
-  video_style?: string;     // key phong cách ảnh (2d/3d/ghibli/…/real)
+  channel_id?: number | null; // kênh đăng nháp — kênh nào cũng nhận nhạc cụ nào
+  video_style?: string;     // "channel" (theo phong cách kênh) hoặc key ảnh (2d/3d/…/real)
   theme?: string;           // chủ đề tuỳ chọn
   target_tracks?: number | null;
   max_create_actions?: number | null;
   mix_duration_minutes?: number;  // tổng thời lượng mix/video mỗi project
+  intro_mode?: IntroMode;
+  cast_mode?: CastMode;
 }
 
 export interface InstrumentOption {
@@ -106,6 +119,85 @@ export interface ApiTestResult {
   retryable: boolean;
 }
 
+// ── Thumbnail AI (ảnh + chữ qua API, mặc định ShopAIKey) ──────────
+export interface ThumbAIModelChoice {
+  key: string;
+  label: string;
+  group: string;
+  price_usd?: number | null;
+  protocol: string;
+  note: string;
+}
+
+export interface ThumbAISettings {
+  base_url: string;
+  model: string;
+  enabled: boolean;
+  verify: boolean;
+  has_api_key: boolean;
+  protocol: string;
+  models: ThumbAIModelChoice[];
+  engine: ThumbEngine;
+  engines: { key: ThumbEngine; label: string; note: string }[];
+  chatgpt_logged_in?: boolean | null;
+  chatgpt_checked_at?: string | null;
+}
+
+export type ThumbEngine = 'chatgpt' | 'api' | 'pil';
+
+export interface ChatGPTWindowStatus {
+  open: boolean;
+  status?: string | null;
+  message: string;
+  logged_in?: boolean | null;
+  checked_at?: string | null;
+}
+
+export interface ThumbAISettingsUpdate {
+  api_key?: string;
+  clear_api_key?: boolean;
+  base_url?: string;
+  model?: string;
+  enabled?: boolean;
+  verify?: boolean;
+  engine?: ThumbEngine;
+}
+
+export interface ThumbAITestRequest {
+  api_key?: string;
+  base_url?: string;
+  model?: string;
+}
+
+export interface ThumbAITestResult {
+  ok: boolean;
+  base_url: string;
+  model: string;
+  model_available?: boolean | null;
+  image_models: string[];
+  model_count: number;
+  latency_ms?: number | null;
+  error?: string | null;
+}
+
+export interface ThumbAIStatus {
+  engine: 'chatgpt' | 'ai' | 'pil';
+  note: string;
+  default_engine?: ThumbEngine;
+  chatgpt_logged_in?: boolean | null;
+  chatgpt_checked_at?: string | null;
+  ai_ready: boolean;
+  ai_active: boolean;
+  model: string;
+  model_label: string;
+  price_usd?: number | null;
+  last_ai?: {
+    model: string; created_at: string; attempts: number; seconds: number;
+    engine?: string; label?: string;
+    verified?: boolean | null; read_title?: string | null;
+  } | null;
+}
+
 export interface Track {
   id: number;
   project_id: number;
@@ -161,6 +253,10 @@ export interface ProjectCreate {
   description?: string;
   instrument?: string;     // nhạc cụ chủ đạo — khoá nhân vật/cảnh/Styles Suno
   music_style?: string;    // thể loại nhạc (lofi, zen, sleep…)
+  video_style?: string;    // "channel" = theo phong cách riêng của kênh; key = cố định
+  channel_id?: number | null; // kênh YouTube đăng nháp (null = tự chọn theo nhạc cụ)
+  intro_mode?: IntroMode;
+  cast_mode?: CastMode;
 }
 
 export interface ProjectUpdate {
@@ -176,6 +272,9 @@ export interface ProjectUpdate {
   suno_idea?: string;
   mix_duration_minutes?: number;
   mix_crossfade_seconds?: number;
+  channel_id?: number | null;
+  intro_mode?: IntroMode;
+  cast_mode?: CastMode;
 }
 
 export interface MixCreate {
@@ -253,6 +352,8 @@ export interface VideoParamsInfo {
   flow_mode:      string;
   blend_seconds:  number;
   slow_speed:     number;
+  cast_mode?:     CastMode;   // theo bộ ảnh đã chuẩn bị (prompts.json), chưa có → theo project
+  intro_mode?:    IntroMode;
 }
 
 export type VideoJobStatus = 'pending' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
@@ -275,6 +376,8 @@ export interface VideoStatus {
   final_exists:   boolean;
   final_path?:    string | null;
   thumbnail_path?: string | null;
+  thumbnail_mtime?: number | null;
+  thumbnail_ai?:  ThumbAIStatus | null;
   audio_path?:    string | null;
   audio_duration?: number | null;
   job?:           VideoJobInfo | null;

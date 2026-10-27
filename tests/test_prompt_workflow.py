@@ -15,6 +15,38 @@ from backend.video import suno_prompt, suno_service
 REAL_BOOTSTRAP = catalog.bootstrap_existing
 
 
+# Sổ công thức thumbnail (data/thumbnail_recipes.json) → file tạm, để test
+# không ghi công thức giả vào sổ thật của người dùng.
+from backend.video import thumbnail_recipe as _thumb_recipe  # noqa: E402
+_LEDGER_DIR = None
+_LEDGER_PATCH = None
+_AI_PATCH = None
+
+
+def setUpModule():
+    global _LEDGER_DIR, _LEDGER_PATCH, _AI_PATCH
+    import tempfile as _tf
+    from unittest import mock as _mock
+    _LEDGER_DIR = _tf.TemporaryDirectory()
+    _LEDGER_PATCH = _mock.patch.object(
+        _thumb_recipe, "LEDGER", Path(_LEDGER_DIR.name) / "thumbnail_recipes.json")
+    _LEDGER_PATCH.start()
+    # Không bao giờ gọi API ảnh thật (tốn phí) trong test, kể cả khi đã lưu key.
+    from backend.video import thumbnail_ai as _tai
+    _AI_PATCH = _mock.patch.object(_tai, "load_settings",
+                                   lambda *a, **k: _tai.ThumbAISettings(engine="pil"))
+    _AI_PATCH.start()
+
+
+def tearDownModule():
+    if _AI_PATCH:
+        _AI_PATCH.stop()
+    if _LEDGER_PATCH:
+        _LEDGER_PATCH.stop()
+    if _LEDGER_DIR:
+        _LEDGER_DIR.cleanup()
+
+
 class PromptWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory(prefix="mixer-prompts-test-")

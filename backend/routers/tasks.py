@@ -33,6 +33,10 @@ _VIDEO_KIND = {
     "motions": ("Tạo lại prompt chuyển động", "video"),
     "clips-manual": ("Clip thủ công", "video"),
     "retitle": ("Đổi tên — cập nhật chữ thumbnail/intro", "video"),
+    "thumbnail": ("Tạo thumbnail (ChatGPT / AI / font)", "video"),
+    "browser-chatgpt": ("Cửa sổ ChatGPT — tự đăng nhập", "video"),
+    "browser-gemini": ("Cửa sổ Gemini (profile của tool)", "video"),
+    "browser-flow": ("Cửa sổ Flow (profile của tool)", "video"),
     "images": ("Tạo ảnh", "video"),
     "clips": ("Tạo clip", "video"),
     "assemble": ("Ghép video", "video"),
@@ -74,10 +78,11 @@ def active_tasks(db: Session = Depends(get_session)):
     # 1) Worker Video/Suno/Upload (1 luồng — pending = đang xếp hàng)
     for j in video_job_manager.all_jobs():
         label, tab = _VIDEO_KIND.get(j.kind, (j.kind, "video"))
+        pid = j.project_id or None     # 0 = tác vụ chung (cửa sổ ChatGPT ở Cài đặt)
         item = {
             "id": f"video:{j.project_id}", "source": "video",
-            "project_id": j.project_id,
-            "project_name": _name(db, names, j.project_id),
+            "project_id": pid,
+            "project_name": _name(db, names, pid),
             "kind": j.kind, "label": label, "tab": tab,
             "status": j.status, "percent": round(j.percent or 0, 1),
             "message": (j.message or "")[:300],

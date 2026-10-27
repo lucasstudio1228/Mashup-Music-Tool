@@ -93,4 +93,6 @@ def run():
     sys.exit(0 if all_pass else 1)
 
 if __name__ == "__main__":
+    from _live_guard import require_live_opt_in
+    require_live_opt_in("verify_phase1_stems")
     run()

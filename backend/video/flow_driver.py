@@ -1026,13 +1026,21 @@ def _style_wrapper(style: str | None) -> Callable[[str], str]:
         return wrap_safe
 
     from .veo_safety import INGREDIENT_LOCK as short_lock
-    motion_negative = getattr(config, "MOTION_NEGATIVE", "") or ""
+    from .veo_safety import SCENERY_LOCK as short_scenery_lock
 
     def wrap(m: str) -> str:
         m = (m or "").strip()
         # Hồ sơ dựng thời bản gọn mang câu khoá ngắn → đổi lại câu khoá đầy đủ.
         if m.startswith(short_lock):
             m = config.INGREDIENT_LOCK_FULL + m[len(short_lock):]
+        elif m.startswith(short_scenery_lock):
+            m = config.INGREDIENT_LOCK_SCENERY + m[len(short_scenery_lock):]
+        # Chỉ cảnh vật → phủ định người/thú thay cho phủ định khói/tay/mặt.
+        motion_negative = config.motion_negative(m)
+        scenery = config.is_scenery_prompt(m)
+        if scenery:
+            # Cảnh vật ĐỘNG (2026-10-27): bỏ câu khoá máy/siêu chậm của hồ sơ cũ.
+            m = config.liven_scenery_motion(m)
         if style_motion and not m.lower().startswith(style_motion.lower()):
             m = f"{style_motion}, {m}" if m else style_motion
         # Gắn phủ định CỨNG vào CUỐI mọi prompt (chặn khói/đầu-ngược/méo tay…);
@@ -1040,13 +1048,36 @@ def _style_wrapper(style: str | None) -> Callable[[str], str]:
         cut = m.find("|| STRICTLY FORBIDDEN")
         if cut > 0 and motion_negative.strip() not in m:
             m = m[:cut].rstrip()
+        if scenery and m and config.SCENERY_LIVING_MOTION not in m:
+            cut = m.find("|| STRICTLY FORBIDDEN")
+            head, tail = (m[:cut].rstrip(), " " + m[cut:]) if cut > 0 else (m.rstrip(), "")
+            if not head.endswith((".", "!", "?")):
+                head += "."
+            m = f"{head} {config.SCENERY_LIVING_MOTION}{tail}"
         if m and motion_negative and motion_negative.strip() not in m:
             m = f"{m}{motion_negative}"
         return m
     return wrap
 
 
+def motion_base(cast_mode: str | None) -> str:
+    """Câu chuyển động dự phòng (khi thiếu prompt AI của clip). Override
+    flow_motion_prompt viết cho nhân vật → bỏ qua ở chế độ chỉ cảnh vật."""
+    if cast_mode == "scenery":
+        return config.FLOW_MOTION_PROMPT_SCENERY
+    return config.load_overrides().get("flow_motion_prompt") or config.FLOW_MOTION_PROMPT
+
+
 def _fallback_variants(plain_base: str) -> list[str]:
+    if config.is_scenery_prompt(plain_base):
+        # Cảnh vật ĐỘNG: mỗi clip dự phòng một kiểu máy quay khác nhau.
+        return [
+            plain_base + ", smooth dolly forward into the scene",
+            plain_base + ", lateral tracking shot gliding to the right",
+            plain_base + ", gentle crane rise revealing the wider view",
+            plain_base + ", slow orbit around the main landmark",
+            plain_base + ", aerial drift over the place",
+        ]
     return [
         plain_base,
         plain_base + ", very slow pan to the right",
@@ -1078,12 +1109,12 @@ def clip_prompt_list(project_id: int, project_name: str | None = None,
     out_dir = config.clips_dir(project_id, project_name)
     wrap = _style_wrapper(style)
     ai_motions = _load_motions(img_dir)
-    variants = _fallback_variants(config.load_overrides().get("flow_motion_prompt")
-                                  or config.FLOW_MOTION_PROMPT)
+    cast_mode = config.images_cast_mode(img_dir)
+    variants = _fallback_variants(motion_base(cast_mode))
     items = []
     for idx, ings in enumerate(config.generate_ingredient_plan(total)):
         if config.IMG_THUMBNAIL in ings:
-            raw = config.INTRO_MOTION_PROMPT
+            raw = config.intro_motion_prompt(cast_mode)
         else:
             raw = ai_motions.get(str(idx)) or variants[idx % len(variants)]
         items.append({"index": idx, "name": f"clip_{idx:02d}.mp4",
@@ -1136,13 +1167,15 @@ def generate_clips(
     # clip khác = [1, 2]. Deterministic ⇒ không phụ thuộc _plan.json (khác quy
     # trình cũ ánh xạ 1:1 ngẫu nhiên).
     plan: list[list[int]] = config.generate_ingredient_plan(total)
+    cast_mode = config.images_cast_mode(img_dir)
+    roles = config.image_roles(cast_mode)
 
     # Luôn cần HAI bảng nhân vật; ảnh 0 (thumbnail) chỉ cần khi còn phải tạo
     # clip intro (kiểm ngay dưới, sau khi biết clip nào đã xong).
     for i in config.SHEET_IMAGES:
         if not (img_dir / f"{i}.png").exists():
             raise FileNotFoundError(
-                f"Thiếu ảnh {i}.png ({config.IMAGE_ROLES.get(i, '')}) trong "
+                f"Thiếu ảnh {i}.png ({roles.get(i, '')}) trong "
                 f"{img_dir} — hãy tạo ảnh trước.")
 
     # Clip DỰ PHÒNG tĩnh (Veo lỗi) được ĐÁNH DẤU để resume TẠO LẠI bằng Veo —
@@ -1209,8 +1242,7 @@ def generate_clips(
         return [str(out_dir / f"clip_{k:02d}.mp4") for k in range(total)]
     # Prompt chuyển động: nhẹ nhàng, chậm, mượt (video sẽ còn được làm chậm 0.7x
     # và blend khi ghép). Xoay vòng vài biến thể cho đa dạng.
-    plain_base = (config.load_overrides().get("flow_motion_prompt")
-                  or config.FLOW_MOTION_PROMPT)
+    plain_base = motion_base(cast_mode)
     # Phong cách (2D/3D) sẽ được gắn lên ĐẦU MỌI prompt chuyển động để Veo giữ
     # đúng nét hoạt hình của ảnh nguồn, không "làm thật hoá" khi tạo chuyển động.
     _style_wrap = _style_wrapper(style)
@@ -1232,7 +1264,7 @@ def generate_clips(
     if missing:
         raise FileNotFoundError(
             f"Thiếu ảnh {', '.join(f'{i}.png' for i in missing)} "
-            f"({', '.join(config.IMAGE_ROLES.get(i, '') for i in missing)}) trong "
+            f"({', '.join(roles.get(i, '') for i in missing)}) trong "
             f"{img_dir} — clip intro 00 dựng từ ảnh bìa; hãy tạo ảnh trước.")
     img_paths = [str(img_dir / f"{i}.png") for i in todo_images]
 
@@ -1336,7 +1368,7 @@ def generate_clips(
                     # Clip intro: làm sống động ĐÚNG ảnh bìa. Các clip khác: prompt
                     # bối cảnh AI của CHÍNH clip đó; thiếu → mặc định.
                     if config.IMG_THUMBNAIL in ings:
-                        raw_motion = config.INTRO_MOTION_PROMPT
+                        raw_motion = config.intro_motion_prompt(cast_mode)
                     else:
                         raw_motion = (ai_motions.get(str(clip_idx))
                                       or fallback_variants[clip_idx % len(fallback_variants)])

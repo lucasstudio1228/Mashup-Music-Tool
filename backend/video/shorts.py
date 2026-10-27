@@ -142,16 +142,21 @@ def _balance_lines(words: list[str], n: int, measure, max_w: float) -> list[str]
 
 
 def _sentence_layout(text: str, draw, font, max_w: float, max_lines: int = 4,
-                     min_size: int = 40, start_size: int = 0):
+                     min_size: int = 40, start_size: int = 0,
+                     fonts: Optional[list[str]] = None):
     """Hook 2 vế («Rough day? Stay a while.»): mỗi câu bắt đầu DÒNG MỚI để câu mời
-    không dính đuôi câu hỏi. (font, lines) hoặc None nếu chỉ 1 câu / không vừa."""
+    không dính đuôi câu hỏi. (font, lines) hoặc None nếu chỉ 1 câu / không vừa.
+
+    `fonts` = bộ font đang dùng (phải truyền đúng bộ của render_hook_png, nếu
+    không chữ sẽ lặng lẽ đổi về font mặc định khi phải giảm cỡ)."""
     from .thumbnail import _load_font, _wrap
+    cands = fonts or _HOOK_FONTS
     parts = [s for s in re.split(r"(?<=[.?!])\s+", text) if s.strip()]
     if len(parts) != 2:
         return None
     size = max(start_size, font.size)
     while size >= min_size:
-        f = font if size == font.size else _load_font(_HOOK_FONTS, size)
+        f = font if size == font.size else _load_font(cands, size)
         if f is None:
             return None
 
@@ -168,17 +173,27 @@ def _sentence_layout(text: str, draw, font, max_w: float, max_lines: int = 4,
 
 
 def render_hook_png(text: str, out_png: str | Path,
-                    width: int = SHORT_W, height: int = SHORT_H) -> bool:
-    """PNG trong suốt: dải tối mờ phía trên + hook chữ trắng viền tối, căn giữa,
-    nằm ở vùng 8–20% chiều cao (né thanh tìm kiếm trên & chữ/nút Shorts dưới)."""
+                    width: int = SHORT_W, height: int = SHORT_H,
+                    style: Optional[dict] = None) -> bool:
+    """PNG trong suốt: dải tối mờ phía trên + hook chữ viền tối, căn giữa, nằm ở
+    vùng 8–20% chiều cao (né thanh tìm kiếm trên & chữ/nút Shorts dưới).
+
+    `style` (thumbnail_recipe.hook_style) đổi FONT + MÀU chữ theo công thức của
+    project → mỗi Short một kiểu chữ khác. Không truyền → chữ trắng font mặc
+    định như trước."""
     text = " ".join((text or "").split())
     if not text:
         return False
     try:
         from PIL import Image, ImageDraw
-        from .thumbnail import _fit_wrapped
+        from .thumbnail import _fit_wrapped, _usable
     except Exception:
         return False
+    fonts = list((style or {}).get("fonts") or []) + _HOOK_FONTS
+    # Font trang trí thiếu dấu tiếng Việt → _usable đẩy font đủ glyph lên đầu.
+    fonts = _usable(fonts, text)
+    fill = tuple((style or {}).get("fill") or (255, 255, 255))
+    stroke_rgb = tuple((style or {}).get("stroke") or (10, 18, 15))
     img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     # Dải tối gradient ở 1/3 trên để chữ luôn đọc được trên nền sáng.
     band_h = int(height * 0.30)
@@ -191,14 +206,15 @@ def render_hook_png(text: str, out_png: str | Path,
 
     draw = ImageDraw.Draw(img)
     max_w = int(width * 0.84)
-    font, lines = _fit_wrapped(_HOOK_FONTS, text, draw, max_w,
+    font, lines = _fit_wrapped(fonts, text, draw, max_w,
                                int(width * 0.078), max_lines=3, min_size=40)
     if font is None or not lines:
         return False
     lines = _balance_lines(text.split(), len(lines),
                            lambda t: draw.textlength(t, font=font), max_w) or lines
     font, lines = (_sentence_layout(text, draw, font, max_w,
-                                    start_size=int(width * 0.078)) or (font, lines))
+                                    start_size=int(width * 0.078),
+                                    fonts=fonts) or (font, lines))
     stroke = max(4, int(font.size * 0.08))
     top, bottom = draw.textbbox((0, 0), "Ag", font=font, stroke_width=stroke)[1::2]
     lh = bottom - top
@@ -207,8 +223,8 @@ def render_hook_png(text: str, out_png: str | Path,
     y = int(height * 0.08) + max(0, (int(height * 0.12) - block) // 2) - top
     for ln in lines:
         w = draw.textlength(ln, font=font)
-        draw.text(((width - w) / 2, y), ln, font=font, fill=(255, 255, 255, 255),
-                  stroke_width=stroke, stroke_fill=(10, 18, 15, 235))
+        draw.text(((width - w) / 2, y), ln, font=font, fill=fill + (255,),
+                  stroke_width=stroke, stroke_fill=stroke_rgb + (235,))
         y += lh + gap
     Path(out_png).parent.mkdir(parents=True, exist_ok=True)
     img.save(out_png, format="PNG")
@@ -611,6 +627,19 @@ def compose_description(meta: dict, channel_name: str,
 
 
 # ── Ghép lại: chuẩn bị short.mp4 + nội dung ─────────────────────────────
+def _hook_style(project_id: Optional[int]) -> Optional[dict]:
+    """Font + màu chữ hook theo công thức thumbnail của project. Best-effort:
+    thiếu project_id / lỗi sổ công thức → None → chữ trắng mặc định."""
+    if not project_id:
+        return None
+    try:
+        from . import thumbnail_recipe
+        return thumbnail_recipe.hook_style(
+            thumbnail_recipe.recipe_for_project(int(project_id)))
+    except Exception:
+        return None
+
+
 def build_short(final_path: str, out_dir: Path, tracklist: list[dict], *,
                 channel_name: str, instrument: str, music_style: str,
                 long_title: str, past_titles: list[str], api_config,
@@ -631,7 +660,8 @@ def build_short(final_path: str, out_dir: Path, tracklist: list[dict], *,
                                past_titles, api_config,
                                log=lambda m: progress_cb(m, 18.0))
     hook_png = out_dir / "_short_hook.png"
-    use_hook = st["hook"] and render_hook_png(meta["hook"], hook_png)
+    use_hook = st["hook"] and render_hook_png(meta["hook"], hook_png,
+                                              style=_hook_style(project_id))
     progress_cb(f"Short: crop dọc 9:16 + hook «{meta['hook']}»…" if use_hook
                 else "Short: crop dọc 9:16…", 25.0)
     out = render_short(final_path, out_dir / "short.mp4", start, length,

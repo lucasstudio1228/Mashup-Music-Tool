@@ -15,6 +15,7 @@ Chạy trong worker thread (Playwright sync API + ffmpeg).
 from __future__ import annotations
 import json
 import random
+import sqlite3
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -33,6 +34,24 @@ def _thumbnail_keywords(n: int = 3) -> str:
            or config.THUMBNAIL_KEYWORDS)
     k = min(n, len(kws))
     return " · ".join(random.sample(list(kws), k)) if k else ""
+
+
+def _title_look(project_id: int, project_name: str | None):
+    """Công thức thumbnail của project → (style cho thumbnail.py, dòng phụ,
+    finish video theo phong cách kênh, recipe). Lỗi → kiểu cũ."""
+    P = config.PARAMS
+    try:
+        from . import channel_looks, thumbnail_recipe
+        recipe = thumbnail_recipe.recipe_for_project(project_id, project_name)
+        if recipe:
+            return (thumbnail_recipe.render_style(recipe),
+                    thumbnail_recipe.project_subtitle(project_id, recipe),
+                    channel_looks.finish_for(recipe.get("look"), recipe), recipe)
+    except Exception:
+        pass
+    return (None, _thumbnail_keywords(),
+            {"grade": "", "transition": "softfade", "blend_seconds": P.blend_seconds,
+             "slow_speed": P.slow_speed}, None)
 
 
 def _resolve_prompts(
@@ -377,23 +396,29 @@ def regen_motions(project_id: int,
     idea = (saved.get("idea") or "").strip()
     style_key = config.normalize_style(style_key or saved.get("style_key"))
     scenes = config.PARAMS.total_clips   # sinh lại ĐỦ số cảnh theo cấu hình hiện tại
+    from .prompt_workflow import manifest_cast_mode, scene_suffix
+    cast_mode = manifest_cast_mode(saved)
+    # hồ sơ chỉ cảnh vật: character_sheet = bảng bối cảnh, pet_sheet = bảng ánh sáng
+    mode_kw = {"cast_mode": cast_mode} if cast_mode == "scenery" else {}
 
-    _log(f"Sinh lại {scenes} prompt cảnh từ hai bảng nhân vật đã khoá…")
+    _log(f"Sinh lại {scenes} prompt cảnh từ "
+         + ("bảng bối cảnh + bảng ánh sáng" if mode_kw else "hai bảng nhân vật")
+         + " đã khoá…")
     motions = generate_scene_prompts(
         character_sheet=character_sheet, pet_sheet=pet_sheet, idea=idea,
         style=config.style_info(style_key)["brief"],
         api_config=get_api_config_from_db(str(DB_PATH)),
         scene_count=scenes, log=_log,
         instrument=(saved.get("context") or {}).get("instrument", "")
-        or _project_instrument(project_id))
+        or _project_instrument(project_id), **mode_kw)
     if not motions or len(motions) != scenes:
         raise RuntimeError(
             "AI chưa sinh lại đủ bộ prompt cảnh (kiểm tra API key/model ở ⚙️ "
             "Settings rồi thử lại).")
 
-    from .prompt_workflow import (validate_manifest, save_manifest,
-                                  SCENE_SUFFIX)
-    saved["motions"] = {k: v + SCENE_SUFFIX for k, v in motions.items()}
+    from .prompt_workflow import validate_manifest, save_manifest
+    suffix = scene_suffix(cast_mode)
+    saved["motions"] = {k: v + suffix for k, v in motions.items()}
     if "scene_count" in saved and saved["scene_count"] != scenes:
         from .prompt_workflow import _resign
         _resign(dict(saved), saved, scenes)
@@ -439,53 +464,150 @@ def step_assemble(project_id: int,
     rest = clips[1:]
     random.Random(seed).shuffle(rest)
 
-    # Intro = clip_00 (dựng lại cảnh ảnh bìa từ ảnh 0 + hai bảng nhân vật) → chồng
-    # tiêu đề lên bằng font thật, khớp chữ với final/thumbnail.png.
+    # Intro = clip_00 (dựng lại cảnh ảnh bìa từ ảnh 0 + hai bảng nguyên liệu).
     intro = clips[0]
     title = (project_name or "Healing").strip()
-    subtitle = _thumbnail_keywords()
-    titled_intro = config.final_dir(project_id, project_name) / "_intro_titled.mp4"
-    if title and overlay_title_on_clip(
-            intro, title, subtitle, str(titled_intro),
-            log=lambda m: progress_cb(m, 4.0)):
-        intro = str(titled_intro)
+    intro_mode = _project_intro_mode(project_id)
+    # Kiểu chữ + dòng phụ + màu/chuyển cảnh theo công thức riêng của video và
+    # phong cách kênh (thumbnail_recipe / channel_looks) — chống dập khuôn.
+    style, subtitle, finish, recipe = _title_look(project_id, project_name)
+    if config.images_cast_mode(config.images_dir(project_id, project_name)) == "scenery":
+        # Chỉ cảnh vật: phát đúng tốc độ thật — làm chậm 0.7x khiến cảnh vật trông
+        # như đứng hình (người dùng muốn cảnh động, chuyển động bình thường).
+        finish = {**finish, "slow_speed": config.SCENERY_PLAYBACK_SPEED}
+    if recipe:
+        from .channel_looks import look_info
+        progress_cb(f"Phong cách kênh «{look_info(recipe.get('look'))['label']}»: chữ "
+                    f"{recipe.get('layout')} · {recipe.get('treatment')} · "
+                    f"{recipe.get('font_lock') or recipe.get('font')}", 3.5)
 
-    # Thumbnail riêng: overlay tiêu đề (CÙNG title/subtitle với intro) lên ảnh 0
-    # SẠCH → final/thumbnail.png. Dùng chung 1 subtitle nên chữ khớp intro video.
+    # Thumbnail TRƯỚC (ChatGPT/API vẽ ảnh + chữ; lỗi → chữ font PIL) lên ảnh 0
+    # SẠCH → final/thumbnail.png. intro_mode="thumbnail" (mặc định): chính ảnh
+    # này mở đầu video từ 00:00 rồi hoà tan vào clip 00 → intro giống hệt
+    # thumbnail, không còn một kiểu chữ/thiết kế khác.
+    from .job_manager import JobCancelled
+    thumb_path = None
     try:
-        render_thumbnail(project_id, project_name, subtitle,
-                         log=lambda m: progress_cb(m, 4.5))
+        thumb_path = render_thumbnail(project_id, project_name, subtitle,
+                                      log=lambda m: progress_cb(m, 4.0), style=style,
+                                      recipe=recipe,
+                                      cancel_check=getattr(progress_cb, "is_cancelled", None))
+    except JobCancelled:
+        raise
     except Exception as e:
-        progress_cb(f"Bỏ qua tạo thumbnail.png ({e})", 4.5)
+        progress_cb(f"Bỏ qua tạo thumbnail.png ({e})", 4.0)
+    lead_image = None
+    if intro_mode == "thumbnail" and thumb_path and Path(thumb_path).exists():
+        lead_image = thumb_path
+        progress_cb(f"Intro 00:00 = ảnh thumbnail (đẩy máy chậm "
+                    f"{config.INTRO_THUMBNAIL_SECONDS:.0f}s) → hoà tan vào clip 00", 4.5)
+    else:
+        if intro_mode == "thumbnail":
+            progress_cb("Chưa có final/thumbnail.png → intro dùng chữ font có sẵn "
+                        "đè lên clip 00.", 4.5)
+        # intro_mode="font" (tuỳ chọn): chồng tiêu đề bằng font thật lên clip 00.
+        cover = config.images_dir(project_id, project_name) / "0.png"
+        titled_intro = config.final_dir(project_id, project_name) / "_intro_titled.mp4"
+        if title and overlay_title_on_clip(
+                intro, title, subtitle, str(titled_intro),
+                log=lambda m: progress_cb(m, 4.5), style=style,
+                bg_hint=str(cover) if cover.exists() else None):
+            intro = str(titled_intro)
     seq = [intro, *rest]
+    head = ("Intro thumbnail → clip 00 một lần" if lead_image
+            else "Intro clip 00 (chữ font) một lần")
     progress_cb(
-        f"Intro clip 00 một lần; shuffle T+{P.t_window} cycle "
-        f"{len(seq) - 1} clip còn lại, blend 0.7x, lặp đến {dur:.0f}s", 5.0)
+        f"{head}; shuffle T+{P.t_window} cycle "
+        f"{len(seq) - 1} clip còn lại, chuyển cảnh {finish['transition']} "
+        f"{finish['blend_seconds']:.1f}s, tốc độ {finish['slow_speed']:.2f}x, "
+        f"lặp đến {dur:.0f}s", 5.0)
 
     out = config.final_dir(project_id, project_name) / "final.mp4"
     return assemble_video_blend(
         seq, audio, str(out), target_seconds=dur,
-        blend_seconds=P.blend_seconds, slow_speed=P.slow_speed,
+        blend_seconds=finish["blend_seconds"], slow_speed=finish["slow_speed"],
+        grade=finish["grade"], transition=finish["transition"],
+        lead_image=lead_image, lead_seconds=config.INTRO_THUMBNAIL_SECONDS,
         progress_cb=lambda m, p: progress_cb(m, 5.0 + p * 0.95),
     )
 
 
 def render_thumbnail(project_id: int, project_name: str | None,
-                     subtitle: str | None = None, log=None) -> Optional[str]:
-    """Ảnh 0 SẠCH (không chữ) + tiêu đề = tên project (font thật) →
-    final/thumbnail.png. Trả đường dẫn, hoặc None nếu chưa có ảnh 0."""
+                     subtitle: str | None = None, log=None,
+                     style: Optional[dict] = None, *,
+                     recipe: Optional[dict] = None, engine: str | None = None,
+                     force_ai: bool = False, interactive: bool = False,
+                     cancel_check=None) -> Optional[str]:
+    """Ảnh 0 SẠCH (không chữ) + tiêu đề = tên project →
+    final/thumbnail.png theo công thức thumbnail của project (bố cục, kiểu chữ,
+    màu, font). Trả đường dẫn, hoặc None nếu chưa có ảnh 0.
+
+    engine: None = theo Cài đặt `thumb_engine` (mặc định "chatgpt": ChatGPT web
+    → lỗi thì API nếu bật tự động + có key → lỗi thì PIL; "api": API nếu bật
+    tự động + có key → PIL)
+    | "chatgpt" = bắt buộc ChatGPT (lỗi → PIL, KHÔNG tự sang API tốn phí)
+    | "ai" = bắt buộc API | "pil" = chữ font thật (miễn phí).
+    force_ai = vẽ bản AI mới (bỏ qua ảnh đã lưu). interactive = người dùng bấm
+    nút (chờ đăng nhập ChatGPT lâu hơn)."""
     import shutil
+    from . import chatgpt_thumbnail, thumbnail_ai
+    from .job_manager import JobCancelled
     from .thumbnail import render_title
     title = (project_name or "Healing").strip()
     src0 = config.images_dir(project_id, project_name) / "0.png"
     if not title or not src0.exists():
         return None
-    thumb = config.final_dir(project_id, project_name) / "thumbnail.png"
+    if style is None or recipe is None:
+        st, auto_sub, _, rec = _title_look(project_id, project_name)
+        style = st if style is None else style
+        recipe = rec if recipe is None else recipe
+        if subtitle is None:
+            subtitle = auto_sub
+    if subtitle is None:
+        subtitle = _thumbnail_keywords()
+    if config.images_cast_mode(src0.parent) == "scenery":
+        # ảnh bìa chỉ có cảnh vật → prompt thumbnail không nhắc nhân vật/khuôn mặt
+        recipe = {**(recipe or {}), "scenery": True}
+    final_d = config.final_dir(project_id, project_name)
+    thumb = final_d / "thumbnail.png"
     thumb.parent.mkdir(parents=True, exist_ok=True)
+    notes: list[str] = []
+    if engine != "pil":
+        settings = thumbnail_ai.load_settings()
+        if engine == "chatgpt":
+            chain = ["chatgpt"]
+        elif engine == "ai":
+            chain = ["ai"]
+        elif settings.engine == "chatgpt":
+            chain = ["chatgpt"] + (["ai"] if settings.active else [])
+        elif settings.engine == "api":
+            chain = ["ai"] if settings.active else []
+        else:
+            chain = []
+        for i, eng in enumerate(chain):
+            nxt = ("API" if chain[i + 1:] == ["ai"] else "chữ font (PIL)")
+            try:
+                if eng == "chatgpt":
+                    chatgpt_thumbnail.generate(
+                        title=title, subtitle=subtitle, recipe=recipe, cover=src0,
+                        out=thumb, settings=settings, log=log, force=force_ai,
+                        interactive=interactive, cancel_check=cancel_check)
+                else:
+                    thumbnail_ai.generate(title=title, subtitle=subtitle, recipe=recipe,
+                                          cover=src0, out=thumb, settings=settings,
+                                          log=log, force=force_ai)
+                return str(thumb)
+            except JobCancelled:
+                raise
+            except Exception as e:
+                who = "ChatGPT" if eng == "chatgpt" else "API"
+                notes.append(f"{who} lỗi: {e}")
+                if log:
+                    log(f"Thumbnail {who} không dùng được ({e}) → thử {nxt}.")
+    fallback_note = " · ".join(notes)
     shutil.copyfile(src0, thumb)
-    render_title(thumb, title,
-                 _thumbnail_keywords() if subtitle is None else subtitle,
-                 log=log)
+    render_title(thumb, title, subtitle, log=log, style=style)
+    thumbnail_ai.mark_current(final_d, "pil", fallback_note)
     return str(thumb)
 
 
@@ -512,7 +634,8 @@ def retitle_video(project_id: int,
         lo = 70.0
     progress_cb("Vẽ lại chữ tiêu đề lên thumbnail…", lo)
     out["thumbnail"] = render_thumbnail(
-        project_id, project_name, log=lambda m: progress_cb(m, lo))
+        project_id, project_name, log=lambda m: progress_cb(m, lo),
+        cancel_check=getattr(progress_cb, "is_cancelled", None))
     clip_dir = config.clips_dir(project_id, project_name)
     have_clips = all((clip_dir / f"clip_{i:02d}.mp4").exists()
                      for i in range(config.PARAMS.total_clips))
@@ -527,6 +650,36 @@ def retitle_video(project_id: int,
         progress_cb("Xong — đã cập nhật thumbnail. Chưa đủ clip/nhạc nên chưa "
                     "ghép video (chữ intro sẽ đúng tên mới khi ghép).", 100.0)
     return out
+
+
+def make_thumbnail(project_id: int,
+                   progress_cb: Callable[[str, float], None],
+                   project_name: str | None = None,
+                   engine: str = "chatgpt") -> dict:
+    """Nút «Tạo thumbnail»: vẽ lại final/thumbnail.png từ ảnh bìa (ảnh 0).
+    engine="chatgpt" → bản MỚI do ChatGPT web vẽ (tài khoản ChatGPT của người
+    dùng; lỗi → chữ PIL); "ai" → bản MỚI qua API (tốn phí; lỗi → PIL);
+    "pil" → chữ font thật (miễn phí). Không ghép lại video, không đăng."""
+    from . import thumbnail_ai
+    src0 = config.images_dir(project_id, project_name) / "0.png"
+    if not src0.exists():
+        raise RuntimeError("Chưa có ảnh bìa (ảnh 0) — hãy tạo ảnh trước.")
+    engine = engine if engine in ("chatgpt", "ai", "pil") else "chatgpt"
+    progress_cb({"chatgpt": "Tạo thumbnail bằng ChatGPT (ảnh + chữ, tài khoản của bạn)…",
+                 "ai": "Tạo thumbnail bằng AI (ảnh + chữ qua API)…",
+                 "pil": "Vẽ chữ tiêu đề lên thumbnail (font)…"}[engine], 5.0)
+    path = render_thumbnail(project_id, project_name, log=lambda m: progress_cb(m, 50.0),
+                            engine=engine, force_ai=(engine != "pil"), interactive=True,
+                            cancel_check=getattr(progress_cb, "is_cancelled", None))
+    st = thumbnail_ai.status(config.final_dir(project_id, project_name))
+    used = {"chatgpt": "ChatGPT", "ai": "AI (API)"}.get(st["engine"], "font (PIL)")
+    stale_intro = (_project_intro_mode(project_id) == "thumbnail"
+                   and (config.final_dir(project_id, project_name) / "final.mp4").exists())
+    progress_cb(f"Xong — thumbnail vẽ bằng {used}. "
+                + ("Intro final.mp4 vẫn là thumbnail cũ — bấm «Ghép video» để mở đầu "
+                   "bằng thumbnail mới. " if stale_intro else "")
+                + "Bấm «Đăng nháp YouTube» nếu muốn cập nhật bản nháp.", 100.0)
+    return {"thumbnail": path, "engine": st["engine"], "note": st["note"]}
 
 
 # ── Pipeline đầy đủ ─────────────────────────────────────────────
@@ -758,31 +911,92 @@ def _project_instrument(project_id: int) -> str:
     return (row["instrument"] or "") if row else ""
 
 
-def _lookup_channel_mapping(instrument: str, music_style: str) -> dict | None:
-    """Tra ChannelMapping theo (instrument, music_style), so khớp không phân biệt
-    hoa/thường & khoảng trắng thừa. Trả dict hoặc None."""
-    ins = (instrument or "").strip().lower()
-    sty = (music_style or "").strip().lower()
+def _project_intro_mode(project_id: int) -> str:
+    """intro_mode của project: "thumbnail" (mặc định) | "font"."""
     con = _db()
     try:
-        row = con.execute(
-            "SELECT * FROM channelmapping "
-            "WHERE lower(trim(instrument))=? AND lower(trim(music_style))=? "
-            "ORDER BY id DESC LIMIT 1",
-            (ins, sty),
-        ).fetchone()
-        if not row:
-            # 'Piano' (danh mục) ↔ 'Lofi Piano' (ánh xạ): cùng nhạc cụ + cùng thể loại.
-            from .music_spec import same_instrument
-            row = next((r for r in con.execute(
-                "SELECT * FROM channelmapping ORDER BY id DESC").fetchall()
-                if (r["music_style"] or "").strip().lower() == sty
-                and same_instrument(r["instrument"] or "", ins)), None)
+        row = con.execute("SELECT intro_mode FROM project WHERE id=?",
+                          (project_id,)).fetchone()
+    except Exception:
+        return config.DEFAULT_INTRO_MODE
+    finally:
+        con.close()
+    return config.normalize_intro_mode(row["intro_mode"] if row else None)
+
+
+def match_channel(rows: list[dict], instrument: str, music_style: str) -> dict | None:
+    """Dòng ánh xạ khớp (instrument, music_style) — không phân biệt hoa/thường &
+    khoảng trắng thừa; dòng mới nhất thắng. Dùng cho project CHƯA chọn kênh."""
+    ins = (instrument or "").strip().lower()
+    sty = (music_style or "").strip().lower()
+    if not ins or not sty:
+        return None
+    rows = sorted(rows, key=lambda r: r.get("id") or 0, reverse=True)
+    hit = next((r for r in rows if (r.get("instrument") or "").strip().lower() == ins
+                and (r.get("music_style") or "").strip().lower() == sty), None)
+    if hit:
+        return hit
+    # 'Piano' (danh mục) ↔ 'Lofi Piano' (ánh xạ): cùng nhạc cụ + cùng thể loại.
+    from .music_spec import same_instrument
+    return next((r for r in rows if (r.get("music_style") or "").strip().lower() == sty
+                 and same_instrument(r.get("instrument") or "", ins)), None)
+
+
+def _lookup_channel_mapping(instrument: str, music_style: str) -> dict | None:
+    """Tra ChannelMapping theo (instrument, music_style). Trả dict hoặc None."""
+    con = _db()
+    try:
+        rows = [dict(r) for r in con.execute("SELECT * FROM channelmapping").fetchall()]
+    except Exception:
+        return None
+    finally:
+        con.close()
+    return match_channel(rows, instrument, music_style)
+
+
+def _lookup_channel_by_id(channel_id) -> dict | None:
+    """ChannelMapping theo id (kênh người dùng chọn cho project)."""
+    try:
+        cid = int(channel_id or 0)
+    except (TypeError, ValueError):
+        return None
+    if cid <= 0:
+        return None
+    con = _db()
+    try:
+        row = con.execute("SELECT * FROM channelmapping WHERE id=?", (cid,)).fetchone()
     except Exception:
         return None
     finally:
         con.close()
     return dict(row) if row else None
+
+
+def channel_for(channel_id, instrument: str, music_style: str) -> dict | None:
+    """Kênh YouTube của 1 project: kênh người dùng CHỌN (channel_id) — kênh nào
+    cũng nhận nhạc cụ/thể loại nào; chưa chọn → tra theo (nhạc cụ, thể loại) như cũ."""
+    m = _lookup_channel_by_id(channel_id)
+    if m:
+        return m
+    if not (instrument or "").strip() or not (music_style or "").strip():
+        return None
+    return _lookup_channel_mapping(instrument, music_style)
+
+
+def channel_for_project(project_id: int, instrument: str | None = None,
+                        music_style: str | None = None) -> dict | None:
+    fields = _read_project_fields(project_id)
+    ins = (instrument if instrument is not None else fields.get("instrument")) or ""
+    sty = (music_style if music_style is not None else fields.get("music_style")) or ""
+    return channel_for(fields.get("channel_id"), ins, sty)
+
+
+def _no_channel_error(instrument: str, music_style: str, what: str = "video") -> str:
+    return (f"Project chưa chọn kênh YouTube — không biết đăng {what} lên kênh nào. "
+            "Chọn kênh ở tab Video (mục «Đăng nháp YouTube») hoặc ✏️ Sửa project"
+            + (f" (hoặc thêm dòng ánh xạ nhạc cụ '{instrument}' + phong cách "
+               f"'{music_style}' ở ⚙️ Cài đặt → YouTube/GPMLogin)"
+               if instrument.strip() and music_style.strip() else "") + ".")
 
 
 def _read_gpm_settings_db() -> tuple[str, str | None]:
@@ -804,10 +1018,16 @@ def _read_gpm_settings_db() -> tuple[str, str | None]:
 def _read_project_fields(project_id: int) -> dict:
     con = _db()
     try:
-        row = con.execute(
-            "SELECT name, instrument, music_style, auto_upload "
-            "FROM project WHERE id=?", (project_id,)
-        ).fetchone()
+        try:
+            row = con.execute(
+                "SELECT name, instrument, music_style, auto_upload, channel_id "
+                "FROM project WHERE id=?", (project_id,)
+            ).fetchone()
+        except sqlite3.OperationalError:          # DB chưa chạy migration M015
+            row = con.execute(
+                "SELECT name, instrument, music_style, auto_upload "
+                "FROM project WHERE id=?", (project_id,)
+            ).fetchone()
     finally:
         con.close()
     return dict(row) if row else {}
@@ -860,9 +1080,9 @@ def step_upload_youtube(project_id: int,
                         project_name: str | None = None,
                         instrument: str | None = None,
                         music_style: str | None = None) -> dict:
-    """Đăng NHÁP video final.mp4 lên YouTube qua profile GPMLogin khớp
-    (instrument, music_style). AI viết title/description từ thumbnail. KHÔNG
-    publish — chỉ lưu bản nháp."""
+    """Đăng NHÁP video final.mp4 lên YouTube qua profile GPMLogin của kênh project
+    đã chọn (chưa chọn → khớp instrument + music_style). AI viết title/description
+    từ thumbnail. KHÔNG publish — chỉ lưu bản nháp."""
     from backend.core_bridge import get_api_config_from_db
     from backend.database import DB_PATH
     from . import gpm_client as gpmc
@@ -875,17 +1095,11 @@ def step_upload_youtube(project_id: int,
     project_name = project_name or fields.get("name")
 
     progress_cb("Chuẩn bị đăng nháp YouTube…", 2.0)
-    if not instrument.strip() or not music_style.strip():
-        raise RuntimeError(
-            "Chưa nhập 'nhạc cụ' và 'phong cách nhạc' cho project — cần để chọn "
-            "đúng kênh (profile GPMLogin).")
-
-    mapping = _lookup_channel_mapping(instrument, music_style)
+    # Kênh = kênh người dùng chọn cho project (nhạc cụ nào cũng được); project
+    # cũ chưa chọn → tra theo (nhạc cụ, phong cách) như trước.
+    mapping = channel_for(fields.get("channel_id"), instrument, music_style)
     if not mapping:
-        raise RuntimeError(
-            f"Chưa cấu hình kênh cho nhạc cụ '{instrument}' + phong cách "
-            f"'{music_style}'. Vào phần Cài đặt → YouTube/GPMLogin để thêm dòng "
-            f"ánh xạ (instrument + music_style → profile).")
+        raise RuntimeError(_no_channel_error(instrument, music_style))
 
     profile_id = mapping.get("gpm_profile_id", "")
     if not profile_id:
@@ -1001,11 +1215,9 @@ def step_upload_short(project_id: int,
     music_style = (music_style if music_style is not None else fields.get("music_style")) or ""
     project_name = project_name or fields.get("name")
     progress_cb("Chuẩn bị YouTube Short…", 1.0)
-    mapping = _lookup_channel_mapping(instrument, music_style)
+    mapping = channel_for(fields.get("channel_id"), instrument, music_style)
     if not mapping or not mapping.get("gpm_profile_id"):
-        raise RuntimeError(
-            f"Chưa cấu hình kênh cho nhạc cụ '{instrument}' + phong cách "
-            f"'{music_style}' — không biết đăng Short lên kênh nào.")
+        raise RuntimeError(_no_channel_error(instrument, music_style, "Short"))
     profile_id = mapping["gpm_profile_id"]
 
     out_dir = config.final_dir(project_id, project_name)

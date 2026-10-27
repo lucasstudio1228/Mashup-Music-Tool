@@ -72,6 +72,8 @@ def test_full_flow():
 
 
 if __name__ == "__main__":
+    from _live_guard import require_live_opt_in
+    require_live_opt_in("verify_integration")
     try:
         requests.get(f"{BASE}/api/health", timeout=3)
     except Exception:

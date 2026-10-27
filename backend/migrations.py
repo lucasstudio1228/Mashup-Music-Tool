@@ -336,6 +336,157 @@ def migrate_add_project_trash_columns():
         conn.close()
 
 
+def migrate_add_channel_visual_look():
+    """
+    M012: thêm channelmapping.visual_look (phong cách kênh — mỗi kênh 1 look
+    riêng: phong cách ảnh + kiểu thumbnail + màu/chuyển cảnh video). Rỗng = tự gán
+    ở lần đọc đầu (video/channel_looks.ensure_channel_looks).
+    """
+    if not DB_PATH.exists():
+        return
+    conn = _get_conn()
+    try:
+        if not _table_exists(conn, "channelmapping"):
+            return
+        if not _column_exists(conn, "channelmapping", "visual_look"):
+            print("  [Migration M012] Adding channelmapping column: visual_look")
+            conn.execute("ALTER TABLE channelmapping ADD COLUMN visual_look "
+                         "VARCHAR NOT NULL DEFAULT ''")
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise RuntimeError(f"Migration M012 failed: {e}") from e
+    finally:
+        conn.close()
+
+
+def migrate_add_thumbnail_ai_settings():
+    """
+    M013: cấu hình Thumbnail AI qua API (key/base URL/model riêng + bật/tắt +
+    kiểm tra chữ) trong appsettings.
+    """
+    if not DB_PATH.exists():
+        return
+    conn = _get_conn()
+    try:
+        if not _table_exists(conn, "appsettings"):
+            return
+        cols = {
+            "thumb_api_key": "VARCHAR",
+            "thumb_api_base_url": "VARCHAR NOT NULL DEFAULT 'https://api.shopaikey.com'",
+            "thumb_api_model": "VARCHAR NOT NULL DEFAULT 'gemini-3-pro-image-preview'",
+            "thumb_ai_enabled": "BOOLEAN NOT NULL DEFAULT 1",
+            "thumb_ai_verify": "BOOLEAN NOT NULL DEFAULT 1",
+        }
+        for col, ddl in cols.items():
+            if not _column_exists(conn, "appsettings", col):
+                print(f"  [Migration M013] Adding appsettings column: {col}")
+                conn.execute(f"ALTER TABLE appsettings ADD COLUMN {col} {ddl}")
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise RuntimeError(f"Migration M013 failed: {e}") from e
+    finally:
+        conn.close()
+
+
+def migrate_add_thumbnail_engine():
+    """
+    M014: máy vẽ thumbnail mặc định (chatgpt | api | pil) trong appsettings —
+    mặc định ChatGPT web từ 2026-10-23.
+    """
+    if not DB_PATH.exists():
+        return
+    conn = _get_conn()
+    try:
+        if not _table_exists(conn, "appsettings"):
+            return
+        if not _column_exists(conn, "appsettings", "thumb_engine"):
+            print("  [Migration M014] Adding appsettings column: thumb_engine")
+            conn.execute("ALTER TABLE appsettings ADD COLUMN thumb_engine "
+                         "VARCHAR NOT NULL DEFAULT 'chatgpt'")
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise RuntimeError(f"Migration M014 failed: {e}") from e
+    finally:
+        conn.close()
+
+
+def migrate_add_project_channel_id():
+    """
+    M015: thêm project.channel_id — kênh YouTube người dùng chọn cho project,
+    độc lập với nhạc cụ/thể loại. NULL = tra theo (instrument, music_style) như cũ.
+    """
+    if not DB_PATH.exists():
+        return
+    conn = _get_conn()
+    try:
+        if not _table_exists(conn, "project"):
+            return
+        if not _column_exists(conn, "project", "channel_id"):
+            print("  [Migration M015] Adding project column: channel_id")
+            conn.execute("ALTER TABLE project ADD COLUMN channel_id INTEGER")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_project_channel_id "
+                         "ON project (channel_id)")
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise RuntimeError(f"Migration M015 failed: {e}") from e
+    finally:
+        conn.close()
+
+
+def migrate_add_project_intro_cast():
+    """
+    M016: thêm project.intro_mode ('thumbnail' = intro dựng từ ảnh thumbnail —
+    MẶC ĐỊNH cả project cũ; 'font' = chữ font đè clip 00 như trước) và
+    project.cast_mode ('character_pet' mặc định; 'scenery' = chỉ cảnh vật).
+    """
+    if not DB_PATH.exists():
+        return
+    conn = _get_conn()
+    try:
+        if not _table_exists(conn, "project"):
+            return
+        if not _column_exists(conn, "project", "intro_mode"):
+            print("  [Migration M016] Adding project column: intro_mode")
+            conn.execute("ALTER TABLE project ADD COLUMN intro_mode TEXT "
+                         "DEFAULT 'thumbnail'")
+        if not _column_exists(conn, "project", "cast_mode"):
+            print("  [Migration M016] Adding project column: cast_mode")
+            conn.execute("ALTER TABLE project ADD COLUMN cast_mode TEXT "
+                         "DEFAULT 'character_pet'")
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise RuntimeError(f"Migration M016 failed: {e}") from e
+    finally:
+        conn.close()
+
+
+def migrate_create_custom_look_table():
+    """
+    M017: bảng customlook — phong cách kênh người dùng tự nhập (tên + mô tả →
+    câu thẩm mỹ tiếng Anh, kế thừa 1 look có sẵn). Kể từ đây 2 kênh được dùng
+    chung 1 phong cách (không còn ràng buộc mỗi kênh 1 look khác nhau).
+    """
+    if not DB_PATH.exists():
+        return
+    from backend.video.channel_looks import CUSTOM_TABLE_SQL
+    conn = _get_conn()
+    try:
+        if not _table_exists(conn, "customlook"):
+            print("  [Migration M017] Creating table: customlook")
+            conn.execute(CUSTOM_TABLE_SQL)
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise RuntimeError(f"Migration M017 failed: {e}") from e
+    finally:
+        conn.close()
+
+
 def run_all():
     """Gọi hàm này ở startup, trước create_db_and_tables()."""
     migrate_remove_project_api_fields()   # M001
@@ -349,4 +500,10 @@ def run_all():
     migrate_add_project_batch_id()         # M009
     migrate_add_project_mix_settings()     # M010
     migrate_add_project_trash_columns()    # M011 — Thùng rác
+    migrate_add_channel_visual_look()      # M012 — phong cách kênh
+    migrate_add_thumbnail_ai_settings()    # M013 — thumbnail AI qua API
+    migrate_add_thumbnail_engine()         # M014 — thumbnail ChatGPT mặc định
+    migrate_add_project_channel_id()       # M015 — kênh chọn riêng từng project
+    migrate_add_project_intro_cast()       # M016 — intro thumbnail + chỉ cảnh vật
+    migrate_create_custom_look_table()     # M017 — phong cách kênh tự nhập
     # Thêm migration mới vào đây theo thứ tự

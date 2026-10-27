@@ -392,9 +392,11 @@ def generate_images_muse(
             return [str(out_dir / f"{i}.png") for i in range(n) if _has_image(out_dir, i)]
 
     # Prompt dựng TRƯỚC khi mở trình duyệt: thiếu prompt / còn tiếng Việt → báo ngay.
-    prompts = {i: image_prompt(_prompt_for(i, topic, params, prompts_override, style)
-                               + (config.THUMBNAIL_REF_NOTE if i == config.IMG_THUMBNAIL else ""))
-               for i in todo}
+    def _full(i: int) -> str:
+        p = _prompt_for(i, topic, params, prompts_override, style)
+        return p + (config.thumbnail_ref_note(p) if i == config.IMG_THUMBNAIL else "")
+
+    prompts = {i: image_prompt(_full(i)) for i in todo}
     assert_english_prompts(list(prompts.items()))
 
     _LOGP = out_dir / "_muse_image.log"
@@ -432,7 +434,7 @@ def generate_images_muse(
             page = sess.page
             for k, i in enumerate(pending):
                 pct = 3.0 + 94.0 * (len(done) / max(len(todo), 1))
-                role = config.IMAGE_ROLES.get(i, "")
+                role = config.image_roles(config.images_cast_mode(out_dir)).get(i, "")
                 dest = out_dir / f"{i}.png"
                 refs: list[str] = []
                 if i == config.IMG_THUMBNAIL:

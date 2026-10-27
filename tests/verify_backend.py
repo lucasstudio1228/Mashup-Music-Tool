@@ -200,4 +200,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from _live_guard import require_live_opt_in
+    require_live_opt_in("verify_backend")
     main()

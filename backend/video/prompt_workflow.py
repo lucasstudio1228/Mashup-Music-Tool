@@ -21,6 +21,23 @@ SCENE_SUFFIX = (
     "sheets: no side-by-side views, no labels, no text, no colour-swatch strip, "
     "no flat studio backdrop, no duplicated character. Keep the character and "
     "creature identity unchanged.")
+# Chế độ CHỈ CẢNH VẬT (cast_mode="scenery"): không người, không thú.
+SCENE_SUFFIX_SCENERY = (
+    " One single continuous shot, no cuts. Do not reproduce the reference "
+    "sheets: no side-by-side panels, no labels, no text, no colour-swatch strip, "
+    "no flat studio backdrop. No people and no animals at any moment; keep the "
+    "place unchanged.")
+
+
+def scene_suffix(cast_mode: str | None) -> str:
+    return SCENE_SUFFIX_SCENERY if cast_mode == "scenery" else SCENE_SUFFIX
+
+
+def manifest_cast_mode(saved: dict | None) -> str:
+    """cast_mode của hồ sơ prompt đã lưu (hồ sơ cũ = có nhân vật)."""
+    saved = saved or {}
+    mode = saved.get("cast_mode") or (saved.get("continuity") or {}).get("cast_mode")
+    return config.normalize_cast_mode(mode)
 
 
 def project_context(project_id: int, title: str = "", idea: str | None = None) -> dict:
@@ -39,7 +56,7 @@ def project_context(project_id: int, title: str = "", idea: str | None = None) -
                 music_styles = json.loads(batch.config_json or "{}").get("styles", "")
             except (ValueError, AttributeError):
                 pass
-        return {
+        ctx = {
             "title": title or project.name,
             "visual_idea": (idea if idea is not None else project.video_idea) or "",
             "music_idea": project.suno_idea or "",
@@ -48,6 +65,10 @@ def project_context(project_id: int, title: str = "", idea: str | None = None) -
             "description": project.description or "",
             "music_styles": music_styles,
         }
+        # Chỉ thêm khoá khi CHỈ CẢNH VẬT → chữ ký hồ sơ có nhân vật giữ nguyên.
+        if config.normalize_cast_mode(getattr(project, "cast_mode", None)) == "scenery":
+            ctx["cast_mode"] = "scenery"
+        return ctx
 
 
 def validate_set(values, count: int, label: str) -> dict[str, str]:
@@ -297,9 +318,12 @@ def extend_scene_count(project_id: int, saved: dict, target: int | None = None,
         raise ValueError("Hồ sơ thiếu khoá continuity — không bổ sung cảnh được; "
                          "dùng Làm lại từ đầu.")
     need = target - have
+    cast_mode = manifest_cast_mode(saved)
+    sheets = ("bảng bối cảnh + bảng ánh sáng" if cast_mode == "scenery"
+              else "hai bảng nhân vật")
     if log:
         log(f"Nâng {have} → {target} clip/video: AI viết thêm {need} prompt cảnh "
-            "từ hai bảng nhân vật đã khoá (giữ nguyên ảnh + cảnh cũ)…")
+            f"từ {sheets} đã khoá (giữ nguyên ảnh + cảnh cũ)…")
     if _generate is None:
         from .prompt_gen import generate_scene_prompts as _generate
         if api_config is None:
@@ -310,16 +334,18 @@ def extend_scene_count(project_id: int, saved: dict, target: int | None = None,
     idea = json.dumps(context, ensure_ascii=False) if context else (saved.get("idea") or "")
     avoid = list(locks.get("settings") or [])
     style = config.style_info(config.normalize_style(saved.get("style_key") or saved.get("style")))["brief"]
+    kwargs = {"cast_mode": cast_mode} if cast_mode == "scenery" else {}
     extra = _generate(character_sheet=character_sheet, pet_sheet=pet_sheet, idea=idea,
                       style=style, api_config=api_config, scene_count=need, log=log,
-                      avoid=avoid or None)
+                      avoid=avoid or None, **kwargs)
     extra = validate_set(extra, need, "Prompt cảnh bổ sung") if extra else None
     if not extra:
         raise RuntimeError(f"AI chưa viết thêm được {need} prompt cảnh (kiểm tra API "
                            "key/model ở ⚙️ Settings rồi thử lại).")
     new = dict(motions)
+    suffix = scene_suffix(cast_mode)
     for j in range(need):
-        new[str(have + j)] = extra[str(j)] + SCENE_SUFFIX
+        new[str(have + j)] = extra[str(j)] + suffix
     out = dict(saved)
     out["motions"] = new
     if "scene_count" in saved:
@@ -410,14 +436,32 @@ def prepare(project_id: int, project_name: str | None = None, idea: str | None =
     api_config = get_api_config_from_db(str(DB_PATH))
     locks = {}
     effective_idea = json.dumps(context, ensure_ascii=False)
-    log(f"Chuẩn bị hồ sơ chung → {count} ảnh (bìa + 2 bảng phân tích nhân vật) "
+    # Công thức thumbnail riêng của video (bố cục/góc máy/ánh sáng/kiểu chữ) —
+    # chống lặp theo kênh; KHÔNG đưa vào input_signature (chỉ là hướng dẫn bố cục).
+    recipe, directive = None, ""
+    cast_mode = config.normalize_cast_mode(context.get("cast_mode"))
+    scenery = cast_mode == "scenery"
+    try:
+        from . import thumbnail_recipe
+        recipe = thumbnail_recipe.new_recipe_for_prompts(project_id, style_key)
+        directive = thumbnail_recipe.composition_directive(recipe, scenery=scenery)
+        if directive:
+            log(f"Ảnh bìa: bố cục «{recipe.get('layout')}», góc máy «{recipe.get('shot')}», "
+                f"ánh sáng «{recipe.get('light')}», kiểu chữ «{recipe.get('treatment')}».")
+    except Exception as exc:
+        log(f"Không chọn được công thức thumbnail ({type(exc).__name__}: {exc}) — dùng bố cục cũ.")
+        recipe, directive = None, ""
+    sheets = ("bảng bối cảnh + bảng ánh sáng" if scenery
+              else "2 bảng phân tích nhân vật")
+    mode_kw = {"cast_mode": cast_mode} if scenery else {}
+    log(f"Chuẩn bị hồ sơ chung → {count} ảnh (bìa + {sheets}) "
         f"và {scenes} prompt cảnh; kiểm tra continuity và chống trùng…")
     result = generate_prompts(
         idea=effective_idea, title=context["title"], keywords=context["purpose"],
         scene_count=scenes, aspect_ratio=config.PARAMS.aspect_ratio,
         style=config.style_info(style_key)["brief"], api_config=api_config, log=log,
         creative_brief=brief["visual"] + "\nMusic: " + brief["music"], metadata_out=locks,
-        instrument=context["instrument"])
+        instrument=context["instrument"], thumbnail_directive=directive, **mode_kw)
     if not result:
         raise RuntimeError("AI chưa tạo được hồ sơ/prompt đầy đủ. Kiểm tra cấu hình API rồi thử lại; "
                            "Tool chưa mở Gemini/Flow và không thay bằng prompt chung.")
@@ -426,21 +470,28 @@ def prepare(project_id: int, project_name: str | None = None, idea: str | None =
     try:
         motions = validate_set(motions, scenes, "Prompt cảnh (clip)")
     except ValueError:
-        log("Prompt cảnh chưa đủ; viết bổ sung từ hai bảng nhân vật đã khoá.")
+        log(f"Prompt cảnh chưa đủ; viết bổ sung từ {sheets} đã khoá.")
         motions = generate_scene_prompts(
             character_sheet=locks.get("character_sheet", ""),
             pet_sheet=locks.get("pet_sheet", ""), idea=effective_idea,
             style=config.style_info(style_key)["brief"], api_config=api_config,
             scene_count=scenes, log=log, avoid=locks.get("settings") or None,
-            instrument=context["instrument"])
+            instrument=context["instrument"], **mode_kw)
         motions = validate_set(motions, scenes, "Prompt cảnh (clip)")
-    motions = {key: value + SCENE_SUFFIX for key, value in motions.items()}
+    suffix = scene_suffix(cast_mode)
+    motions = {key: value + suffix for key, value in motions.items()}
+    if directive and directive not in prompts.get("0", ""):
+        prompts["0"] = prompts["0"].rstrip() + "\n\n" + directive
     saved = {**inputs, "input_signature": signature, "creative_brief": brief,
              "continuity": locks, "title": context["title"], "idea": context["visual_idea"],
              "style_key": style_key, "prompts": prompts, "motions": motions,
              "review_note": "Structural checks passed; visual/music quality still requires output review."}
+    if scenery:
+        saved["cast_mode"] = "scenery"
+    if recipe:
+        saved["thumbnail_recipe"] = recipe
     saved["prompt_hashes"] = validate_manifest(project_id, saved, count, scenes)
     save_manifest(img_dir / "prompts.json", saved)
     log(f"Đã lưu bộ prompt đầy đủ: {count} ảnh + {scenes} cảnh — mọi clip dùng "
-        f"chung hai bảng nhân vật làm nguyên liệu, chỉ khác bối cảnh.")
+        f"chung {sheets} làm nguyên liệu, chỉ khác bối cảnh.")
     return saved

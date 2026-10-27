@@ -133,6 +133,9 @@ def _thumbnail_keywords() -> str:
     return " · ".join(random.sample(list(kws), n)) if n else ""
 
 
+_COMPOSITION_MARK = "THUMBNAIL COMPOSITION"   # = thumbnail_recipe.COMPOSITION_MARK
+
+
 def _prompt_for(index: int, topic: str, params: config.VideoParams,
                 prompts_override: Optional[dict] = None,
                 style: Optional[str] = None) -> str:
@@ -160,11 +163,24 @@ def _prompt_for(index: int, topic: str, params: config.VideoParams,
     # áp dụng cho MỌI prompt (AI-sinh, overrides file, DEFAULT_PROMPTS).
     # Riêng ảnh 1 & 2 là BẢNG PHÂN TÍCH NHÂN VẬT: dùng bộ bọc tài liệu, vì
     # prefix điện ảnh/bokeh ở đầu prompt sẽ khiến Gemini vẽ cảnh phim.
-    if index in config.SHEET_IMAGES:
+    # Chế độ CHỈ CẢNH VẬT: ảnh 1 & 2 là bảng thiết kế BỐI CẢNH (không nhân vật).
+    if index in config.SHEET_IMAGES and config.is_scenery_prompt(body):
+        wrapped = config.wrap_world_sheet_style(body, style)
+    elif index in config.SHEET_IMAGES:
         wrapped = config.wrap_sheet_style(body, style)
     else:
         wrapped = config.wrap_style(body, style)
-    if index == 0:
+    if index == 0 and _COMPOSITION_MARK in body:
+        # Prompt bìa có công thức bố cục riêng (thumbnail_recipe) → không ép
+        # "chữ trái"; chỉ nhắc cấm chữ + giữ đúng vùng trống đã mô tả.
+        wrapped += (
+            " || MOST IMPORTANT (absolute priority): THE IMAGE MUST CONTAIN NO "
+            "TEXT AT ALL. NEVER draw any letters/title/name/typography/caption/"
+            "watermark/logo/numbers in the image — not a single character. "
+            "Keep the THUMBNAIL COMPOSITION exactly as described, including the "
+            "clean empty title area (the title is added later by software)."
+        )
+    elif index == 0:
         # Thumbnail: model sinh ảnh KHÔNG đánh vần được → cấm tuyệt đối vẽ chữ,
         # tiêu đề sẽ được overlay bằng font thật sau (thumbnail.render_title).
         # Đặt CUỐI cùng để ưu tiên cao nhất; yêu cầu chừa khoảng trống bên trái.
@@ -172,8 +188,11 @@ def _prompt_for(index: int, topic: str, params: config.VideoParams,
             " || MOST IMPORTANT (absolute priority): THE IMAGE MUST CONTAIN NO "
             "TEXT AT ALL. NEVER draw any letters/title/name/typography/caption/"
             "watermark/logo/numbers in the image — not a single character. "
-            "Eye-catching thumbnail composition, characters placed off-centre to "
-            "the RIGHT, LEAVE clean negative space on the LEFT HALF for the title "
+            "Eye-catching thumbnail composition, "
+            + ("the main landmark placed off-centre to the RIGHT, NO people or "
+               "animals, " if config.is_scenery_prompt(body)
+               else "characters placed off-centre to the RIGHT, ")
+            + "LEAVE clean negative space on the LEFT HALF for the title "
             "to be added later."
         )
     return wrapped
@@ -685,7 +704,7 @@ def generate_images(
                         raise RuntimeError(
                             f"Ảnh bìa phải dựa trên 2 bảng nhân vật nhưng chưa có ảnh "
                             f"{missing} — tạo 2 bảng nhân vật trước rồi tạo lại ảnh bìa.")
-                    prompt += config.THUMBNAIL_REF_NOTE
+                    prompt += config.thumbnail_ref_note(prompt)
 
                 # Cắt ngữ cảnh định kỳ (trước khi gửi), tránh chat phình quá dài.
                 if _NEW_CHAT_EVERY > 0 and done_count > 0 \
@@ -781,7 +800,7 @@ def generate_images(
                     saved_ok = True
                     mark_done(i)
                     done_count += 1
-                    _p(f"[{k+1}/{len(todo)}] Đã lưu ảnh {i} ({config.IMAGE_ROLES.get(i, '')})", pct + 6.0)
+                    _p(f"[{k+1}/{len(todo)}] Đã lưu ảnh {i} ({config.image_roles(config.images_cast_mode(out_dir)).get(i, '')})", pct + 6.0)
                     break
                     # Ảnh 0 giữ SẠCH — tiêu đề overlay ở bước ghép (step_assemble).
 

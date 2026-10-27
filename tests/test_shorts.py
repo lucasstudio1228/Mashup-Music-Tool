@@ -9,6 +9,25 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backend.video import shorts, service  # noqa: E402
+from backend.video import thumbnail_recipe  # noqa: E402
+
+# build_short đọc công thức thumbnail (chữ hook) và có thể GHI sổ (bổ sung kiểu
+# chữ AI) → sổ tạm, không đụng data/thumbnail_recipes.json thật.
+_LEDGER_DIR = None
+_LEDGER_PATCH = None
+
+
+def setUpModule():
+    global _LEDGER_DIR, _LEDGER_PATCH
+    _LEDGER_DIR = tempfile.TemporaryDirectory()
+    _LEDGER_PATCH = mock.patch.object(
+        thumbnail_recipe, "LEDGER", Path(_LEDGER_DIR.name) / "thumbnail_recipes.json")
+    _LEDGER_PATCH.start()
+
+
+def tearDownModule():
+    _LEDGER_PATCH.stop()
+    _LEDGER_DIR.cleanup()
 
 
 class PickSegmentTest(unittest.TestCase):
