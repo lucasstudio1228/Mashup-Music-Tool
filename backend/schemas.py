@@ -187,6 +187,8 @@ class BatchCreate(BaseModel):
     max_create_actions: Optional[int] = None
     # Tổng thời lượng mix/video (phút) cho MỖI project trong lô.
     mix_duration_minutes: float = Field(default=120.0, ge=1, le=720)
+    # True = «Auto Audio»: mỗi sản phẩm chỉ Suno → Mix (không video / YouTube).
+    audio_only: bool = False
 
 
 class BatchProjectItem(BaseModel):

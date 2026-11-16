@@ -171,11 +171,14 @@ def start_patch(project_id: int) -> int:
         mix.output_dir = str(out_dir)
         s.add(mix); s.commit()
         mix_id, base_id = mix.id, base.id
+        # Bản cũ có master + cân bằng âm lượng → bản vá dùng lại gain cũ.
+        prev_loudness = data.get("loudness")
 
     from backend.routers.mixes import _on_failure, _on_cancel
     job_manager.submit(
         mix_id, core_bridge.run_patch_mix_job,
         seq, names, str(out_dir), xf, sr, bd, DB_PATH, base_total,
+        prev_loudness=prev_loudness,
         on_success=partial(_on_patch_success, project_id=project_id,
                            base_total=base_total, base_mix_id=base_id),
         on_failure=_on_failure, on_cancel=_on_cancel,

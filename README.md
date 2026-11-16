@@ -5,7 +5,7 @@ thiền / chữa lành / lofi cho YouTube, từ nhạc tới bản nháp YouTube
 
 1. **Nhạc (Suno)** — tự tạo và tải các bài WAV theo nhạc cụ + thể loại bạn chọn.
    Bạn cũng có thể tải nhạc của mình lên.
-2. **Mix** — trộn thành 1 bản dài (vd 120 phút) có crossfade, chuẩn hoá −16 LUFS.
+2. **Mix** — master từng bài (ffmpeg: EQ, mono bass, nén nhẹ, loudnorm −16 LUFS) rồi cân bằng độ to giữa các bài + limiter −1 dBFS, trộn thành 1 bản dài (vd 120 phút) có crossfade. Tuỳ chỉnh trong `data/master_config.json` (`preset`: dynamic −16 / natural −14 / loud −10; `enabled`, `balance_enabled`).
    Có bước rà soát chất lượng từng bài.
 3. **Video** — vẽ ảnh bìa + 2 bảng nhân vật bằng **Gemini**, tạo clip 8 giây bằng
    **Muse.ai** (hoặc Gemini/Flow), rồi ghép thành `final.mp4` khớp độ dài nhạc.
@@ -46,7 +46,13 @@ cd Mashup-Music-Tool
    - cài PyTorch, thư viện Python và Chromium cho Playwright;
    - kiểm tra ffmpeg;
    - tạo file `.env`.
-2. Double-click **`start.bat`**. Trình duyệt tự mở `http://localhost:8000`.
+2. Double-click **`MashupMusicTool.exe`** — tool mở trong **cửa sổ ứng dụng riêng**
+   (không cần trình duyệt, không có cửa sổ console đen; log ở `data/logs/backend.log`).
+   - Exe phải nằm trong thư mục tool (cạnh `.venv`). Muốn để ngoài Desktop thì tạo
+     **shortcut**, đừng chép file exe ra.
+   - Đóng cửa sổ là tắt tool. Nếu đang có tác vụ chạy, app sẽ hỏi lại trước khi đóng.
+   - Build lại exe (sau khi sửa `launcher.py`): chạy `build_exe.bat`.
+   - Cách cũ vẫn dùng được: `start.bat` (console + trình duyệt `http://localhost:8000`).
 3. Vào **⚙️ Settings** và nhập **OpenAI API key** (hoặc điền `OPENAI_API_KEY` trong `.env`).
 4. *(Đăng YouTube)* Trong mục YouTube, thêm **kênh**: tên kênh + UUID profile GPMLogin
    đã đăng nhập kênh đó, cùng nhạc cụ / thể loại tương ứng.
@@ -57,8 +63,8 @@ cd Mashup-Music-Tool
 Lần đầu chạy Gemini / Suno, tool mở cửa sổ trình duyệt riêng và **chờ bạn tự đăng
 nhập**. Phiên đăng nhập được giữ lại trong `.browser_profile*` trên máy bạn.
 
-> Tắt ứng dụng: đóng cửa sổ console đen (hoặc `Ctrl + C`). Đã sửa code backend thì
-> phải tắt rồi mở lại `start.bat`.
+> Tắt ứng dụng: đóng cửa sổ app (hoặc cửa sổ console đen nếu chạy `start.bat`).
+> Đã sửa code backend thì phải tắt rồi mở lại.
 
 ---
 

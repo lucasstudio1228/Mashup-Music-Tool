@@ -124,7 +124,9 @@ class PatchMixTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             d = Path(t)
             db = d / "app.db"
-            SQLModel.metadata.create_all(create_engine(f"sqlite:///{db}"))
+            eng = create_engine(f"sqlite:///{db}")
+            SQLModel.metadata.create_all(eng)
+            eng.dispose()                   # Windows: nhả app.db để xoá thư mục tạm
             sr = 44100
 
             def song(seed, sec=30):

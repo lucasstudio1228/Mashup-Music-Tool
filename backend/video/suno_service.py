@@ -146,6 +146,9 @@ def resolve_batch_config(overrides: Optional[dict] = None) -> dict:
                                               base.max_replacement_creates)),
         "auto_continue_workflow": bool(ov.get("auto_continue_workflow",
                                              base.auto_continue_workflow)),
+        # «Auto Audio»: Suno → Mix rồi DỪNG (không dựng video, không đăng YouTube).
+        # Mặc định False = «Full auto» (Suno → Mix → Video → nháp YouTube).
+        "audio_only": bool(ov.get("audio_only", False)),
     }
     return cfg
 
@@ -692,12 +695,17 @@ def _drive_batch(session: Session, batch: SunoBatch, cfg: dict,
     # job Suno này kết thúc ngay sau khối này nên worker video sẽ rảnh cho bước
     # dựng video. Bọc try/except để lỗi downstream không làm hỏng STEP 0 đã xong.
     if cfg.get("auto_continue_workflow", True):
+        audio_only = bool(cfg.get("audio_only"))
         _touch(session, batch, DOWNSTREAM_RUNNING,
-               "Tự chạy tiếp: Mix 15 track → render Video…")
+               "Tự chạy tiếp: Mix 15 track (chỉ Audio — không dựng video)…" if audio_only
+               else "Tự chạy tiếp: Mix 15 track → render Video…")
         try:
             from backend.routers.mixes import start_mix_for_project
-            mix_id = start_mix_for_project(batch.project_id, force_video=True)
-            log(f"Đã bắt đầu Mix #{mix_id}. Video sẽ tự render sau khi mix xong.")
+            mix_id = start_mix_for_project(batch.project_id, force_video=not audio_only,
+                                           skip_video=audio_only)
+            log(f"Đã bắt đầu Mix #{mix_id}. " + (
+                "Auto Audio: dừng sau Mix (không dựng video / không đăng YouTube)."
+                if audio_only else "Video sẽ tự render sau khi mix xong."))
         except Exception as e:      # noqa: BLE001 — downstream là bước phụ
             log(f"Không tự chạy tiếp workflow: {e}. Bạn có thể chạy Mix thủ công.")
     _touch(session, batch, COMPLETED, "Hoàn tất STEP 0.")

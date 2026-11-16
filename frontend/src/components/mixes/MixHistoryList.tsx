@@ -1,4 +1,6 @@
 import { downloadUrl } from '../../api/client';
+import { useOpenMixFolder } from '../../api/mixes';
+import { apiErrorText } from '../../api/youtube';
 import type { Mix } from '../../types';
 import StatusBadge from '../shared/StatusBadge';
 
@@ -27,6 +29,7 @@ const DOWNLOADS: { type: string; label: string }[] = [
 ];
 
 export default function MixHistoryList({ mixes, onDelete }: Props) {
+  const openFolder = useOpenMixFolder();
   if (mixes.length === 0) {
     return <p className="text-sm text-gray-500">No mixes yet.</p>;
   }
@@ -76,6 +79,18 @@ export default function MixHistoryList({ mixes, onDelete }: Props) {
                   {d.label}
                 </a>
               ))}
+            {mix.status === 'completed' && (
+              <button
+                onClick={() =>
+                  openFolder.mutate(mix.id, { onError: (err) => alert(apiErrorText(err)) })
+                }
+                disabled={openFolder.isPending}
+                title="Mở thư mục Audio trên máy (Explorer chọn sẵn mix.wav)"
+                className="rounded bg-surface-2 px-2 py-1 text-xs text-gray-200 hover:bg-white/10"
+              >
+                📂 Mở thư mục
+              </button>
+            )}
             {mix.status !== 'running' && mix.status !== 'pending' && (
               <button
                 onClick={() => onDelete(mix)}

@@ -185,7 +185,8 @@ def create_batch(count: int, instrument: str, music_style: str, video_style: str
                  channel_id: Optional[int] = None,
                  mix_duration_minutes: float = 120.0,
                  intro_mode: str = "thumbnail",
-                 cast_mode: str = "character_pet") -> dict:
+                 cast_mode: str = "character_pet",
+                 audio_only: bool = False) -> dict:
     """
     Sinh N ý tưởng phân biệt (1 call LLM, KHÔNG tốn credit Suno) → tạo N Project
     cùng batch_id → tạo BatchRun → khởi động thread chạy tuần tự.
@@ -254,7 +255,8 @@ def create_batch(count: int, instrument: str, music_style: str, video_style: str
         return _create_batch_rows(ideas, count, instrument, music_style, style_key,
                                   theme, channel_name, tgt, mca, mix_duration_minutes,
                                   styles_cycle=styles_cycle, channel_id=channel_id,
-                                  intro_mode=intro_mode, cast_mode=cast_mode)
+                                  intro_mode=intro_mode, cast_mode=cast_mode,
+                                  audio_only=audio_only)
     finally:
         _create_lock.release()
 
@@ -264,7 +266,8 @@ def _create_batch_rows(ideas, count, instrument, music_style, style_key, theme,
                        styles_cycle: Optional[list[str]] = None,
                        channel_id: Optional[int] = None,
                        intro_mode: str = "thumbnail",
-                       cast_mode: str = "character_pet") -> dict:
+                       cast_mode: str = "character_pet",
+                       audio_only: bool = False) -> dict:
     batch_key = uuid.uuid4().hex
     params = {
         "count": count, "instrument": instrument, "music_style": music_style,
@@ -274,6 +277,8 @@ def _create_batch_rows(ideas, count, instrument, music_style, style_key, theme,
         "intro_mode": intro_mode, "cast_mode": cast_mode,
         "target_tracks": tgt, "max_create_actions": mca,
         "mix_duration_minutes": float(mix_duration_minutes),
+        # «Auto Audio»: mỗi sản phẩm chỉ Suno → Mix (không video / YouTube).
+        "audio_only": bool(audio_only),
     }
 
     with Session(engine) as session:
@@ -292,8 +297,8 @@ def _create_batch_rows(ideas, count, instrument, music_style, style_key, theme,
                 intro_mode=intro_mode,
                 cast_mode=cast_mode,
                 music_source="suno",
-                auto_video=True,
-                auto_upload=True,
+                auto_video=not audio_only,
+                auto_upload=not audio_only,
                 batch_id=batch_key,
                 mix_duration_minutes=float(mix_duration_minutes),
             )
@@ -383,11 +388,13 @@ def _run_batch(batch_key: str, resume: bool = False) -> None:
             return
         params = json.loads(run.params_json or "{}")
         project_ids = [p.id for p in projects]
+    audio_only = bool(params.get("audio_only"))
 
     overrides = {
         "target_tracks": params.get("target_tracks", 15),
         "max_create_actions": params.get("max_create_actions", 15),
         "max_new_song_downloads": params.get("target_tracks", 15),
+        "audio_only": audio_only,
     }
 
     for idx, pid in enumerate(project_ids):
@@ -406,8 +413,8 @@ def _run_batch(batch_key: str, resume: bool = False) -> None:
                 suno_idea = proj.suno_idea or ""
                 # Chốt lại cấu hình an toàn cho từng project (phòng khi bị đổi).
                 proj.music_source = "suno"
-                proj.auto_video = True
-                proj.auto_upload = True
+                proj.auto_video = not audio_only
+                proj.auto_upload = not audio_only
                 session.add(proj)
                 session.commit()
             if proj is None or getattr(proj, "deleted_at", None):
@@ -421,7 +428,7 @@ def _run_batch(batch_key: str, resume: bool = False) -> None:
             _touch(session, run, current_index=idx, current_project_id=pid,
                    message=f"Sản phẩm {idx + 1}/{len(project_ids)}: «{name}» — bắt đầu Suno.")
 
-        if resume and _verify_product(pid)[0]:
+        if resume and _verify_product(pid, audio_only=audio_only)[0]:
             with Session(engine) as session:
                 run = session.exec(
                     select(BatchRun).where(BatchRun.batch_key == batch_key)).first()
@@ -448,7 +455,8 @@ def _run_batch(batch_key: str, resume: bool = False) -> None:
         while True:
             # Khi tiếp tục lô: nối lại batch Suno dở ngay lần đầu (_submit_stage
             # tự bỏ qua resume nếu batch đã terminal / chưa có).
-            stage = _submit_stage(pid, ov, resume=(resume or attempt > 0))
+            stage = _submit_stage(pid, ov, resume=(resume or attempt > 0),
+                                  audio_only=audio_only)
             if stage is None:
                 outcome, detail = "blocked", "không submit được bước tiếp theo"
                 break
@@ -456,8 +464,9 @@ def _run_batch(batch_key: str, resume: bool = False) -> None:
             outcome, detail, phase = _await_product_chain(batch_key, pid, ev)
 
             if outcome == "done":
-                ok, why = _verify_product(pid)
+                ok, why = _verify_product(pid, audio_only=audio_only)
                 if ok:
+                    detail = why
                     break
                 detail = why
                 outcome = "blocked"     # thiếu final.mp4 / nháp YouTube → thử lại
@@ -557,10 +566,27 @@ def _account_block(pid: int) -> Optional[str]:
     return err if any(m in low for m in _ACCOUNT_BLOCK_MARKERS) else None
 
 
-def _verify_product(pid: int) -> tuple[bool, str]:
+def _completed_mix_wav(pid: int) -> Optional[Path]:
+    """mix.wav của mix hoàn tất mới nhất (None nếu chưa có)."""
+    from backend.models import Mix
+    with Session(engine) as session:
+        mixes = session.exec(select(Mix).where(Mix.project_id == pid)
+                             .order_by(Mix.id)).all()
+    done = [Path(m.output_dir) / "mix.wav" for m in mixes
+            if (m.status or "") == "completed" and m.output_dir
+            and (Path(m.output_dir) / "mix.wav").exists()]
+    return done[-1] if done else None
+
+
+def _verify_product(pid: int, audio_only: bool = False) -> tuple[bool, str]:
     """Sản phẩm CHỈ được tính là xong khi có final.mp4 VÀ đã lưu nháp YouTube —
     không tin mỗi 'job đã chạy xong' (job video có thể hỏng mà Suno vẫn
-    COMPLETED, lúc đó cả 2 manager đều rảnh và dễ bị chấm nhầm là hoàn tất)."""
+    COMPLETED, lúc đó cả 2 manager đều rảnh và dễ bị chấm nhầm là hoàn tất).
+    «Auto Audio»: xong = có mix.wav hoàn tất."""
+    if audio_only:
+        if _completed_mix_wav(pid) is None:
+            return (False, "chưa có bản mix Audio (mix.wav)")
+        return (True, "đã có bản mix Audio (mix.wav)")
     final = _project_paths(pid)[0] / "final.mp4"
     if not final.exists():
         return (False, "thiếu final.mp4")
@@ -569,7 +595,8 @@ def _verify_product(pid: int) -> tuple[bool, str]:
     return (True, "final.mp4 + bản nháp YouTube đã có")
 
 
-def _submit_stage(pid: int, ov: dict, *, resume: bool) -> Optional[str]:
+def _submit_stage(pid: int, ov: dict, *, resume: bool,
+                  audio_only: bool = False) -> Optional[str]:
     """Submit ĐÚNG bước còn thiếu của project và trả tên bước.
 
     Chạy lại không phải lúc nào cũng là chạy lại Suno: nếu Suno đã COMPLETED mà
@@ -588,6 +615,14 @@ def _submit_stage(pid: int, ov: dict, *, resume: bool) -> Optional[str]:
         video_job_manager.submit(pid, "suno", suno_service.run_suno_step0,
                                  dry_run=False, overrides=ov, resume=can_resume)
         return "suno"
+
+    if audio_only:
+        # «Auto Audio»: Suno xong → chỉ cần mix.wav, không video / YouTube.
+        if _completed_mix_wav(pid) is None:
+            from backend.routers.mixes import start_mix_for_project
+            start_mix_for_project(pid, skip_video=True)
+            return "mix"
+        return "done"
 
     final_dir, name = _project_paths(pid)
     if not (final_dir / "final.mp4").exists():

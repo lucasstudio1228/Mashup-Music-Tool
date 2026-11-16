@@ -368,13 +368,20 @@ class StepAssembleIntroTests(unittest.TestCase):
         ov.assert_called_once()
         self.assertIsNone(asm.call_args.kwargs["lead_image"])
 
-    def test_scenery_plays_at_real_speed(self):
-        # Chỉ cảnh vật: không làm chậm 0.7x (cảnh trông như đứng hình).
-        _, _, asm, _ = self._run("thumbnail", cast="scenery")
-        self.assertEqual(asm.call_args.kwargs["slow_speed"], config.SCENERY_PLAYBACK_SPEED)
-        self.assertEqual(config.SCENERY_PLAYBACK_SPEED, 1.0)
-        _, _, asm, _ = self._run("thumbnail", cast="character_pet")
-        self.assertEqual(asm.call_args.kwargs["slow_speed"], 0.7)
+    def test_every_mode_is_chill_slow_motion(self):
+        # 2026-10-28 "video trôi quá nhanh": MỌI chế độ (cả cảnh vật) slow motion
+        # ≤ MAX_PLAYBACK_SPEED + chuyển cảnh ≥ MIN_BLEND_SECONDS + nội suy mci.
+        self.assertFalse(hasattr(config, "SCENERY_PLAYBACK_SPEED"))
+        for cast in ("scenery", "character_pet"):
+            with self.subTest(cast):
+                _, _, asm, _ = self._run("thumbnail", cast=cast)
+                kw = asm.call_args.kwargs
+                self.assertLessEqual(kw["slow_speed"], config.MAX_PLAYBACK_SPEED)
+                self.assertLessEqual(kw["slow_speed"], 0.62)
+                self.assertGreaterEqual(kw["blend_seconds"], config.MIN_BLEND_SECONDS)
+                self.assertGreaterEqual(kw["blend_seconds"], 4.2)
+                self.assertTrue(kw["smooth_slowmo"])
+                self.assertTrue(str(kw["slowmo_cache"]).endswith("_slowmo"))
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "cần ffmpeg")

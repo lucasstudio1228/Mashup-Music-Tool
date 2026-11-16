@@ -225,6 +225,7 @@ def create_batch(data: BatchCreate):
             max_create_actions=data.max_create_actions,
             channel_name=data.channel_name, channel_id=data.channel_id,
             mix_duration_minutes=data.mix_duration_minutes,
+            audio_only=data.audio_only,
         )
     except RuntimeError as exc:
         raise HTTPException(422, str(exc)) from exc

@@ -471,10 +471,9 @@ def step_assemble(project_id: int,
     # Kiểu chữ + dòng phụ + màu/chuyển cảnh theo công thức riêng của video và
     # phong cách kênh (thumbnail_recipe / channel_looks) — chống dập khuôn.
     style, subtitle, finish, recipe = _title_look(project_id, project_name)
-    if config.images_cast_mode(config.images_dir(project_id, project_name)) == "scenery":
-        # Chỉ cảnh vật: phát đúng tốc độ thật — làm chậm 0.7x khiến cảnh vật trông
-        # như đứng hình (người dùng muốn cảnh động, chuyển động bình thường).
-        finish = {**finish, "slow_speed": config.SCENERY_PLAYBACK_SPEED}
+    # Nhạc chill: MỌI video (cả chỉ cảnh vật) slow motion + chuyển cảnh dài, mềm
+    # (2026-10-28 — trước đây cảnh vật phát 1.0x, chuyển cảnh 2.6–3.2s → "trôi quá nhanh").
+    finish = config.chill_finish(finish)
     if recipe:
         from .channel_looks import look_info
         progress_cb(f"Phong cách kênh «{look_info(recipe.get('look'))['label']}»: chữ "
@@ -528,6 +527,10 @@ def step_assemble(project_id: int,
         blend_seconds=finish["blend_seconds"], slow_speed=finish["slow_speed"],
         grade=finish["grade"], transition=finish["transition"],
         lead_image=lead_image, lead_seconds=config.INTRO_THUMBNAIL_SECONDS,
+        smooth_slowmo=config.SMOOTH_SLOWMO,
+        slowmo_cache=config.final_dir(project_id, project_name) / "_slowmo",
+        slowmo_workers=config.SLOWMO_WORKERS,
+        cancel_check=getattr(progress_cb, "is_cancelled", None),
         progress_cb=lambda m, p: progress_cb(m, 5.0 + p * 0.95),
     )
 

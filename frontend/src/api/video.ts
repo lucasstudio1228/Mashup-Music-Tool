@@ -247,6 +247,17 @@ export function videoDownloadUrl(projectId: number): string {
   return `${API_BASE}${base(projectId)}/download`;
 }
 
+// Phát final.mp4 ngay trong tool (inline, tua được). bust = final_mtime.
+export function videoFinalUrl(projectId: number, bust?: string | number): string {
+  const q = bust != null ? `?t=${encodeURIComponent(String(bust))}` : "";
+  return `${API_BASE}${base(projectId)}/final${q}`;
+}
+
+// Mở final.mp4 bằng trình phát mặc định của máy (backend chạy local).
+export const useOpenFinal = (pid: number) => useVideoAction(pid, "open-final");
+// Mở thư mục Final trong Explorer (chọn sẵn final.mp4).
+export const useOpenFinalFolder = (pid: number) => useVideoAction(pid, "open-final-folder");
+
 // URL ảnh thumbnail (kèm chữ). Thêm cache-buster để sau mỗi lần ghép lại, ảnh
 // mới hiển thị thay vì bản cache cũ của trình duyệt.
 export function videoThumbnailUrl(projectId: number, bust?: string | number): string {

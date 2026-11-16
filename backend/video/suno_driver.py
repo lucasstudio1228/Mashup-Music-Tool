@@ -1181,19 +1181,31 @@ class SunoDriver:
     # bài đó. Trước đây ưu tiên nút ⋯ theo link /song/<id> — trên trang bài thì
     # đó là nút ở THANH PHÁT NHẠC dưới cùng: LIVE 2026-09-30, ngay sau 1 lần tải
     # thành công, menu mở từ thanh phát nhạc bị menu 'Earn Credits' ở sidebar
-    # chen vào → submenu Edit không bung (~1/2 số bài tải lỗi). JS đánh dấu nút
-    # ⋯ nằm trong vùng nội dung, không thuộc hàng của bài KHÁC, không ở sidebar
-    # trái / thanh phát nhạc, và cao nhất trang.
+    # chen vào → submenu Edit không bung (~1/2 số bài tải lỗi).
+    # GIAO DIỆN MỚI 2026-11-17 (dò LIVE, data/_probe_song_header_1117.py): nút ⋯
+    # đầu trang đổi aria-label thành «More options for <tên bài>»; trang bài có
+    # thêm mục «Similar songs» với nút ⋯ (aria đúng bằng «More options») của bài
+    # KHÁC → selector cũ (so khớp nguyên văn) bỏ sót nút đầu trang và bấm nhầm ⋯
+    # của Similar songs (0/15 bài tải được).
+    # JS: nhận mọi nút có aria bắt đầu «More options», loại sidebar trái / thanh
+    # phát nhạc, loại nút thuộc HÀNG của bài khác (khung nhỏ nhất chứa link
+    # /song/ mà chỉ có 1 nút ⋯ = hàng; gặp khung có ≥2 nút ⋯ trước khi thấy link
+    # = đã ra khỏi hàng → không phải hàng bài khác). Ưu tiên «More options for …»
+    # rồi tới nút cao nhất trang.
     _MARK_HEADER_MORE_JS = """(id) => {
       document.querySelectorAll('[data-mm-song-more]')
         .forEach(e => e.removeAttribute('data-mm-song-more'));
       if (!id || !location.pathname.includes(id)) return false;
-      let best = null, by = 1e9;
-      for (const b of document.querySelectorAll("button[aria-label='More options']")) {
+      const MORE = "button[aria-label^='More options']";
+      let best = null, bestNamed = 2, bestY = 1e9;
+      for (const b of document.querySelectorAll(MORE)) {
         if (b.offsetParent === null) continue;
-        let c = b, foreign = false;
-        for (let i = 0; i < 6 && c; i++) {
-          const ls = c.querySelectorAll ? c.querySelectorAll("a[href*='/song/']") : [];
+        const r = b.getBoundingClientRect();
+        if (r.width === 0 || r.x < 250 || r.y > innerHeight - 120) continue;
+        let c = b.parentElement, foreign = false;
+        for (let i = 0; i < 10 && c; i++) {
+          if (c.querySelectorAll(MORE).length > 1) break;
+          const ls = c.querySelectorAll("a[href*='/song/']");
           if (ls.length) {
             foreign = [...ls].some(a => !(a.getAttribute('href') || '').includes(id));
             break;
@@ -1201,9 +1213,10 @@ class SunoDriver:
           c = c.parentElement;
         }
         if (foreign) continue;
-        const r = b.getBoundingClientRect();
-        if (r.width === 0 || r.x < 250 || r.y > innerHeight - 120) continue;
-        if (r.y < by) { by = r.y; best = b; }
+        const named = /^more options for\s/i.test(b.getAttribute('aria-label') || '') ? 0 : 1;
+        if (named < bestNamed || (named === bestNamed && r.y < bestY)) {
+          best = b; bestNamed = named; bestY = r.y;
+        }
       }
       if (!best) return false;
       best.setAttribute('data-mm-song-more', '1');
@@ -1227,8 +1240,9 @@ class SunoDriver:
                 row = self.page.locator(f"a[href*='/song/{song_id}']").first
                 if row.count() > 0:
                     container = row.locator(
-                        "xpath=ancestor-or-self::*[.//button[@aria-label='More options']][1]")
-                    cand = container.locator("button[aria-label='More options']").first
+                        "xpath=ancestor-or-self::*[.//button[starts-with(@aria-label,"
+                        "'More options')]][1]")
+                    cand = container.locator("button[aria-label^='More options']").first
                     if cand.count() > 0:
                         more = cand
             except Exception:
@@ -1304,7 +1318,7 @@ class SunoDriver:
                 has_link = self.page.locator(
                     f"a[href*='/song/{song_id}']").count() > 0
                 has_more = self.page.locator(
-                    "button[aria-label='More options']").count() > 0
+                    "button[aria-label^='More options']").count() > 0
                 if has_link or has_more:
                     return
             except Exception as e:      # noqa: BLE001 — thử lại

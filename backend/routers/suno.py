@@ -47,6 +47,8 @@ class StartBody(BaseModel):
     max_generation_credits: Optional[int] = None
     max_new_song_downloads: Optional[int] = None
     auto_continue_workflow: Optional[bool] = None
+    # True = «Auto Audio» (Suno → Mix rồi dừng); False/None = «Full auto».
+    audio_only: Optional[bool] = None
 
     def overrides(self) -> dict:
         return {k: v for k, v in self.model_dump().items() if v is not None}
@@ -127,6 +129,8 @@ class GenStylesBody(BaseModel):
     idea: str = ""
     preset: Optional[str] = None
     save: bool = True   # lưu idea vào project.suno_idea để textbox nhớ
+    # «Auto Audio»: không bật auto_video/auto_upload (chuỗi dừng ở Mix).
+    audio_only: bool = False
 
 
 @router.post("/generate-styles")
@@ -184,13 +188,14 @@ def suno_generate_styles(project_id: int, body: GenStylesBody,
         note = None
 
     # ── Phân loại kênh YouTube + bật chuỗi tự động ──
-    channel = _classify_and_prepare(db, project, title, idea, styles, api_config)
+    channel = _classify_and_prepare(db, project, title, idea, styles, api_config,
+                                    audio_only=body.audio_only)
     return {"source": source, "styles": styles, "exclusions": exclusions,
             "note": note, "channel": channel}
 
 
 def _classify_and_prepare(db: Session, project: Project, title: str, idea: str,
-                          styles: str, api_config) -> dict:
+                          styles: str, api_config, *, audio_only: bool = False) -> dict:
     """Kênh YouTube của project: người dùng ĐÃ CHỌN kênh (project.channel_id) →
     dùng đúng kênh đó, không phân loại, không đổi nhạc cụ/thể loại (kênh nào
     cũng nhận nhạc cụ nào — 2026-10-25). Chưa chọn → AI chọn kênh khớp nhất
@@ -208,9 +213,11 @@ def _classify_and_prepare(db: Session, project: Project, title: str, idea: str,
         for m in db.exec(select(ChannelMapping).order_by(ChannelMapping.id)).all()
     ]
 
-    # Luôn bật auto_upload + auto_video: luồng một-chạm phải đi hết tới YouTube.
-    project.auto_upload = True
-    project.auto_video = True
+    # «Full auto»: bật auto_upload + auto_video để luồng một-chạm đi hết tới
+    # YouTube. «Auto Audio»: TẮT cả hai — chuỗi dừng ở Mix (bấm Mix lại cũng
+    # không tự dựng video; bật lại ở tab Video khi muốn).
+    project.auto_upload = not audio_only
+    project.auto_video = not audio_only
 
     matched: Optional[dict] = None
     warning: Optional[str] = None

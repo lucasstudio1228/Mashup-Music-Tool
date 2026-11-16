@@ -212,10 +212,11 @@ def status(project_id: int, db: Session = Depends(get_session)):
         "clip_engines": [{"key": k, "label": config.CLIP_ENGINE_LABELS.get(k, k)}
                          for k in config.CLIP_ENGINES],
         "aspect_ratio": p.aspect_ratio, "flow_mode": p.flow_mode,
-        "blend_seconds": p.blend_seconds,
-        # Chỉ cảnh vật ghép ở tốc độ thật (không làm chậm như đứng hình).
-        "slow_speed": (config.SCENERY_PLAYBACK_SPEED if cast_mode == "scenery"
-                       else p.slow_speed),
+        # Nhạc chill: mọi chế độ đều slow motion + chuyển cảnh dài (config.chill_finish).
+        "blend_seconds": config.chill_finish({"blend_seconds": p.blend_seconds,
+                                              "slow_speed": p.slow_speed})["blend_seconds"],
+        "slow_speed": config.chill_finish({"blend_seconds": p.blend_seconds,
+                                           "slow_speed": p.slow_speed})["slow_speed"],
         # Nhãn vai trò 3 ảnh (0 bìa, 1 nhân vật chính, 2 linh thú) cho UI —
         # chế độ chỉ cảnh vật: bảng bối cảnh + bảng ánh sáng.
         "image_roles": {str(k): v for k, v in config.image_roles(cast_mode).items()},
@@ -233,6 +234,12 @@ def status(project_id: int, db: Session = Depends(get_session)):
         media["thumbnail_mtime"] = int((final_d / "thumbnail.png").stat().st_mtime)
     except OSError:
         media["thumbnail_mtime"] = None
+    # mtime/size final.mp4 — cache-buster cho trình phát «Xem Final» trong UI.
+    try:
+        fst = (final_d / "final.mp4").stat()
+        media["final_mtime"], media["final_size"] = int(fst.st_mtime), fst.st_size
+    except OSError:
+        media["final_mtime"], media["final_size"] = None, None
     return media
 
 
@@ -627,6 +634,45 @@ def download(project_id: int, db: Session = Depends(get_session)):
                    for c in (project.name or "video")).strip()
     return FileResponse(str(final), media_type="video/mp4",
                         filename=f"{safe or 'video'}_final.mp4")
+
+
+def _final_or_404(db: Session, project_id: int) -> Path:
+    project = _project_or_404(db, project_id)
+    final = config.final_dir(project_id, project.name) / "final.mp4"
+    if not final.exists():
+        raise HTTPException(404, "Chưa có video final. Hãy ghép video trước.")
+    return final
+
+
+@router.get("/final")
+def watch_final(project_id: int, db: Session = Depends(get_session)):
+    """Phát final.mp4 ngay trong tool (inline, hỗ trợ Range → tua được)."""
+    return FileResponse(str(_final_or_404(db, project_id)), media_type="video/mp4",
+                        content_disposition_type="inline",
+                        headers={"Cache-Control": "no-cache"})
+
+
+@router.post("/open-final")
+def open_final(project_id: int, db: Session = Depends(get_session)):
+    """Mở final.mp4 bằng trình phát mặc định của máy (tool chạy local)."""
+    import os
+    final = _final_or_404(db, project_id)
+    if not hasattr(os, "startfile"):
+        raise HTTPException(501, "Chỉ hỗ trợ mở bằng trình phát máy trên Windows.")
+    try:
+        os.startfile(str(final))
+    except OSError as e:
+        raise HTTPException(500, f"Không mở được video: {e}")
+    return {"status": "opened", "project_id": project_id}
+
+
+@router.post("/open-final-folder")
+def open_final_folder(project_id: int, db: Session = Depends(get_session)):
+    """Mở thư mục Final trong Explorer (chọn sẵn final.mp4 nếu đã có)."""
+    from backend.open_folder import reveal
+    project = _project_or_404(db, project_id)
+    folder = config.final_dir(project_id, project.name)
+    return {**reveal(folder, folder / "final.mp4"), "project_id": project_id}
 
 
 @router.get("/image/{index}")

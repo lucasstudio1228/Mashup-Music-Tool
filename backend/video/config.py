@@ -135,8 +135,8 @@ class VideoParams:
 
     # Ghép/mix: blend (crossfade) + làm chậm
     t_window:        int   = 10             # T+10: không lặp trong 10 clip kế
-    blend_seconds:   float = 3.0            # crossfade êm (softfade) giữa 2 clip
-    slow_speed:      float = 0.7            # tốc độ phát (0.7 = chậm lại, mượt)
+    blend_seconds:   float = 4.6            # crossfade êm (softfade) giữa 2 clip
+    slow_speed:      float = 0.58           # slow motion (nội suy khung mci, mượt)
 
     @property
     def total_clips(self) -> int:
@@ -698,7 +698,7 @@ INTRO_MOTION_PROMPT_SCENERY = (
     "motion — flowing water and ripples, clouds moving across the sky, wind "
     "through leaves, branches and grass, drifting mist, falling petals, "
     "flickering lantern light, moving light and shadows — while the camera makes "
-    "one smooth, natural push-in or gentle drift at a normal, unhurried speed; "
+    "one smooth, natural push-in or drift that is gentle, steady and unhurried (calm, never fast or rushed); "
     "seamless, no scene cut, no people, no characters, no animals, no text"
 )
 
@@ -707,7 +707,7 @@ FLOW_MOTION_PROMPT_SCENERY = (
     "clearly visible natural motion — flowing water and ripples, clouds moving "
     "across the sky, wind through trees, leaves and grass, drifting mist, falling "
     "petals, moving light and shadows; one smooth, natural cinematic camera move "
-    "at a normal, unhurried speed; preserve the exact same place, landmarks and "
+    "that is gentle, steady and unhurried (calm, never fast or rushed); preserve the exact same place, landmarks and "
     "color palette; one continuous shot, no scene cut, no camera shake, no "
     "people, no characters, no animals"
 )
@@ -717,7 +717,7 @@ SCENERY_LIVING_MOTION = (
     "LIVING SCENE, never a still image: the place is clearly in motion (flowing "
     "water, moving clouds, wind through trees and grass, drifting mist, falling "
     "petals or leaves, moving light and shadows) and the camera makes one smooth, "
-    "natural cinematic move at a normal, unhurried speed.")
+    "natural cinematic move that is gentle, steady and unhurried (calm, never fast or rushed).")
 
 MOTION_NEGATIVE_SCENERY = (
     " || STRICTLY FORBIDDEN (avoid absolutely): NO people, NO human figures, "
@@ -765,9 +765,16 @@ def liven_scenery_motion(text: str) -> str:
     return re.sub(r"[ \t]{2,}", " ", out)
 
 
-# Ghép video chỉ cảnh vật: phát ĐÚNG tốc độ thật (phong cách kênh thường làm chậm
-# 0.7x — với cảnh vật làm clip trông như đứng hình).
-SCENERY_PLAYBACK_SPEED = 1.0
+# Nhạc chill → MỌI video slow motion (2026-10-28 người dùng: "video trôi quá nhanh").
+# Cảnh vật trước đây phát 1.0x → nay theo tốc độ phong cách kênh như chế độ nhân vật.
+# Chặn trên tốc độ + chặn dưới độ dài chuyển cảnh (cả look tự nhập / recipe cũ).
+MAX_PLAYBACK_SPEED = 0.62
+MIN_BLEND_SECONDS = 4.2
+# Slow motion bằng nội suy chuyển động (minterpolate mci) thay vì nhân bản khung
+# (clip 24fps làm chậm 0.6x chỉ còn ~14 khung thật/giây → giật). Xử lý song song
+# từng clip, cache final/_slowmo/ → ghép lại không làm lại.
+SMOOTH_SLOWMO = True
+SLOWMO_WORKERS = 8
 
 
 def intro_motion_prompt(cast_mode: str | None) -> str:
@@ -1779,7 +1786,9 @@ SUNO_SELECTORS: dict[str, list[str]] = {
     "new_workspace": ["*:has-text('Create new workspace')"],
     # Danh sách bài + hành động per-song.
     "song_row_play": ["div[role=button][aria-label^='Play ']"],
-    "song_more_options": ["button[aria-label='More options']"],
+    # 2026-11-17: nút ⋯ đầu trang bài = «More options for <tên bài>».
+    "song_more_options": ["button[aria-label^='More options for ']",
+                          "button[aria-label='More options']"],
     # Menu ⋯ → Download → dialog format WAV.
     "download_entry": [
         "div.hxc-menu-item:has-text('Download')",
@@ -1976,3 +1985,14 @@ def get_selectors(site: str) -> dict[str, list[str]]:
 PARAMS  = VideoParams()
 BROWSER = BrowserConfig()
 SUNO    = SunoConfig()
+
+
+def chill_finish(finish: dict) -> dict:
+    """Ép thông số ghép về nhịp nhạc chill: tốc độ ≤ MAX_PLAYBACK_SPEED (slow motion),
+    chuyển cảnh ≥ MIN_BLEND_SECONDS (mềm). Áp cho mọi look/recipe cũ/chế độ cảnh vật."""
+    out = dict(finish)
+    out["slow_speed"] = round(min(float(out.get("slow_speed") or PARAMS.slow_speed),
+                                  MAX_PLAYBACK_SPEED), 3)
+    out["blend_seconds"] = round(max(float(out.get("blend_seconds") or PARAMS.blend_seconds),
+                                     MIN_BLEND_SECONDS), 2)
+    return out

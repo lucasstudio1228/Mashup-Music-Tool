@@ -75,3 +75,11 @@ export function useDeleteMix(projectId: number) {
     },
   });
 }
+
+/** Mở thư mục Audio của mix trong Explorer (chọn sẵn mix.wav). */
+export function useOpenMixFolder() {
+  return useMutation({
+    mutationFn: async (mixId: number) =>
+      (await api.post(`/api/mixes/${mixId}/open-folder`)).data,
+  });
+}

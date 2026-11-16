@@ -102,8 +102,8 @@ LOOKS: dict[str, dict] = {
         "grade": ("eq=saturation=0.84:contrast=1.04:brightness=0.01,"
                   "colorbalance=bs=0.04:bm=0.02:rh=-0.02,vignette=angle=PI/5"),
         "transitions": ["softfade"],
-        "blend_seconds": 3.2,
-        "slow_speed": 0.68,
+        "blend_seconds": 5.0,
+        "slow_speed": 0.56,
     },
     "cozy_lofi": {
         "icon": "☕",
@@ -165,8 +165,8 @@ LOOKS: dict[str, dict] = {
         "grade": ("eq=saturation=1.05:contrast=0.96:gamma=1.03,"
                   "colorbalance=rs=0.04:rm=0.03:bh=-0.03,vignette=angle=PI/5"),
         "transitions": ["softfade"],
-        "blend_seconds": 3.0,
-        "slow_speed": 0.72,
+        "blend_seconds": 4.6,
+        "slow_speed": 0.6,
     },
     "cinematic": {
         "icon": "🎬",
@@ -230,8 +230,8 @@ LOOKS: dict[str, dict] = {
         "grade": ("eq=contrast=1.07:saturation=0.93,"
                   "colorbalance=rs=-0.05:bs=0.06:rh=0.05:bh=-0.05"),
         "transitions": ["softfade"],
-        "blend_seconds": 3.0,
-        "slow_speed": 0.7,
+        "blend_seconds": 4.8,
+        "slow_speed": 0.58,
     },
     "painterly": {
         "icon": "🌸",
@@ -293,8 +293,8 @@ LOOKS: dict[str, dict] = {
         "grade": ("eq=saturation=1.08:gamma=1.02,colorbalance=rm=0.03:bm=-0.02,"
                   "vignette=angle=PI/6"),
         "transitions": ["softfade"],
-        "blend_seconds": 2.8,
-        "slow_speed": 0.7,
+        "blend_seconds": 4.4,
+        "slow_speed": 0.57,
     },
     "bright": {
         "icon": "✨",
@@ -355,8 +355,8 @@ LOOKS: dict[str, dict] = {
                       "citrus yellow and emerald", "violet and aqua"],
         "grade": "eq=saturation=1.16:contrast=1.04",
         "transitions": ["softfade"],
-        "blend_seconds": 2.6,
-        "slow_speed": 0.74,
+        "blend_seconds": 4.2,
+        "slow_speed": 0.62,
     },
 }
 

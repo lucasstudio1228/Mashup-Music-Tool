@@ -205,10 +205,122 @@ def _mux_visual_list(list_path: Path, audio_path: str, out_path: Path,
 # giữ lại cho tương thích.
 XFADE_TRANSITIONS = ("softfade", "fade", "fadegrays", "fadeblack", "fadewhite",
                      "hblur", "smoothleft", "smoothright", "dissolve")
-# P của xfade chạy 1 → 0 (1 = còn nguyên clip A). s = smoothstep(P).
-_SOFTFADE_EXPR = "A*(P*P*(3-2*P))+B*(1-P*P*(3-2*P))"
+# P của xfade chạy 1 → 0 (1 = còn nguyên clip A). s = smootherstep(P) = 6P⁵-15P⁴+10P³
+# (2026-10-28: êm hơn smoothstep — cả vận tốc lẫn gia tốc = 0 ở hai đầu, không
+# "chớp" lúc bắt đầu/kết thúc hoà tan).
+_EASE = "(P*P*P*(P*(P*6-15)+10))"
+_SOFTFADE_EXPR = f"A*{_EASE}+B*(1-{_EASE})"
 # Crossfade không được dài quá ~nửa clip (2 lần hoà tan chồng nhau trong 1 clip).
 _MAX_BLEND_FRACTION = 0.45
+
+# Slow motion NỘI SUY chuyển động (motion-compensated): clip 24fps làm chậm 0.58x
+# chỉ còn ~14 khung thật/giây → nhân bản khung = giật; minterpolate mci tạo khung
+# trung gian thật → trôi mượt. Chậm (~15–30x realtime/luồng) → chạy song song +
+# cache theo (nguồn, tốc độ, fps, kích thước).
+_MCI = "minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"
+
+
+def _slowmo_target(src: Path, cache_dir: Path, speed: float, fps: int,
+                   width: int, height: int) -> Path:
+    import hashlib
+    key = hashlib.sha1(str(src.resolve()).lower().encode("utf-8")).hexdigest()[:8]
+    return cache_dir / f"{src.stem}_{key}_s{speed:.3f}_f{fps}_{width}x{height}.mp4"
+
+
+def _slowmo_fresh(src: Path, dst: Path) -> bool:
+    try:
+        return dst.stat().st_size > 0 and dst.stat().st_mtime >= src.stat().st_mtime
+    except OSError:
+        return False
+
+
+def _slowmo_cmd(src: Path, dst: Path, speed: float, fps: int, width: int,
+                height: int, interpolate: bool) -> list[str]:
+    vf = (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+          f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,setpts=PTS/{speed},"
+          + (_MCI.format(fps=fps) if interpolate else f"fps={fps}"))
+    return ["ffmpeg", "-y", "-i", str(src), "-an", "-vf", vf,
+            "-c:v", "libx264", "-preset", "medium", "-crf", "16", "-threads", "2",
+            "-pix_fmt", "yuv420p", str(dst)]
+
+
+def slowmo_clips(clips: list[str], speed: float, cache_dir: Path, *, fps: int = 30,
+                 width: int = 1920, height: int = 1080, workers: int = 8,
+                 cancel_check: Optional[Callable[[], bool]] = None,
+                 progress: Optional[Callable[[str], None]] = None) -> list[str]:
+    """Làm chậm từng clip (giữ thứ tự, trùng lặp xử lý 1 lần) bằng nội suy mci.
+
+    Trả về đường dẫn clip đã chậm (phát ở 1.0x). Clip nào mci lỗi → làm lại bằng
+    nhân bản khung (vẫn đúng tốc độ). Huỷ job → kill mọi ffmpeg + JobCancelled."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    uniq: dict[str, Path] = {}
+    for c in clips:
+        uniq.setdefault(c, _slowmo_target(Path(c), cache_dir, speed, fps, width, height))
+    todo = [(Path(c), d) for c, d in uniq.items() if not _slowmo_fresh(Path(c), d)]
+    procs: list[subprocess.Popen] = []
+    cancelled = False
+    done = [len(uniq) - len(todo)]
+
+    def _one(src: Path, dst: Path) -> None:
+        tmp = dst.with_name(dst.stem + ".part.mp4")
+        for interpolate in (True, False):
+            if cancelled:
+                return
+            p = subprocess.Popen(_slowmo_cmd(src, tmp, speed, fps, width, height,
+                                             interpolate),
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                 text=True, encoding="utf-8", errors="replace")
+            procs.append(p)
+            if cancelled:
+                p.kill()
+            _, err = p.communicate()
+            if p.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+                tmp.replace(dst)
+                done[0] += 1
+                if progress:
+                    progress(f"Slow motion mượt {speed:.2f}x: {done[0]}/{len(uniq)} clip"
+                             + ("" if interpolate else f" ({src.name}: nội suy lỗi → "
+                                                       "nhân bản khung)"))
+                return
+            if cancelled:
+                return
+        raise RuntimeError(f"ffmpeg làm chậm {src.name} lỗi: {(err or '').strip()[-300:]}")
+
+    if todo:
+        if progress:
+            progress(f"Slow motion mượt {speed:.2f}x (nội suy chuyển động): "
+                     f"{len(todo)} clip, song song {max(1, workers)} luồng"
+                     + (f" — {done[0]} clip có sẵn trong cache" if done[0] else ""))
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+            futs = [ex.submit(_one, s, d) for s, d in todo]
+            try:
+                while not all(f.done() for f in futs):
+                    if cancel_check and cancel_check():
+                        cancelled = True
+                        break
+                    time.sleep(0.5)
+                if not cancelled:
+                    for f in futs:
+                        f.result()
+            except BaseException:
+                cancelled = True
+                raise
+            finally:
+                if cancelled:
+                    for p in list(procs):
+                        if p.poll() is None:
+                            p.kill()
+        if cancelled:
+            for _, d in todo:
+                try:
+                    d.with_name(d.stem + ".part.mp4").unlink()
+                except OSError:
+                    pass
+            from .job_manager import JobCancelled
+            raise JobCancelled("Đã huỷ khi đang làm slow motion.")
+    return [str(uniq[c]) for c in clips]
 
 
 def _xfade(transition: str, duration: float, offset: float) -> str:
@@ -235,6 +347,10 @@ def assemble_video_blend(
     transition: str = "softfade",
     lead_image: Optional[str] = None,
     lead_seconds: float = 7.0,
+    smooth_slowmo: bool = False,
+    slowmo_cache: Optional[Path] = None,
+    slowmo_workers: int = 8,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """
     Phát clip đầu đúng một lần làm intro. Các clip còn lại tạo thành visual
@@ -248,6 +364,8 @@ def assemble_video_blend(
       thumbnail (frame 00:00 = thumbnail nguyên vẹn, chữ AI giữ nguyên), đẩy máy
       rất chậm (Ken Burns 1.0 → 1.06, smoothstep) trong `lead_seconds` giây rồi
       hoà tan vào clip 00. Ảnh không qua `grade` để giống hệt thumbnail.
+    - `smooth_slowmo` + slow_speed < 1: làm chậm trước từng clip bằng nội suy
+      chuyển động (slowmo_clips, cache `slowmo_cache`) rồi ghép ở 1.0x.
     """
     if not clip_sequence:
         raise ValueError("clip_sequence rỗng.")
@@ -266,6 +384,12 @@ def assemble_video_blend(
     n = len(clip_sequence)
     if n < 2:
         raise ValueError("Cần ít nhất 2 clip: 1 intro và 1 clip cho cycle.")
+    if smooth_slowmo and slow_speed < 0.999:
+        clip_sequence = slowmo_clips(
+            list(clip_sequence), slow_speed, Path(slowmo_cache or out.parent / "_slowmo"),
+            fps=fps, width=width, height=height, workers=slowmo_workers,
+            cancel_check=cancel_check, progress=lambda m: _p(m, 8.0))
+        slow_speed = 1.0
     _p(f"Đo độ dài {n} clip", 10.0)
     intro_clip = clip_sequence[0]
     cycle_clips = clip_sequence[1:]

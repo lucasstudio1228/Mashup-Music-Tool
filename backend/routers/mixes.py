@@ -83,9 +83,11 @@ def _maybe_trigger_auto_video(project_id: int, project_name: str,
         pass
 
 
-def _on_success(mix_id: int, result: dict, force_video: bool = False) -> None:
+def _on_success(mix_id: int, result: dict, force_video: bool = False,
+                skip_video: bool = False) -> None:
     """force_video=True: luôn auto-dựng video sau mix (dùng cho chuỗi Suno →
-    Mix → Video), bỏ qua công tắc auto_video của project."""
+    Mix → Video), bỏ qua công tắc auto_video của project. skip_video=True
+    («Auto Audio»): KHÔNG dựng video dù project bật auto_video."""
     auto_ctx: dict | None = None
     qc_pid: int | None = None
     with Session(engine) as session:
@@ -108,7 +110,8 @@ def _on_success(mix_id: int, result: dict, force_video: bool = False) -> None:
             # Chuẩn bị context để auto-dựng video (đọc trong session còn mở).
             project = session.get(Project, mix.project_id)
             out_dir = mix.output_dir
-            if project and (project.auto_video or force_video) and out_dir:
+            if (project and not skip_video and (project.auto_video or force_video)
+                    and out_dir):
                 wav = Path(out_dir) / "mix.wav"
                 if wav.exists():
                     auto_ctx = {
@@ -171,7 +174,8 @@ def list_mixes(project_id: int, session: Session = Depends(get_session)):
 
 
 def _submit_mix_job(session: Session, project_id: int, data: MixCreate,
-                    tracks: list[Track], *, force_video: bool) -> Mix:
+                    tracks: list[Track], *, force_video: bool,
+                    skip_video: bool = False) -> Mix:
     """Tạo record Mix + submit job render (dùng chung cho endpoint và auto-continue
     từ Suno). Giả định caller đã validate (đủ track, manager rảnh)."""
     from functools import partial
@@ -209,13 +213,15 @@ def _submit_mix_job(session: Session, project_id: int, data: MixCreate,
         mix.id, core_bridge.run_mix_job,
         track_paths, str(output_dir), data.duration_minutes,
         data.crossfade_seconds, sample_rate, bit_depth, DB_PATH,
-        on_success=partial(_on_success, force_video=force_video),
+        on_success=partial(_on_success, force_video=force_video,
+                           skip_video=skip_video),
         on_failure=_on_failure, on_cancel=_on_cancel,
     )
     return mix
 
 
 def start_mix_for_project(project_id: int, *, force_video: bool = False,
+                          skip_video: bool = False,
                           data: MixCreate | None = None) -> int:
     """Khởi động 1 mix cho project theo cách lập trình (auto-continue từ Suno).
     Mở session riêng, validate, submit. Trả mix_id. Raise RuntimeError nếu không
@@ -238,7 +244,7 @@ def start_mix_for_project(project_id: int, *, force_video: bool = False,
         if job_manager.is_busy():
             raise RuntimeError("Đang có 1 mix render khác — bỏ qua auto-continue.")
         mix = _submit_mix_job(session, project_id, data, tracks,
-                              force_video=force_video)
+                              force_video=force_video, skip_video=skip_video)
         return mix.id
 
 
@@ -348,3 +354,14 @@ def download_mix_file(mix_id: int, file_type: str,
         filename=f"{safe_title}_{filepath.name}",
         media_type=media_type,
     )
+
+
+@router.post("/mixes/{mix_id}/open-folder")
+def open_mix_folder(mix_id: int, session: Session = Depends(get_session)):
+    """Mở thư mục Audio của mix trong Explorer (chọn sẵn mix.wav nếu có)."""
+    from backend.open_folder import reveal
+    mix = _get_mix_or_404(session, mix_id)
+    if not mix.output_dir:
+        raise HTTPException(404, "Mix chưa có thư mục output")
+    folder = Path(mix.output_dir)
+    return {**reveal(folder, folder / "mix.wav"), "mix_id": mix_id}

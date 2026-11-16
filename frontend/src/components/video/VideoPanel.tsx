@@ -6,10 +6,12 @@ import {
   usePreparePrompts, usePromptManifest,
   useUploadYoutube, useUploadShort, useShortSettings, useSaveShortSettings,
   useYoutubeHistory, useOpenVideoBrowser, useCloseVideoBrowser, useMakeThumbnail,
+  useOpenFinalFolder,
   videoDownloadUrl, videoThumbnailUrl, videoImageUrl, videoClipUrl,
 } from "../../api/video";
 import { useProject, useUpdateProject } from "../../api/projects";
 import ManualClipsPanel from "./ManualClipsPanel";
+import { FinalVideoPlayer } from "./FinalVideoPlayer";
 import { apiErrorText, useChannelMappings } from "../../api/youtube";
 import { vndText, ChatGPTLoginPanel } from "../settings/ThumbnailAiSettings";
 
@@ -71,6 +73,9 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
   const saveShortCfg = useSaveShortSettings(projectId);
   const { data: ytHistory, refetch: refetchYtHistory } = useYoutubeHistory(projectId);
   const openBrowser  = useOpenVideoBrowser(projectId);
+  const openFinalFolder = useOpenFinalFolder(projectId);
+  const onOpenFinalFolder = () =>
+    openFinalFolder.mutate(undefined, { onError: (err) => alert(apiErrorText(err)) });
   const closeBrowser = useCloseVideoBrowser(projectId);
   const [idea, setIdea] = useState("");
   // Nạp ý tưởng đã lưu của project vào ô nhập (khi tải xong / đổi project).
@@ -79,6 +84,7 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
   // Cache-buster: sau mỗi lần 1 job hoàn thành, đổi query ?t= để trình duyệt tải
   // lại ảnh/clip mới (thay vì bản cache cũ) trong gallery.
   const [bust, setBust] = useState(() => Date.now());
+  const [watchFinal, setWatchFinal] = useState(false);
   const jobStatus = st?.job?.status;
   useEffect(() => {
     if (jobStatus === "completed") {
@@ -168,6 +174,14 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
 
   return (
     <div className="space-y-6">
+    {watchFinal && st.final_exists && (
+      <FinalVideoPlayer
+        projectId={projectId}
+        title={project?.name}
+        bust={st.final_mtime ?? bust}
+        onClose={() => setWatchFinal(false)}
+      />
+    )}
     <Section title="Hồ sơ sáng tạo và bộ prompt">
       <p className="mb-3 text-sm text-gray-400">
         Một hồ sơ chung cho nhạc, nhân vật và bối cảnh. Tool viết <b>{p.image_count} prompt ảnh</b>
@@ -230,6 +244,24 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
             <Stat label="Nhạc (audio)" value={hasAudio ? fmtDur(st.audio_duration) : "Chưa có"} ok={hasAudio} />
             <Stat label="Video final" value={st.final_exists ? "Đã có" : "Chưa"} ok={st.final_exists} />
           </div>
+          <button
+            className={`${ghost} mt-3 w-full`}
+            onClick={onOpenFinalFolder}
+            disabled={openFinalFolder.isPending}
+            title="Mở thư mục Final trên máy (Explorer chọn sẵn final.mp4 nếu đã render)"
+          >
+            📂 Mở thư mục Final
+          </button>
+          {st.final_exists && (
+            <button className={`${primary} mt-2 w-full`} onClick={() => setWatchFinal(true)}>
+              ▶ Xem Final
+              {st.final_mtime && (
+                <span className="ml-2 text-xs font-normal opacity-80">
+                  (render lúc {new Date(st.final_mtime * 1000).toLocaleString("vi-VN")})
+                </span>
+              )}
+            </button>
+          )}
           {hasAudio && (
             <p className="mt-2 text-xs text-gray-500">
               Clip 00 chỉ phát một lần ở đầu; clip 01–{p.total_clips - 1} chạy cycle random T+{p.t_window} để phủ hết {fmtDur(st.audio_duration)} nhạc.
@@ -340,13 +372,21 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
               </div>
             )}
             {st.final_exists && (
-              <a
-                href={videoDownloadUrl(projectId)}
-                className={`${primary} inline-block`}
-                download
-              >
-                ⬇ Tải video final.mp4
-              </a>
+              <div className="flex flex-wrap gap-2">
+                <button className={primary} onClick={() => setWatchFinal(true)}>
+                  ▶ Xem Final
+                </button>
+                <a
+                  href={videoDownloadUrl(projectId)}
+                  className={`${ghost} inline-block`}
+                  download
+                >
+                  ⬇ Tải video final.mp4
+                </a>
+                <button className={ghost} onClick={onOpenFinalFolder} disabled={openFinalFolder.isPending}>
+                  📂 Mở thư mục
+                </button>
+              </div>
             )}
           </Section>
         )}
@@ -681,7 +721,8 @@ export default function VideoPanel({ projectId }: { projectId: number }) {
             cho {p.total_clips} clip — mỗi clip một góc khác của cùng khung cảnh, là{" "}
             <b>cảnh động</b> chứ không phải ảnh tĩnh: nước chảy, mây trôi, gió lùa cây cỏ, mưa /
             tuyết / cánh hoa rơi, ánh sáng đổi, máy quay chuyển động mượt (dolly, lia, cẩu…),
-            ghép ở tốc độ thật. Ảnh bìa không chứa chữ; thumbnail có chữ được tạo khi ghép video.
+            ghép <b>slow motion {p.slow_speed}x</b> (nội suy khung mượt) với chuyển cảnh hoà tan{" "}
+            {p.blend_seconds}s. Ảnh bìa không chứa chữ; thumbnail có chữ được tạo khi ghép video.
           </p>
           ) : (
           <p className="mt-2 text-xs text-gray-500">

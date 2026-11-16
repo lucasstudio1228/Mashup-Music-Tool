@@ -208,8 +208,8 @@ def _scenes_system(style_brief: str) -> str:
         "trees, grass and flowers, falling rain, snow, petals or leaves, drifting "
         "mist, swaying lanterns, turning waterwheels or windmills, moving light "
         "and shadows) and the camera makes one smooth, real cinematic move (dolly, "
-        "tracking, pan, tilt, crane, orbit, aerial drift, push-in) at a normal, "
-        "unhurried speed. "
+        "tracking, pan, tilt, crane, orbit, aerial drift, push-in) that is gentle, "
+        "steady and unhurried — calm, never fast or rushed. "
         "Describe the motion POSITIVELY (the model's safety filter rejects "
         "prompts that mention fire, smoke or destruction, even negated). Write in "
         "ENGLISH ONLY. Return ONLY valid JSON."
@@ -320,7 +320,8 @@ main character, NO companion, NO people, NO animals. It consists of:
    f) CAMERA MOVE — one smooth, natural cinematic move, different from clip to
       clip: dolly forward or back, lateral tracking, pan, tilt-up reveal, crane
       rise, gentle orbit, aerial drift / flyover, push-in toward a detail.
-      Normal, unhurried speed — never a locked or frozen camera.
+      Gentle, steady, unhurried speed (calm, never fast or rushed) — never a
+      locked or frozen camera.
    g) PACING: calm, smooth and continuous at natural real-time speed. No cuts,
       no fades, no text.
    Phrase everything POSITIVELY; never mention smoke, fire or destruction.
@@ -394,8 +395,8 @@ MANDATORY RULES for every prompt (70–130 words):
    sky, wind through trees and grass, falling rain / snow / petals / leaves,
    drifting mist, swaying lanterns, a turning waterwheel or windmill, moving
    light and shadows) PLUS one smooth cinematic CAMERA MOVE (dolly, tracking,
-   pan, tilt, crane, orbit, aerial drift, push-in), varied between clips, at a
-   normal unhurried speed — never a locked or frozen camera. No cuts, no fades.
+   pan, tilt, crane, orbit, aerial drift, push-in), varied between clips,
+   gentle, steady and unhurried (never fast or rushed) — never a locked or frozen camera. No cuts, no fades.
 5. NEVER mention people, characters, figures, silhouettes or animals of any kind
    — not even to say they are absent.
 {_instrument_note(instrument_spec, n)}

@@ -123,6 +123,8 @@ def _load_track_audio_with_stems(
     filepath: str,
     target_sr: int,
     db_path: str,
+    source_path: str | None = None,
+    normalize: bool = True,
 ) -> np.ndarray:
     """
     Load audio cho 1 track:
@@ -171,8 +173,10 @@ def _load_track_audio_with_stems(
             return mixed
         # Nếu load_mixed_stems trả None (file bị xóa) → fallback
 
-    # ── Fallback: load file gốc + LUFS normalize ──
-    audio, sr = sf.read(filepath, dtype="float32")
+    # ── Fallback: load file gốc (hoặc bản master của nó) + LUFS normalize ──
+    # source_path = bản _master (mastering_service); normalize=False khi bước
+    # cân bằng âm lượng (loudness_balance) lo độ to sau.
+    audio, sr = sf.read(source_path or filepath, dtype="float32")
     if audio.ndim == 1:
         audio = np.column_stack([audio, audio])
     if sr != target_sr:
@@ -181,7 +185,8 @@ def _load_track_audio_with_stems(
             res_type="kaiser_best"
         ).T
     # Normalize về -16 LUFS để đồng bộ với stems
-    audio = normalize_audio(audio, target_sr)
+    if normalize:
+        audio = normalize_audio(audio, target_sr)
     return audio
 
 
@@ -198,6 +203,131 @@ def _get_track_stem_status(filepath: str, db_path: str) -> str:
         return row[0] if row and row[0] else "not_started"
     finally:
         conn.close()
+
+
+def _load_mastered_balanced(
+    paths: list[str],
+    sample_rate: int,
+    db_path: str,
+    progress_cb,
+    pct_from: float = 8.0,
+    pct_to: float = 50.0,
+    reuse: dict | None = None,
+) -> tuple[dict[str, np.ndarray], dict]:
+    """Master + cân bằng âm lượng như tool «Cover nhạc» (2026-11-17):
+
+      1. Master từng bài bằng ffmpeg (EQ, mono bass, nén nhẹ, loudnorm 2 pass)
+         → bộ đệm <thư mục bài>/mastered/ (mastering_service). Bài đã có stems
+         (Demucs) giữ đường stems, không master.
+      2. Đọc bản master (lỗi → file gốc), ĐO «đoạn to» mọi bài, dời gain để các
+         bài to đều nhau, trung vị = LUFS của preset; limiter nhìn trước chặn
+         đỉnh -1 dBFS (loudness_balance).
+
+    Trả (audio đã xử lý theo đường dẫn GỐC, khối «loudness» cho mix_info.json).
+    Tắt trong data/master_config.json: "enabled" (master) / "balance_enabled".
+
+    reuse = khối «loudness» của bản mix CŨ (vá mix): bài còn giữ dùng LẠI đúng
+    gain cũ (đoạn trước bài thay giống hệt), bài mới nhận gain để «đoạn to»
+    bằng mức chung của bản cũ.
+    """
+    from backend import loudness_balance as lb
+    from backend import mastering_service as ms
+    from backend.loudness_service import normalize_audio
+
+    cfg = ms.load_config()
+    ms.ensure_config_file()
+    target = ms.target_lufs(cfg)
+    uniq = list(dict.fromkeys(paths))
+    n = max(len(uniq), 1)
+    span = pct_to - pct_from
+    stems = {p: _get_track_stem_status(p, db_path) == "completed" for p in uniq}
+
+    masters: dict[str, dict] = {}
+    to_master = [p for p in uniq if not stems[p]]
+    if cfg.get("enabled", True) and to_master:
+        progress_cb(2, f"Master âm thanh 0/{len(to_master)}", pct_from)
+        labels = {"cached": "đã có", "done": "xong", "failed": "lỗi → dùng file gốc"}
+
+        def on_master(done, total, res):
+            state = labels.get(res.get("status"), res.get("status"))
+            progress_cb(2, f"Master âm thanh {done}/{total}: {res.get('file')} ({state})",
+                        pct_from + span * 0.5 * done / total)
+        masters = ms.master_many(to_master, cfg, on_master)
+
+    balance = bool(cfg.get("balance_enabled", True))
+    load_from = pct_from + span * 0.5 if masters else pct_from
+    load_span = pct_to - load_from
+    audio: dict[str, np.ndarray] = {}
+    rows: list[dict] = []
+    for i, p in enumerate(uniq):
+        m = masters.get(p) or {}
+        src = m.get("path") if m.get("status") in ("done", "cached") else None
+        kind = "stems" if stems[p] else ("master" if src else "original")
+        progress_cb(2, f"[{i + 1}/{len(uniq)}] [{kind.upper()}] {Path(p).name}",
+                    load_from + load_span * (0.6 if balance else 1.0) * i / n)
+        audio[p] = _load_track_audio_with_stems(p, sample_rate, db_path,
+                                                source_path=src, normalize=not balance)
+        if not balance and src:
+            # Bản master đã ở LUFS của preset → chuẩn theo đúng mức đó.
+            audio[p] = normalize_audio(audio[p], sample_rate, target)
+        rows.append({"audio_file": Path(p).name, "source": kind,
+                     "master": ({k: m.get(k) for k in ("status", "before", "after", "error")}
+                                if m else None)})
+    info: dict = {"mastered": sum(r["source"] == "master" for r in rows),
+                  "master_preset": cfg.get("preset"), "target_lufs": target,
+                  "balanced": balance, "songs": rows}
+    if not balance:
+        return audio, info
+
+    stats = []
+    for i, p in enumerate(uniq):
+        progress_cb(2, f"Đo âm lượng [{i + 1}/{len(uniq)}] {Path(p).name}",
+                    load_from + load_span * (0.6 + 0.2 * i / n))
+        stats.append(lb.analyze(audio[p], sample_rate))
+    plan = lb.plan(stats, target)
+    old_gain = {r.get("audio_file"): r.get("gain_db")
+                for r in (reuse or {}).get("songs") or [] if r.get("gain_db") is not None}
+    levels = [r["after"]["loud"] for r in (reuse or {}).get("songs") or []
+              if (r.get("after") or {}).get("loud") is not None]
+    if old_gain and levels:
+        level = float(np.median(levels))
+        for i, p in enumerate(uniq):
+            name = Path(p).name
+            if name in old_gain:
+                plan[i]["gain_db"] = float(old_gain[name])
+            elif stats[i].get("loud") is not None:
+                plan[i]["gain_db"] = round(max(lb.MAX_CUT_DB, min(
+                    lb.MAX_BOOST_DB, level - stats[i]["loud"])), 2)
+        info["reused_gains"] = True
+    for i, (p, st, pl) in enumerate(zip(uniq, stats, plan)):
+        progress_cb(2, f"Cân bằng âm lượng [{i + 1}/{len(uniq)}] {Path(p).name}",
+                    load_from + load_span * (0.8 + 0.2 * i / n))
+        audio[p], limited = lb.apply(audio[p], sample_rate, pl["gain_db"])
+        rows[i].update(before=st, after=lb.analyze(audio[p], sample_rate),
+                       gain_db=pl["gain_db"], limited_db=limited, flag=pl["flag"])
+    info.update(ceiling_db=lb.CEILING_DB,
+                spread_before=_spread([st.get("loud") for st in stats]),
+                spread_after=_spread([r["after"].get("loud") for r in rows]))
+    return audio, info
+
+
+def _spread(values) -> float | None:
+    """Chênh «đoạn to» giữa bài to nhất và nhỏ nhất (LU)."""
+    vals = [v for v in values if v is not None]
+    return round(max(vals) - min(vals), 2) if vals else None
+
+
+def _write_loudness_info(files: dict, loudness: dict) -> None:
+    """Ghi khối «loudness» (master + cân bằng) vào mix_info.json."""
+    import json
+    try:
+        p = Path(files["json"])
+        data = json.loads(p.read_text(encoding="utf-8"))
+        data["loudness"] = loudness
+        p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                     encoding="utf-8")
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
 
 
 def run_mix_job(
@@ -233,22 +363,14 @@ def run_mix_job(
     # xếp playlist để đo độ dài THỰC mỗi bài đóng góp vào mix (render bỏ dead-air
     # đầu/đuôi + overlap crossfade) — ước lượng theo duration file làm mix hụt
     # so với yêu cầu (vd đặt 60' ra 58'35").
+    # Master + cân bằng âm lượng giữa các bài (như tool Cover nhạc).
     progress_cb(2, "Loading stems", 8.0)
-    preloaded: dict[str, np.ndarray] = {}
+    preloaded, loudness = _load_mastered_balanced(
+        [t.path for t in tracks], sample_rate, db_path, progress_cb)
     effective: dict[str, float] = {}
-    for i, track in enumerate(tracks):
-        if track.path in preloaded:
-            continue
-        pct = 8.0 + (i / max(len(tracks), 1)) * 42.0
-        stem_status = _get_track_stem_status(track.path, db_path)
-        msg = (f"[{i+1}/{len(tracks)}] "
-               f"{'[STEMS] ' if stem_status == 'completed' else '[ORIGINAL] '}"
-               f"{Path(track.path).name}")
-        progress_cb(2, msg, pct)
-        audio = _load_track_audio_with_stems(track.path, sample_rate, db_path)
-        preloaded[track.path] = audio
+    for path, audio in preloaded.items():
         tail, head = find_transition_points(audio, sample_rate, crossfade_seconds)
-        effective[track.path] = (tail - head) / sample_rate - crossfade_seconds
+        effective[path] = (tail - head) / sample_rate - crossfade_seconds
 
     # Step 3/6 – Generate playlist (shuffle theo vòng + T+5)
     progress_cb(3, "Generating playlist", 52.0)
@@ -286,7 +408,7 @@ def run_mix_job(
     # Step 6/6 – Write metadata
     progress_cb(6, "Writing metadata", 92.0)
     info = sf.info(output_wav)
-    write_metadata(
+    files = write_metadata(
         timestamps=timestamps,
         output_wav_path=output_wav,
         total_duration_sec=info.duration,
@@ -295,6 +417,7 @@ def run_mix_job(
         crossfade_sec=crossfade_seconds,
         channels=info.channels,
     )
+    _write_loudness_info(files, loudness)
 
     # Done
     progress_cb(6, "Completed", 100.0)
@@ -319,6 +442,7 @@ def run_patch_mix_job(
     bit_depth: int,
     db_path: str,
     target_seconds: float,
+    prev_loudness: dict | None = None,
 ) -> dict:
     """
     "Vá mix": render lại theo ĐÚNG playlist + tên của bản mix cũ, chỉ khác ở các
@@ -338,11 +462,17 @@ def run_patch_mix_job(
         raise ValueError("Không đọc được: " + ", ".join(Path(p).name for p in missing))
 
     progress_cb(2, "Loading stems", 8.0)
-    preloaded: dict[str, np.ndarray] = {}
-    for i, p in enumerate(uniq):
-        progress_cb(2, f"[{i+1}/{len(uniq)}] {Path(p).name}",
-                    8.0 + (i / max(len(uniq), 1)) * 42.0)
-        preloaded[p] = _load_track_audio_with_stems(p, sample_rate, db_path)
+    if prev_loudness and prev_loudness.get("balanced"):
+        preloaded, loudness = _load_mastered_balanced(
+            uniq, sample_rate, db_path, progress_cb, reuse=prev_loudness)
+    else:
+        # Bản cũ làm trước khi có master/cân bằng → xử lý ĐÚNG như cũ để đoạn
+        # trước bài thay giống hệt (chỉ chuẩn -16 LUFS từng bài).
+        preloaded, loudness = {}, {"balanced": False, "legacy": True}
+        for i, p in enumerate(uniq):
+            progress_cb(2, f"[{i+1}/{len(uniq)}] {Path(p).name}",
+                        8.0 + (i / max(len(uniq), 1)) * 42.0)
+            preloaded[p] = _load_track_audio_with_stems(p, sample_rate, db_path)
 
     output_wav = os.path.join(output_dir, "mix.wav")
 
@@ -366,12 +496,13 @@ def run_patch_mix_job(
 
     progress_cb(6, "Writing metadata", 92.0)
     info = sf.info(output_wav)
-    write_metadata(
+    files = write_metadata(
         timestamps=timestamps, output_wav_path=output_wav,
         total_duration_sec=info.duration, sample_rate=sample_rate,
         bit_depth=bit_depth, crossfade_sec=crossfade_seconds,
         channels=info.channels,
     )
+    _write_loudness_info(files, loudness)
     progress_cb(6, "Completed", 100.0)
     return {
         "total_duration_seconds": info.duration,

@@ -42,6 +42,7 @@ export interface BatchCreate {
   mix_duration_minutes?: number;  // tổng thời lượng mix/video mỗi project
   intro_mode?: IntroMode;
   cast_mode?: CastMode;
+  audio_only?: boolean;     // true = AUTO AUDIO: Suno → Mix rồi dừng (không video/YouTube)
 }
 
 export interface InstrumentOption {
@@ -375,6 +376,8 @@ export interface VideoStatus {
   clip_indices?:  number[];
   final_exists:   boolean;
   final_path?:    string | null;
+  final_mtime?:   number | null;
+  final_size?:    number | null;
   thumbnail_path?: string | null;
   thumbnail_mtime?: number | null;
   thumbnail_ai?:  ThumbAIStatus | null;
@@ -502,6 +505,8 @@ export interface SunoStartBody {
   max_generation_credits?:         number;
   max_new_song_downloads?:         number;
   auto_continue_workflow?:         boolean;
+  // true = AUTO AUDIO (Suno → Mix, dừng ở Audio); false/bỏ trống = FULL AUTO.
+  audio_only?:                     boolean;
 }
 
 // Kết quả AI viết Styles từ ý tưởng (POST /suno/generate-styles).
@@ -509,6 +514,7 @@ export interface SunoGenerateStylesBody {
   idea:    string;
   preset?: string;
   save?:   boolean;
+  audio_only?: boolean;
 }
 
 export interface SunoChannelMatch {

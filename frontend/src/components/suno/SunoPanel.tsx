@@ -140,6 +140,8 @@ const errText = (e: unknown, fallback: string) =>
   (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
   ?? (e as Error)?.message ?? fallback;
 
+type AutoMode = "full" | "audio";
+
 export default function SunoPanel({ projectId }: { projectId: number }) {
   const { data: cfg, isLoading: cfgLoading } = useSunoConfig(projectId);
   const { data: status } = useSunoStatus(projectId);
@@ -225,11 +227,15 @@ export default function SunoPanel({ projectId }: { projectId: number }) {
   const actionError = failedAction ? errText(failedAction.error, "Không gửi được lệnh") : null;
   const queued = job?.status === "pending" ? job.message : "";
 
-  /** «✨ AI viết prompt & CHẠY TỰ ĐỘNG»: viết Styles + phân kênh rồi Start LIVE
-   *  ngay → import → Mix → Video → lưu nháp YouTube (không hỏi lại). */
-  async function runAuto() {
+  /** Hai chế độ tự động (viết Styles + phân kênh rồi Start LIVE ngay, không hỏi lại):
+   *  - "full":  Suno → import → Mix → Video → lưu nháp YouTube.
+   *  - "audio": Suno → import → Mix rồi DỪNG ở Audio (không dựng video, không YouTube). */
+  const [autoMode, setAutoMode] = useState<AutoMode | null>(null);
+  async function runAuto(mode: AutoMode) {
+    const audioOnly = mode === "audio";
+    setAutoMode(mode);
     try {
-      const res = await genStyles.mutateAsync({ idea, preset, save: true });
+      const res = await genStyles.mutateAsync({ idea, preset, save: true, audio_only: audioOnly });
       setStyles(res.styles);
       setExclusions(res.exclusions);
       setGenNote(res.note);
@@ -238,6 +244,8 @@ export default function SunoPanel({ projectId }: { projectId: number }) {
         ...buildBody(),
         styles: res.styles,
         exclusions: res.exclusions,
+        auto_continue_workflow: true,
+        audio_only: audioOnly,
       }, {
         onError: (e) => setGenNote(
           "Đã viết prompt nhưng KHÔNG khởi động được Suno: " +
@@ -249,10 +257,14 @@ export default function SunoPanel({ projectId }: { projectId: number }) {
     }
   }
 
-  // New Project → «Tạo & CHẠY TỰ ĐỘNG» mở trang với ?autorun=1 → tự bấm nút ✨
-  // đúng 1 lần khi cấu hình/ý tưởng/trạng thái đã tải xong.
+  // New Project → «Tạo & FULL AUTO / AUTO AUDIO» mở trang với ?autorun=full|audio
+  // (1 = full, tương thích cũ) → tự bấm đúng nút 1 lần khi mọi thứ đã tải xong.
   const [searchParams, setSearchParams] = useSearchParams();
-  const autorunRequested = searchParams.get("autorun") === "1";
+  const autorunParam = searchParams.get("autorun");
+  const autorunMode: AutoMode | null =
+    autorunParam === "audio" ? "audio"
+    : autorunParam === "1" || autorunParam === "full" ? "full" : null;
+  const autorunRequested = autorunMode !== null;
   const autoFired = useRef(false);
   useEffect(() => {
     if (!autorunRequested || autoFired.current) return;
@@ -262,10 +274,10 @@ export default function SunoPanel({ projectId }: { projectId: number }) {
     next.delete("autorun");
     setSearchParams(next, { replace: true });
     if (busy) {
-      setGenNote("Suno của project đang bận nên chưa tự chạy — bấm nút ✨ khi rảnh.");
+      setGenNote("Suno của project đang bận nên chưa tự chạy — bấm nút FULL AUTO / AUTO AUDIO khi rảnh.");
       return;
     }
-    void runAuto();
+    void runAuto(autorunMode ?? "full");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autorunRequested, inited, ideaInited, project, status, busy]);
 
@@ -390,22 +402,36 @@ export default function SunoPanel({ projectId }: { projectId: number }) {
             placeholder="VD: sáo trúc thiền định cạnh dòng suối, nhẹ nhàng, ấm áp…"
             className="w-full resize-y rounded-lg border border-white/10 bg-background px-3 py-2 text-sm text-gray-200 focus:border-accent focus:outline-none disabled:opacity-50"
           />
-          <button
-            className={`${primary} mt-2 w-full`}
-            disabled={busy || genStyles.isPending || start.isPending}
-            onClick={() => void runAuto()}
-          >
-            {genStyles.isPending
-              ? "✨ Đang viết prompt…"
-              : start.isPending
-              ? "▶ Đang khởi động…"
-              : "✨ AI viết prompt & CHẠY TỰ ĐỘNG (Suno → Mix → Video → nháp YouTube)"}
-          </button>
+          <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+            {(["full", "audio"] as AutoMode[]).map((mode) => {
+              const pending = autoMode === mode && (genStyles.isPending || start.isPending);
+              return (
+                <button
+                  key={mode}
+                  className={mode === "full"
+                    ? `${primary} w-full`
+                    : `${btn} w-full bg-emerald-700 text-white hover:bg-emerald-600`}
+                  disabled={busy || genStyles.isPending || start.isPending}
+                  onClick={() => void runAuto(mode)}
+                >
+                  {pending && genStyles.isPending
+                    ? "✨ Đang viết prompt…"
+                    : pending
+                    ? "▶ Đang khởi động…"
+                    : mode === "full"
+                    ? "✨ FULL AUTO (Suno → Mix → Video → nháp YouTube)"
+                    : "🎵 AUTO AUDIO (Suno → Mix, dừng ở Audio)"}
+                </button>
+              );
+            })}
+          </div>
           <p className="mt-1 text-[10px] text-gray-600">
-            Bấm là chạy LIVE ngay (tốn credit Suno) và tự đăng <b>bản nháp</b>
-            YouTube khi xong — không hỏi lại. Vẫn dừng nếu chạm hạn mức, gặp
-            CAPTCHA hoặc cần đăng nhập. Chỉ muốn viết prompt rồi tự bấm Start?
-            Dùng nút ▶ Start ở cột phải.
+            Cả hai nút: AI viết prompt rồi chạy LIVE ngay (tốn credit Suno), không hỏi lại.
+            <b> FULL AUTO</b> làm tiếp Video và lưu <b>bản nháp</b> YouTube;
+            <b> AUTO AUDIO</b> chỉ tạo nhạc + Mix rồi dừng (không dựng video, không
+            YouTube — mở thư mục ở tab Audio). Vẫn dừng nếu chạm hạn mức, gặp CAPTCHA
+            hoặc cần đăng nhập. Chỉ muốn viết prompt rồi tự bấm Start? Dùng nút ▶ Start
+            ở cột phải.
           </p>
           {genNote && (
             <p className="mt-2 rounded bg-amber-950/20 p-2 text-[11px] text-amber-300">

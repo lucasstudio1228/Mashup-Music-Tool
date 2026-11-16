@@ -372,7 +372,7 @@ class VideoFinishTests(unittest.TestCase):
                     slow_speed=fin["slow_speed"], grade=fin["grade"],
                     transition=fin["transition"])
                 text = "\n".join(scripts)
-                self.assertIn("xfade=transition=custom:expr=A*(P*P*(3-2*P))", text)
+                self.assertIn("xfade=transition=custom:expr=A*(P*P*P*(P*(P*6-15)+10))", text)
                 self.assertIn(f"duration={fin['blend_seconds']}:", text)
                 self.assertNotIn("xfade=transition=fade:", text)
                 self.assertNotIn("hblur", text)

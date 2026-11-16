@@ -259,8 +259,8 @@ export default function ProjectsPage() {
           createProject.mutate(data, {
             onSuccess: (p) => {
               setShowForm(false);
-              // Tự bấm «✨ AI viết prompt & CHẠY TỰ ĐỘNG» ở tab Suno của project mới.
-              if (autoRun) navigate(`/projects/${p.id}?tab=suno&autorun=1`);
+              // Tự bấm FULL AUTO / AUTO AUDIO ở tab Suno của project mới.
+              if (autoRun) navigate(`/projects/${p.id}?tab=suno&autorun=${autoRun}`);
             },
           })
         }
